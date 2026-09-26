@@ -77,22 +77,91 @@ async function processEvent(payload, marketplaceId) {
   }
 
   if (payload.topic === 'public_offers' || payload.topic === 'public_candidates') {
-    const detail = await authenticatedGet(payload.resource, accessToken);
-    await supabaseAdmin.from('ml_seller_metrics').upsert(
+    await handlePromotionEvent(payload, marketplaceId, accessToken);
+  }
+
+  // orders_v2, questions, shipments: mesmo padrão — buscar o resource e
+  // gravar no lugar apropriado. Deixado como próximo passo depois que o
+  // fluxo de items/promoções estiver validado.
+}
+
+/**
+ * Trata um evento de promoção da SUA loja e:
+ * 1. grava/atualiza `ml_seller_metrics` (como já fazia);
+ * 2. se a promoção parecer ativa, também cria uma linha em `promotions`,
+ *    pra aparecer junto com as promoções de terceiros no mesmo painel.
+ *
+ * ATENÇÃO: o nome e os valores exatos do campo de status retornado por
+ * `public_offers`/`public_candidates` (ex.: "active", "started"...) ainda não
+ * foram confirmados na documentação pública. Assim que o primeiro evento real
+ * chegar, confira o conteúdo em `webhook_events.raw_payload` no Supabase e
+ * ajuste a lista `ACTIVE_STATUSES` abaixo se o valor vier diferente.
+ */
+const ACTIVE_STATUSES = ['active', 'started', 'approved'];
+
+async function handlePromotionEvent(payload, marketplaceId, accessToken) {
+  const detail = await authenticatedGet(payload.resource, accessToken);
+  const itemId = detail.item_id;
+
+  const { data: metricRow } = await supabaseAdmin
+    .from('ml_seller_metrics')
+    .upsert(
       {
-        item_id: detail.item_id,
+        item_id: itemId,
         promotion_status: detail.status?.id || detail.status,
         promotion_type: detail.type,
         raw_payload: detail,
         updated_at: new Date().toISOString(),
       },
       { onConflict: 'item_id' }
-    );
+    )
+    .select()
+    .single();
+
+  const statusValue = String(detail.status?.id || detail.status || '').toLowerCase();
+  if (!ACTIVE_STATUSES.includes(statusValue)) return; // promoção ainda não está ativa/aprovada
+
+  let item;
+  try {
+    item = await authenticatedGet(`/items/${itemId}`, accessToken);
+  } catch (err) {
+    await supabaseAdmin.from('integration_logs').insert({
+      marketplace_id: marketplaceId,
+      level: 'warn',
+      message: `Não consegui buscar detalhes do item ${itemId} para montar a promoção: ${err.message}`,
+    });
+    return;
   }
 
-  // orders_v2, questions, shipments: mesmo padrão — buscar o resource e
-  // gravar no lugar apropriado. Deixado como próximo passo depois que o
-  // fluxo de items/promoções estiver validado.
+  // Evita duplicar a mesma promoção se o ML reenviar o webhook (retry).
+  const { data: existing } = await supabaseAdmin
+    .from('promotions')
+    .select('id')
+    .eq('ml_seller_metric_id', metricRow.id)
+    .eq('current_price', item.price)
+    .maybeSingle();
+
+  if (existing) return;
+
+  // `item.original_price` é o campo que o ML usa para o preço "de antes" quando
+  // o item está em promoção — confirmar no primeiro payload real antes de confiar 100%.
+  const previousPrice = item.original_price || null;
+  const discountRate = previousPrice
+    ? Number((((previousPrice - item.price) / previousPrice) * 100).toFixed(2))
+    : null;
+
+  await supabaseAdmin.from('promotions').insert({
+    marketplace_id: marketplaceId,
+    ml_seller_metric_id: metricRow.id,
+    title: item.title,
+    image_url: item.thumbnail,
+    original_url: item.permalink,
+    current_price: item.price,
+    previous_price: previousPrice,
+    discount_rate: discountRate,
+    source: 'own_store_webhook',
+    status: 'PENDING',
+  });
 }
 
 async function getFreshAccessToken(creds) {
