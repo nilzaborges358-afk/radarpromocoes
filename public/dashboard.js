@@ -118,5 +118,31 @@ document.querySelectorAll('#filters button').forEach((btn) => {
   });
 });
 
+const scanBtn = document.getElementById('scanBtn');
+const scanResult = document.getElementById('scanResult');
+
+scanBtn.addEventListener('click', async () => {
+  scanBtn.disabled = true;
+  scanBtn.textContent = '🔄 Buscando...';
+  scanResult.textContent = '';
+
+  try {
+    const res = await fetch('/api/scan/mercadolivre');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Falha na busca');
+
+    scanResult.textContent = `Varreu ${data.categoriesScanned} categoria(s) e encontrou ${data.promotionsFound} promoção(ões) nova(s).`;
+    if (data.errors && data.errors.length) {
+      scanResult.textContent += ` (${data.errors.length} erro(s) — veja integration_logs no Supabase)`;
+    }
+    await loadPromotions();
+  } catch (err) {
+    scanResult.textContent = `Erro ao buscar: ${err.message}`;
+  } finally {
+    scanBtn.disabled = false;
+    scanBtn.textContent = '🔍 Buscar promoções agora';
+  }
+});
+
 loadPromotions();
-setInterval(loadPromotions, 60000); // atualiza sozinho a cada 1 minuto
+setInterval(loadPromotions, 60000); // só atualiza a TELA lendo o que já está salvo — não faz nova busca no ML
