@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8" />
+<title>Radar de Promoções — Painel Matriz</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0f1115; --card: #171a21; --text: #e8e8ec; --muted: #9aa0ab;
+    --ml-yellow: #fff159; --border: #2a2e37; --green: #3ecf8e; --amber: #f5a623;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--text); }
+  header { padding: 20px 24px; border-bottom: 1px solid var(--border); display:flex; align-items:center; justify-content:space-between; }
+  header h1 { font-size: 18px; margin:0; }
+  #filters { display:flex; gap:8px; padding: 16px 24px; flex-wrap: wrap; }
+  #filters button { background: var(--card); border:1px solid var(--border); color: var(--text); padding:6px 12px; border-radius:20px; cursor:pointer; font-size:13px; }
+  #filters button.active { background: var(--green); color:#04140c; border-color: var(--green); }
+  #grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(280px,1fr)); gap:16px; padding: 0 24px 32px; }
+  .card { background: var(--card); border:1px solid var(--border); border-radius:12px; overflow:hidden; display:flex; flex-direction:column; }
+  .card img { width:100%; height:160px; object-fit:contain; background:#fff; }
+  .card-body { padding:14px; display:flex; flex-direction:column; gap:8px; flex:1; }
+  .badge { align-self:flex-start; font-size:11px; font-weight:700; padding:3px 8px; border-radius:6px; background: var(--ml-yellow); color:#1a1a1a; }
+  .title { font-size:14px; line-height:1.3; min-height:36px; }
+  .prices { display:flex; align-items:baseline; gap:8px; }
+  .price-old { text-decoration: line-through; color: var(--muted); font-size:13px; }
+  .price-new { font-size:18px; font-weight:700; color: var(--green); }
+  .discount { font-size:12px; color: var(--amber); font-weight:600; }
+  .meta { font-size:11px; color: var(--muted); }
+  .actions { display:flex; gap:8px; margin-top:auto; }
+  .actions a, .actions button { flex:1; text-align:center; padding:8px; border-radius:8px; font-size:12px; text-decoration:none; border:1px solid var(--border); cursor:pointer; }
+  .btn-open { background:#232833; color: var(--text); }
+  .btn-done { background:transparent; color: var(--muted); }
+  .status-pill { font-size:10px; padding:2px 6px; border-radius:10px; }
+  .status-PENDING { background:#3a2f14; color: var(--amber); }
+  .status-AFFILIATED { background:#12301f; color: var(--green); }
+  .status-IGNORED { background:#2a2e37; color: var(--muted); }
+  #empty { padding: 60px 24px; text-align:center; color: var(--muted); }
+</style>
+</head>
+<body>
+  <header>
+    <h1>🎯 Radar de Promoções — Painel Matriz</h1>
+    <span id="count" class="meta"></span>
+  </header>
+
+  <div id="filters">
+    <button data-status="ALL" class="active">Todas</button>
+    <button data-status="PENDING">Pendentes</button>
+    <button data-status="AFFILIATED">Já afiliadas</button>
+    <button data-status="IGNORED">Ignoradas</button>
+  </div>
+
+  <div id="grid"></div>
+  <div id="empty" style="display:none">Nenhuma promoção encontrada ainda. O scan roda a cada 30 minutos.</div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/supabase/2.45.4/umd/supabase.min.js"></script>
+  <script src="config.js"></script>
+  <script src="dashboard.js"></script>
+</body>
+</html>
