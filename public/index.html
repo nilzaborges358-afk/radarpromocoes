@@ -2,64 +2,252 @@
 <html lang="pt-br">
 <head>
 <meta charset="UTF-8" />
-<title>Radar de Promoções — Painel Matriz</title>
+<title>Radar — Painel de Ofertas</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #0f1115; --card: #171a21; --text: #e8e8ec; --muted: #9aa0ab;
-    --ml-yellow: #fff159; --border: #2a2e37; --green: #3ecf8e; --amber: #f5a623;
+    --bg: #101114;
+    --panel: #17181c;
+    --line: #2b2d33;
+    --ink: #f3f2ee;
+    --muted: #8b8d94;
+    --accent: #e7b24a;
+    --good: #5fcb8f;
+    --bad: #e2604a;
+    --font-display: 'Space Grotesk', sans-serif;
+    --font-body: 'Inter', sans-serif;
   }
   * { box-sizing: border-box; }
-  body { margin:0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--text); }
-  header { padding: 20px 24px; border-bottom: 1px solid var(--border); display:flex; align-items:center; justify-content:space-between; }
-  header h1 { font-size: 18px; margin:0; }
-  #filters { display:flex; gap:8px; padding: 16px 24px; flex-wrap: wrap; }
-  #filters button { background: var(--card); border:1px solid var(--border); color: var(--text); padding:6px 12px; border-radius:20px; cursor:pointer; font-size:13px; }
-  #filters button.active { background: var(--green); color:#04140c; border-color: var(--green); }
-  #grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(280px,1fr)); gap:16px; padding: 0 24px 32px; }
-  .card { background: var(--card); border:1px solid var(--border); border-radius:12px; overflow:hidden; display:flex; flex-direction:column; }
-  .card img { width:100%; height:160px; object-fit:contain; background:#fff; }
-  .card-body { padding:14px; display:flex; flex-direction:column; gap:8px; flex:1; }
-  .badge { align-self:flex-start; font-size:11px; font-weight:700; padding:3px 8px; border-radius:6px; background: var(--ml-yellow); color:#1a1a1a; }
-  .title { font-size:14px; line-height:1.3; min-height:36px; }
-  .prices { display:flex; align-items:baseline; gap:8px; }
-  .price-old { text-decoration: line-through; color: var(--muted); font-size:13px; }
-  .price-new { font-size:18px; font-weight:700; color: var(--green); }
-  .discount { font-size:12px; color: var(--amber); font-weight:600; }
-  .meta { font-size:11px; color: var(--muted); }
-  .actions { display:flex; gap:8px; margin-top:auto; }
-  .actions a, .actions button { flex:1; text-align:center; padding:8px; border-radius:8px; font-size:12px; text-decoration:none; border:1px solid var(--border); cursor:pointer; }
-  .btn-open { background:#232833; color: var(--text); }
-  .btn-done { background:transparent; color: var(--muted); }
-  .status-pill { font-size:10px; padding:2px 6px; border-radius:10px; }
-  .status-PENDING { background:#3a2f14; color: var(--amber); }
-  .status-AFFILIATED { background:#12301f; color: var(--green); }
-  .status-IGNORED { background:#2a2e37; color: var(--muted); }
-  #empty { padding: 60px 24px; text-align:center; color: var(--muted); }
-  #scanBtn { background: var(--green); color:#04140c; border:none; font-weight:700; padding:8px 16px; border-radius:20px; cursor:pointer; font-size:13px; }
-  #scanBtn:disabled { opacity:0.6; cursor:wait; }
-  #scanResult { font-size:12px; color: var(--muted); padding: 0 24px; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-body);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ---------- Masthead ---------- */
+  .masthead {
+    border-bottom: 1px solid var(--line);
+    padding: 28px 32px 20px;
+  }
+  .masthead-top {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .wordmark {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 26px;
+    letter-spacing: -0.02em;
+    margin: 0;
+  }
+  .wordmark span { color: var(--accent); }
+  .tagline {
+    font-size: 13px;
+    color: var(--muted);
+    margin: 4px 0 0;
+  }
+  #scanBtn {
+    background: var(--accent);
+    color: #1a1204;
+    border: none;
+    font-family: var(--font-body);
+    font-weight: 600;
+    font-size: 13px;
+    padding: 10px 18px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  #scanBtn:hover { filter: brightness(1.08); }
+  #scanBtn:disabled { opacity: 0.55; cursor: wait; }
+  #scanResult {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 10px;
+    min-height: 16px;
+  }
+
+  /* ---------- Stat ticker ---------- */
+  .ticker {
+    display: flex;
+    gap: 32px;
+    padding: 16px 32px;
+    border-bottom: 1px solid var(--line);
+    flex-wrap: wrap;
+  }
+  .ticker-item .num {
+    font-family: var(--font-display);
+    font-size: 22px;
+    font-weight: 600;
+    display: block;
+    line-height: 1;
+  }
+  .ticker-item .lbl {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 4px;
+    display: block;
+  }
+  .ticker-item.pending .num { color: var(--accent); }
+  .ticker-item.affiliated .num { color: var(--good); }
+
+  /* ---------- Filter tabs (underline style, not pills) ---------- */
+  .tabs {
+    display: flex;
+    gap: 24px;
+    padding: 0 32px;
+    border-bottom: 1px solid var(--line);
+  }
+  .tabs button {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-family: var(--font-body);
+    font-size: 13px;
+    font-weight: 500;
+    padding: 14px 0;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+  }
+  .tabs button.active { color: var(--ink); border-bottom-color: var(--accent); }
+
+  /* ---------- Fatal error banner ---------- */
+  #fatalError {
+    display: none;
+    margin: 24px 32px;
+    padding: 16px 18px;
+    background: #2a1712;
+    border: 1px solid var(--bad);
+    color: #ffcfc2;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  #fatalError strong { color: #fff; }
+
+  /* ---------- Grid ---------- */
+  #grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 1px;
+    background: var(--line);
+    padding: 1px;
+  }
+  .card {
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+  }
+  .card-media {
+    position: relative;
+    background: #fff;
+    height: 170px;
+  }
+  .card-media img { width: 100%; height: 100%; object-fit: contain; }
+  .tag {
+    position: absolute;
+    top: 0; left: 0;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 4px 10px;
+  }
+  .card-body { padding: 16px; display: flex; flex-direction: column; gap: 10px; flex: 1; }
+  .card-title {
+    font-size: 13.5px;
+    line-height: 1.35;
+    min-height: 36px;
+    color: var(--ink);
+  }
+  .price-row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .price-current {
+    font-family: var(--font-display);
+    font-size: 21px;
+    font-weight: 600;
+  }
+  .price-previous {
+    font-size: 13px;
+    color: var(--muted);
+    text-decoration: line-through;
+  }
+  .discount-pill {
+    font-family: var(--font-display);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--good);
+    border: 1px solid var(--good);
+    padding: 1px 6px;
+  }
+  .meta-row {
+    font-size: 11.5px;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .status-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .status-PENDING .status-dot { background: var(--accent); }
+  .status-AFFILIATED .status-dot { background: var(--good); }
+  .status-IGNORED .status-dot { background: var(--muted); }
+  .actions { display: flex; gap: 8px; margin-top: auto; padding-top: 4px; }
+  .actions a, .actions button {
+    flex: 1;
+    text-align: center;
+    padding: 9px 6px;
+    font-size: 12px;
+    font-weight: 500;
+    text-decoration: none;
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--ink);
+    cursor: pointer;
+    font-family: var(--font-body);
+  }
+  .actions a:hover, .actions button:hover { border-color: var(--accent); color: var(--accent); }
+
+  #empty {
+    padding: 80px 32px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 14px;
+  }
 </style>
 </head>
 <body>
-  <header>
-    <h1>🎯 Radar de Promoções — Painel Matriz</h1>
-    <div style="display:flex; align-items:center; gap:12px;">
-      <span id="count" class="meta"></span>
-      <button id="scanBtn">🔍 Buscar promoções agora</button>
-    </div>
-  </header>
-  <div id="scanResult"></div>
 
-  <div id="filters">
+  <div class="masthead">
+    <div class="masthead-top">
+      <div>
+        <h1 class="wordmark">RADAR<span>.</span></h1>
+        <p class="tagline">Ofertas monitoradas no Mercado Livre — sua loja e demais vendedores</p>
+      </div>
+      <button id="scanBtn">Buscar promoções agora</button>
+    </div>
+    <div id="scanResult"></div>
+  </div>
+
+  <div class="ticker">
+    <div class="ticker-item"><span class="num" id="countAll">–</span><span class="lbl">total encontradas</span></div>
+    <div class="ticker-item pending"><span class="num" id="countPending">–</span><span class="lbl">aguardando você</span></div>
+    <div class="ticker-item affiliated"><span class="num" id="countAffiliated">–</span><span class="lbl">já afiliadas</span></div>
+  </div>
+
+  <div class="tabs">
     <button data-status="ALL" class="active">Todas</button>
     <button data-status="PENDING">Pendentes</button>
     <button data-status="AFFILIATED">Já afiliadas</button>
     <button data-status="IGNORED">Ignoradas</button>
   </div>
 
+  <div id="fatalError"></div>
   <div id="grid"></div>
-  <div id="empty" style="display:none">Nenhuma promoção encontrada ainda. Clique em "Buscar promoções agora".</div>
+  <div id="empty" style="display:none">Nenhuma promoção por aqui ainda. Clique em "Buscar promoções agora" no topo.</div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/supabase/2.45.4/umd/supabase.min.js"></script>
   <script src="config.js"></script>
