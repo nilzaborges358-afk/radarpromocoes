@@ -36,13 +36,20 @@
   .status-AFFILIATED { background:#12301f; color: var(--green); }
   .status-IGNORED { background:#2a2e37; color: var(--muted); }
   #empty { padding: 60px 24px; text-align:center; color: var(--muted); }
+  #scanBtn { background: var(--green); color:#04140c; border:none; font-weight:700; padding:8px 16px; border-radius:20px; cursor:pointer; font-size:13px; }
+  #scanBtn:disabled { opacity:0.6; cursor:wait; }
+  #scanResult { font-size:12px; color: var(--muted); padding: 0 24px; }
 </style>
 </head>
 <body>
   <header>
     <h1>🎯 Radar de Promoções — Painel Matriz</h1>
-    <span id="count" class="meta"></span>
+    <div style="display:flex; align-items:center; gap:12px;">
+      <span id="count" class="meta"></span>
+      <button id="scanBtn">🔍 Buscar promoções agora</button>
+    </div>
   </header>
+  <div id="scanResult"></div>
 
   <div id="filters">
     <button data-status="ALL" class="active">Todas</button>
@@ -52,7 +59,7 @@
   </div>
 
   <div id="grid"></div>
-  <div id="empty" style="display:none">Nenhuma promoção encontrada ainda. O scan roda a cada 30 minutos.</div>
+  <div id="empty" style="display:none">Nenhuma promoção encontrada ainda. Clique em "Buscar promoções agora".</div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/supabase/2.45.4/umd/supabase.min.js"></script>
   <script src="config.js"></script>
