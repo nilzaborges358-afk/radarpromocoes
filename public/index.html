@@ -211,6 +211,10 @@
   }
   .actions a:hover, .actions button:hover { border-color: var(--accent); color: var(--accent); }
 
+  nav { display:flex; gap:24px; padding:18px 32px; border-bottom:1px solid var(--line); }
+  nav a { color: var(--muted); text-decoration:none; font-size:13px; font-weight:500; padding-bottom:4px; border-bottom:2px solid transparent; }
+  nav a.active { color: var(--ink); border-bottom-color: var(--accent); }
+
   #empty {
     padding: 80px 32px;
     text-align: center;
@@ -221,11 +225,16 @@
 </head>
 <body>
 
+  <nav>
+    <a href="index.html" class="active">Painel geral</a>
+    <a href="marketplaces.html">Marketplaces</a>
+  </nav>
+
   <div class="masthead">
     <div class="masthead-top">
       <div>
         <h1 class="wordmark">RADAR<span>.</span></h1>
-        <p class="tagline">Ofertas monitoradas no Mercado Livre — sua loja e demais vendedores</p>
+        <p class="tagline">Todas as ofertas monitoradas, de todos os marketplaces, num lugar só</p>
       </div>
       <button id="scanBtn">Buscar promoções agora</button>
     </div>
@@ -249,7 +258,7 @@
   <div id="grid"></div>
   <div id="empty" style="display:none">Nenhuma promoção por aqui ainda. Clique em "Buscar promoções agora" no topo.</div>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/supabase/2.45.4/umd/supabase.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="config.js"></script>
   <script src="dashboard.js"></script>
 </body>
