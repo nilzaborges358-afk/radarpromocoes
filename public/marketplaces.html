@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8" />
+<title>Radar — Marketplaces</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #101114; --panel: #17181c; --line: #2b2d33; --ink: #f3f2ee;
+    --muted: #8b8d94; --accent: #e7b24a; --good: #5fcb8f; --bad: #e2604a;
+    --font-display: 'Space Grotesk', sans-serif; --font-body: 'Inter', sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background: var(--bg); color: var(--ink); font-family: var(--font-body); -webkit-font-smoothing: antialiased; }
+
+  nav { display:flex; gap:24px; padding:18px 32px; border-bottom:1px solid var(--line); }
+  nav a { color: var(--muted); text-decoration:none; font-size:13px; font-weight:500; padding-bottom:4px; border-bottom:2px solid transparent; }
+  nav a.active { color: var(--ink); border-bottom-color: var(--accent); }
+
+  .masthead { padding: 28px 32px 8px; }
+  .wordmark { font-family: var(--font-display); font-weight:700; font-size:24px; margin:0; letter-spacing:-0.02em; }
+  .wordmark span { color: var(--accent); }
+  .tagline { font-size:13px; color: var(--muted); margin:4px 0 0; }
+
+  .list { padding: 12px 32px 48px; display:flex; flex-direction:column; gap:1px; background:var(--line); margin-top:16px; }
+  .mp-row { background: var(--panel); padding: 18px 20px; }
+  .mp-head { display:flex; align-items:center; justify-content:space-between; cursor:pointer; gap:12px; }
+  .mp-name { display:flex; align-items:center; gap:12px; font-family: var(--font-display); font-weight:600; font-size:15px; }
+  .dot { width:8px; height:8px; border-radius:50%; }
+  .dot.on { background: var(--good); }
+  .dot.off { background: var(--muted); }
+  .dot.soon { background: var(--line); border:1px solid var(--muted); }
+  .status-text { font-size:12px; color: var(--muted); }
+  .chev { color: var(--muted); font-size:12px; }
+
+  .mp-body { display:none; padding-top:18px; margin-top:14px; border-top:1px solid var(--line); }
+  .mp-row.open .mp-body { display:block; }
+
+  .field { margin-bottom:14px; }
+  .field label { display:block; font-size:12px; color: var(--muted); margin-bottom:6px; }
+  .field input {
+    width:100%; max-width:420px; background:#0d0e10; border:1px solid var(--line); color: var(--ink);
+    padding:9px 10px; font-family: var(--font-body); font-size:13px;
+  }
+  .field input:focus { outline:none; border-color: var(--accent); }
+  .row-actions { display:flex; gap:10px; margin-top:8px; flex-wrap:wrap; }
+  button.primary, a.primary {
+    background: var(--accent); color:#1a1204; border:none; font-weight:600; font-size:13px;
+    padding:9px 16px; cursor:pointer; text-decoration:none; display:inline-block;
+  }
+  button.secondary {
+    background:transparent; color: var(--ink); border:1px solid var(--line); font-size:13px;
+    padding:9px 16px; cursor:pointer;
+  }
+  button:disabled { opacity:0.5; cursor:not-allowed; }
+  .save-msg { font-size:12px; color: var(--muted); margin-top:8px; }
+  .soon-note { font-size:12px; color: var(--muted); }
+</style>
+</head>
+<body>
+
+  <nav>
+    <a href="index.html">Painel geral</a>
+    <a href="marketplaces.html" class="active">Marketplaces</a>
+  </nav>
+
+  <div class="masthead">
+    <h1 class="wordmark">Marketplaces<span>.</span></h1>
+    <p class="tagline">Credenciais e conexão de cada marketplace — o painel geral fica em outra tela.</p>
+  </div>
+
+  <div class="list" id="list"></div>
+
+  <script src="marketplaces.js"></script>
+</body>
+</html>
