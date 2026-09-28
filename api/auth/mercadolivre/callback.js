@@ -10,27 +10,40 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    const token = await exchangeCodeForToken({
-      code,
-      clientId: process.env.MERCADOLIVRE_CLIENT_ID,
-      clientSecret: process.env.MERCADOLIVRE_CLIENT_SECRET,
-      redirectUri: process.env.MERCADOLIVRE_REDIRECT_URI,
-    });
-
     const { data: marketplace } = await supabaseAdmin
       .from('marketplaces')
       .select('id')
       .eq('slug', 'mercadolivre')
       .single();
 
+    const { data: creds } = await supabaseAdmin
+      .from('marketplace_credentials')
+      .select('client_id, client_secret')
+      .eq('marketplace_id', marketplace.id)
+      .single();
+
+    if (!creds?.client_id || !creds?.client_secret) {
+      res.status(400).send('Credenciais não encontradas. Cadastre em /marketplaces.html antes de conectar.');
+      return;
+    }
+
+    const redirectUri = `https://${req.headers.host}/api/auth/mercadolivre/callback`;
+
+    const token = await exchangeCodeForToken({
+      code,
+      clientId: creds.client_id,
+      clientSecret: creds.client_secret,
+      redirectUri,
+    });
+
     const expiresAt = new Date(Date.now() + token.expires_in * 1000).toISOString();
 
-    // Upsert: só a tabela de credenciais é tocada aqui — nunca métricas junto.
+    // Upsert preservando client_id/client_secret já salvos (mandamos de novo pra garantir).
     await supabaseAdmin.from('marketplace_credentials').upsert(
       {
         marketplace_id: marketplace.id,
-        client_id: process.env.MERCADOLIVRE_CLIENT_ID,
-        client_secret: process.env.MERCADOLIVRE_CLIENT_SECRET,
+        client_id: creds.client_id,
+        client_secret: creds.client_secret,
         access_token: token.access_token,
         refresh_token: token.refresh_token,
         token_expires_at: expiresAt,
