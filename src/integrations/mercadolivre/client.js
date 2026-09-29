@@ -2,7 +2,9 @@ const API_BASE = 'https://api.mercadolibre.com';
 
 /**
  * Busca pública de itens por categoria — NÃO exige autenticação.
- * Usada para a Trilha 2 (promoções de outros vendedores).
+ * ATENÇÃO: o Mercado Livre passou a bloquear este endpoint (403 Forbidden)
+ * para aplicações de terceiros a partir do final de 2025 — não é um bug
+ * deste código. Mantido aqui só para o caso de um dia voltar a funcionar.
  * Doc: GET /sites/{site_id}/search?category={category_id}
  */
 async function searchItemsByCategory({ siteId = 'MLB', categoryId, offset = 0, limit = 50 }) {
@@ -13,6 +15,32 @@ async function searchItemsByCategory({ siteId = 'MLB', categoryId, offset = 0, l
   }
   const data = await res.json();
   return data.results || [];
+}
+
+/**
+ * Extrai o item_id (ex: MLB1234567890) a partir de um link de produto colado
+ * pelo usuário. Os links do ML costumam trazer "MLB" seguido de dígitos em
+ * algum ponto da URL (com ou sem hífen). Retorna null se não achar o padrão.
+ */
+function extractItemIdFromUrl(url) {
+  const match = String(url).match(/MLB-?(\d{9,13})/i);
+  return match ? `MLB${match[1]}` : null;
+}
+
+/**
+ * Preço de venda atual do item — inclui o preço "de antes" (regular_amount)
+ * e metadados de promoção quando existir uma rolando. Endpoint público e
+ * documentado, ainda funcionando (diferente do /sites/{id}/search).
+ * Doc: GET /items/{item_id}/sale_price
+ */
+async function getSalePrice(itemId, accessToken) {
+  const res = await fetch(`${API_BASE}/items/${itemId}/sale_price?context=channel_marketplace`, {
+    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
+  });
+  if (!res.ok) {
+    throw new Error(`sale_price falhou para ${itemId} (${res.status}): ${await res.text()}`);
+  }
+  return res.json(); // { amount, regular_amount, currency_id, metadata: { promotion_id, promotion_type } }
 }
 
 /**
@@ -71,6 +99,8 @@ async function authenticatedGet(path, accessToken) {
 
 module.exports = {
   searchItemsByCategory,
+  extractItemIdFromUrl,
+  getSalePrice,
   exchangeCodeForToken,
   refreshAccessToken,
   authenticatedGet,
