@@ -2,7 +2,7 @@
 <html lang="pt-br">
 <head>
 <meta charset="UTF-8" />
-<title>Radar — Marketplaces</title>
+<title>Radar — Lista de Vigilância</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -25,56 +25,68 @@
   .wordmark span { color: var(--accent); }
   .tagline { font-size:13px; color: var(--muted); margin:4px 0 0; }
 
-  .list { padding: 12px 32px 48px; display:flex; flex-direction:column; gap:1px; background:var(--line); margin-top:16px; }
-  .mp-row { background: var(--panel); padding: 18px 20px; }
-  .mp-head { display:flex; align-items:center; justify-content:space-between; cursor:pointer; gap:12px; }
-  .mp-name { display:flex; align-items:center; gap:12px; font-family: var(--font-display); font-weight:600; font-size:15px; }
-  .dot { width:8px; height:8px; border-radius:50%; }
-  .dot.on { background: var(--good); }
-  .dot.off { background: var(--muted); }
-  .dot.soon { background: var(--line); border:1px solid var(--muted); }
-  .status-text { font-size:12px; color: var(--muted); }
-  .chev { color: var(--muted); font-size:12px; }
-
-  .mp-body { display:none; padding-top:18px; margin-top:14px; border-top:1px solid var(--line); }
-  .mp-row.open .mp-body { display:block; }
-
-  .field { margin-bottom:14px; }
-  .field label { display:block; font-size:12px; color: var(--muted); margin-bottom:6px; }
-  .field input {
-    width:100%; max-width:420px; background:#0d0e10; border:1px solid var(--line); color: var(--ink);
+  .add-form {
+    margin: 20px 32px; padding: 18px 20px; background: var(--panel); border: 1px solid var(--line);
+    display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end;
+  }
+  .add-form .field { flex:1; min-width:220px; }
+  .add-form label { display:block; font-size:12px; color: var(--muted); margin-bottom:6px; }
+  .add-form input, .add-form select {
+    width:100%; background:#0d0e10; border:1px solid var(--line); color: var(--ink);
     padding:9px 10px; font-family: var(--font-body); font-size:13px;
   }
-  .field input:focus { outline:none; border-color: var(--accent); }
-  .row-actions { display:flex; gap:10px; margin-top:8px; flex-wrap:wrap; }
-  button.primary, a.primary {
+  .add-form button {
     background: var(--accent); color:#1a1204; border:none; font-weight:600; font-size:13px;
-    padding:9px 16px; cursor:pointer; text-decoration:none; display:inline-block;
+    padding:10px 18px; cursor:pointer;
   }
-  button.secondary {
-    background:transparent; color: var(--ink); border:1px solid var(--line); font-size:13px;
-    padding:9px 16px; cursor:pointer;
-  }
-  button:disabled { opacity:0.5; cursor:not-allowed; }
-  .save-msg { font-size:12px; color: var(--muted); margin-top:8px; }
-  .soon-note { font-size:12px; color: var(--muted); }
+  .add-form button:disabled { opacity:0.6; cursor:wait; }
+  #addMsg { width:100%; font-size:12px; color: var(--muted); }
+
+  .group-block { margin: 28px 32px; }
+  .group-title { font-family: var(--font-display); font-weight:600; font-size:16px; margin-bottom:10px; display:flex; align-items:center; gap:8px; }
+  .group-count { font-family: var(--font-body); font-weight:400; font-size:12px; color: var(--muted); }
+
+  .p-list { display:flex; flex-direction:column; gap:1px; background:var(--line); }
+  .p-row { background: var(--panel); padding:12px 16px; display:flex; align-items:center; gap:14px; }
+  .p-row img { width:44px; height:44px; object-fit:contain; background:#fff; flex-shrink:0; }
+  .p-title { flex:1; font-size:13px; }
+  .p-checked { font-size:11px; color: var(--muted); white-space:nowrap; }
+  .p-row a { color: var(--muted); text-decoration:none; font-size:12px; margin-left:10px; }
+  .p-row a:hover { color: var(--accent); }
+  .p-row button.remove { background:none; border:none; color: var(--bad); cursor:pointer; font-size:12px; margin-left:10px; }
+
+  .empty-note { padding: 40px 32px; color: var(--muted); font-size:13px; }
 </style>
 </head>
 <body>
 
   <nav>
     <a href="index.html">Painel geral</a>
-    <a href="marketplaces.html" class="active">Marketplaces</a>
-    <a href="watchlist.html">Lista de vigilância</a>
+    <a href="marketplaces.html">Marketplaces</a>
+    <a href="watchlist.html" class="active">Lista de vigilância</a>
   </nav>
 
   <div class="masthead">
-    <h1 class="wordmark">Marketplaces<span>.</span></h1>
-    <p class="tagline">Credenciais e conexão de cada marketplace — o painel geral fica em outra tela.</p>
+    <h1 class="wordmark">Vigilância<span>.</span></h1>
+    <p class="tagline">Cole o link de um produto do Mercado Livre e escolha em qual grupo ele entra</p>
   </div>
 
-  <div class="list" id="list"></div>
+  <div class="add-form">
+    <div class="field">
+      <label>Link do produto</label>
+      <input type="text" id="urlInput" placeholder="https://produto.mercadolivre.com.br/MLB-..." />
+    </div>
+    <div class="field" style="max-width:220px;">
+      <label>Grupo</label>
+      <select id="groupSelect"></select>
+    </div>
+    <button id="addBtn">Adicionar</button>
+    <div id="addMsg"></div>
+  </div>
 
-  <script src="marketplaces.js"></script>
+  <div id="groups"></div>
+  <div id="emptyNote" class="empty-note" style="display:none">Nenhum produto vigiado ainda. Cole um link acima para começar.</div>
+
+  <script src="watchlist.js"></script>
 </body>
 </html>
