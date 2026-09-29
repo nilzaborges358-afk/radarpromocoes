@@ -19,17 +19,20 @@ async function searchItemsByCategory({ siteId = 'MLB', categoryId, offset = 0, l
  * Troca o "code" do OAuth por access_token/refresh_token.
  * Doc: POST /oauth/token
  */
-async function exchangeCodeForToken({ code, clientId, clientSecret, redirectUri }) {
+async function exchangeCodeForToken({ code, clientId, clientSecret, redirectUri, codeVerifier }) {
+  const body = {
+    grant_type: 'authorization_code',
+    client_id: clientId,
+    client_secret: clientSecret,
+    code,
+    redirect_uri: redirectUri,
+  };
+  if (codeVerifier) body.code_verifier = codeVerifier;
+
   const res = await fetch(`${API_BASE}/oauth/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded', accept: 'application/json' },
-    body: new URLSearchParams({
-      grant_type: 'authorization_code',
-      client_id: clientId,
-      client_secret: clientSecret,
-      code,
-      redirect_uri: redirectUri,
-    }),
+    body: new URLSearchParams(body),
   });
   if (!res.ok) {
     throw new Error(`Falha ao trocar code por token (${res.status}): ${await res.text()}`);
