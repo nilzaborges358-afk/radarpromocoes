@@ -18,7 +18,7 @@ module.exports = async function handler(req, res) {
 
     const { data: creds } = await supabaseAdmin
       .from('marketplace_credentials')
-      .select('client_id, client_secret')
+      .select('client_id, client_secret, pending_code_verifier')
       .eq('marketplace_id', marketplace.id)
       .single();
 
@@ -34,11 +34,11 @@ module.exports = async function handler(req, res) {
       clientId: creds.client_id,
       clientSecret: creds.client_secret,
       redirectUri,
+      codeVerifier: creds.pending_code_verifier, // PKCE
     });
 
     const expiresAt = new Date(Date.now() + token.expires_in * 1000).toISOString();
 
-    // Upsert preservando client_id/client_secret já salvos (mandamos de novo pra garantir).
     await supabaseAdmin.from('marketplace_credentials').upsert(
       {
         marketplace_id: marketplace.id,
@@ -48,6 +48,7 @@ module.exports = async function handler(req, res) {
         refresh_token: token.refresh_token,
         token_expires_at: expiresAt,
         seller_id: String(token.user_id),
+        pending_code_verifier: null, // já usado, limpa
         updated_at: new Date().toISOString(),
       },
       { onConflict: 'marketplace_id' }
