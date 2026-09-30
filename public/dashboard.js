@@ -102,6 +102,14 @@ function render() {
   grid.querySelectorAll('[data-ignore]').forEach((btn) => {
     btn.addEventListener('click', () => markStatus(btn.dataset.ignore, 'IGNORED'));
   });
+  grid.querySelectorAll('[data-copy-link]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      await navigator.clipboard.writeText(btn.dataset.copyLink);
+      const original = btn.textContent;
+      btn.textContent = 'Copiado!';
+      setTimeout(() => { btn.textContent = original; }, 1500);
+    });
+  });
 }
 
 function renderCard(promo) {
@@ -131,6 +139,7 @@ function renderCard(promo) {
         </div>
         <div class="actions">
           <a href="${promo.original_url}" target="_blank" rel="noopener">Abrir original</a>
+          ${promo.affiliate_url ? `<button data-copy-link="${escapeHtml(promo.affiliate_url)}" style="color:var(--good); border-color:var(--good);">Copiar link de afiliado</button>` : ''}
           ${promo.status === 'PENDING' ? `
             <button data-mark-affiliated="${promo.id}">Já afiliei</button>
             <button data-ignore="${promo.id}">Ignorar</button>
@@ -154,22 +163,27 @@ async function runScan() {
   btn.textContent = 'Buscando...';
   resultEl.textContent = '';
 
-  try {
-    const res = await fetch('/api/scan/mercadolivre');
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Falha na busca');
+  const results = await Promise.allSettled([
+    fetch('/api/scan/mercadolivre').then((r) => r.json().then((data) => ({ ok: r.ok, data, name: 'Mercado Livre' }))),
+    fetch('/api/scan/shopee').then((r) => r.json().then((data) => ({ ok: r.ok, data, name: 'Shopee' }))),
+  ]);
 
-    resultEl.textContent = `Varreu ${data.categoriesScanned} categoria(s) e encontrou ${data.promotionsFound} promoção(ões) nova(s).`;
-    if (data.errors && data.errors.length) {
-      resultEl.textContent += ` (${data.errors.length} erro(s) — veja integration_logs no Supabase)`;
-    }
-    await loadPromotions();
-  } catch (err) {
-    resultEl.textContent = `Erro ao buscar: ${err.message}`;
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Buscar promoções agora';
-  }
+  const parts = results.map((result) => {
+    if (result.status !== 'fulfilled') return `Erro inesperado: ${result.reason}`;
+    const { ok, data, name } = result.value;
+    if (!ok) return `${name}: erro — ${data.error || 'falha desconhecida'}`;
+    const found = data.promotionsFound ?? 0;
+    const scannedLabel = data.categoriesScanned !== undefined
+      ? `${data.categoriesScanned} categoria(s)`
+      : `${data.groupsSearched ?? data.productsChecked ?? 0} grupo(s)/produto(s)`;
+    return `${name}: ${scannedLabel}, ${found} nova(s)`;
+  });
+
+  resultEl.textContent = parts.join(' · ');
+  await loadPromotions();
+
+  btn.disabled = false;
+  btn.textContent = 'Buscar promoções agora';
 }
 
 function formatPrice(value) {
