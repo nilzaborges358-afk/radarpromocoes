@@ -97,6 +97,20 @@ async function authenticatedGet(path, accessToken) {
   return res.json();
 }
 
+/**
+ * Consulta pública, sem token — usada para itens de OUTROS vendedores.
+ * O token da sua loja só tem permissão sobre os seus próprios itens; para
+ * produtos de terceiros (como os da lista de vigilância), a leitura pública
+ * funciona melhor do que a autenticada.
+ */
+async function publicGet(path) {
+  const res = await fetch(`${API_BASE}${path}`);
+  if (!res.ok) {
+    throw new Error(`Chamada pública falhou (${res.status}) em ${path}: ${await res.text()}`);
+  }
+  return res.json();
+}
+
 module.exports = {
   searchItemsByCategory,
   extractItemIdFromUrl,
@@ -104,4 +118,5 @@ module.exports = {
   exchangeCodeForToken,
   refreshAccessToken,
   authenticatedGet,
+  publicGet,
 };
