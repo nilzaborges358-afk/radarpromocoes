@@ -1,4 +1,4 @@
-const { extractItemIdFromUrl, authenticatedGet } = require('../../src/integrations/mercadolivre/client');
+const { extractItemIdFromUrl, publicGet } = require('../../src/integrations/mercadolivre/client');
 const { supabaseAdmin } = require('../../src/core/database/supabaseClient');
 
 // GET    /api/watchlist            -> { groups, products }
@@ -39,17 +39,12 @@ module.exports = async function handler(req, res) {
         return;
       }
 
-      // Busca dados do item. Tenta com token da sua loja (se existir), senão sem auth
-      // (o recurso /items/{id} costuma ser público para leitura).
-      const { data: creds } = await supabaseAdmin
-        .from('marketplace_credentials')
-        .select('access_token')
-        .eq('marketplace_id', marketplace.id)
-        .maybeSingle();
-
+      // Consulta PÚBLICA (sem token) — o token da sua loja só enxerga seus
+      // próprios itens; produtos de outros vendedores dão "access_denied"
+      // se consultados com esse token.
       let item;
       try {
-        item = await authenticatedGet(`/items/${itemId}`, creds?.access_token);
+        item = await publicGet(`/items/${itemId}`);
       } catch (err) {
         res.status(400).json({ error: `Não consegui buscar esse produto no Mercado Livre: ${err.message}` });
         return;
