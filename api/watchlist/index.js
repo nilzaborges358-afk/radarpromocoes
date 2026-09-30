@@ -48,23 +48,26 @@ module.exports = async function handler(req, res) {
       // Tenta autenticado primeiro (é o que o Mercado Livre espera segundo a doc
       // de "Permissões funcionais"); se falhar, tenta público como fallback.
       let item;
-      let lastError;
+      let authError;
+      let publicError;
       if (creds?.access_token) {
         try {
           item = await authenticatedGet(`/items/${itemId}`, creds.access_token);
         } catch (err) {
-          lastError = err;
+          authError = err.message;
         }
       }
       if (!item) {
         try {
           item = await publicGet(`/items/${itemId}`);
         } catch (err) {
-          lastError = err;
+          publicError = err.message;
         }
       }
       if (!item) {
-        res.status(400).json({ error: `Não consegui buscar esse produto no Mercado Livre: ${lastError?.message}` });
+        res.status(400).json({
+          error: `Não consegui buscar esse produto no Mercado Livre. ${authError ? `Com token: ${authError}. ` : 'Sem token cadastrado. '}${publicError ? `Sem token: ${publicError}.` : ''}`,
+        });
         return;
       }
 
