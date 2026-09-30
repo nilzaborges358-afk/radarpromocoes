@@ -4,9 +4,9 @@ const { supabaseAdmin } = require('../../src/core/database/supabaseClient');
 // GET /api/scan/mercadolivre
 // Chamado pelo botão "Buscar promoções agora". Para cada produto cadastrado na
 // sua lista de vigilância (watchlist), consulta o preço atual via
-// /items/{id}/sale_price — o endpoint de busca por categoria inteira está
-// bloqueado pelo Mercado Livre para apps de terceiros (ver client.js), então
-// isso substitui a antiga varredura automática por categoria.
+// /items/{id}/sale_price — sem token, porque os produtos vigiados são de
+// outros vendedores (o token da sua loja só tem permissão sobre os seus
+// próprios itens, e devolve access_denied para itens de terceiros).
 module.exports = async function handler(req, res) {
   try {
     const { data: marketplace } = await supabaseAdmin
@@ -14,12 +14,6 @@ module.exports = async function handler(req, res) {
       .select('id')
       .eq('slug', 'mercadolivre')
       .single();
-
-    const { data: creds } = await supabaseAdmin
-      .from('marketplace_credentials')
-      .select('access_token')
-      .eq('marketplace_id', marketplace.id)
-      .maybeSingle();
 
     const { data: products } = await supabaseAdmin
       .from('products')
@@ -31,7 +25,7 @@ module.exports = async function handler(req, res) {
 
     for (const product of products || []) {
       try {
-        found += await checkProduct(product, marketplace.id, creds?.access_token);
+        found += await checkProduct(product, marketplace.id);
       } catch (err) {
         errors.push(`${product.source_item_id}: ${err.message}`);
         await supabaseAdmin.from('integration_logs').insert({
@@ -53,8 +47,8 @@ module.exports = async function handler(req, res) {
   }
 };
 
-async function checkProduct(product, marketplaceId, accessToken) {
-  const salePrice = await getSalePrice(product.source_item_id, accessToken);
+async function checkProduct(product, marketplaceId) {
+  const salePrice = await getSalePrice(product.source_item_id); // sem token — item de terceiro
 
   await supabaseAdmin
     .from('products')
@@ -70,7 +64,6 @@ async function checkProduct(product, marketplaceId, accessToken) {
 
   if (!hasPromotion) return 0;
 
-  // Evita duplicar a mesma promoção se você já viu esse preço antes.
   const { data: existing } = await supabaseAdmin
     .from('promotions')
     .select('id')
