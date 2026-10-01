@@ -13,6 +13,7 @@ let client = null;
 let currentStatus = 'ALL';
 let currentMarketplace = 'ALL';
 let currentGroup = 'ALL';
+let currentDateFilter = 'TODAY';
 let allPromotions = [];
 
 function showFatalError(message) {
@@ -61,11 +62,21 @@ function init() {
     currentGroup = e.target.value;
     render();
   });
+  document.getElementById('dateFilter').addEventListener('change', (e) => {
+    currentDateFilter = e.target.value;
+    document.getElementById('customDateRange').classList.toggle('show', currentDateFilter === 'CUSTOM');
+    render();
+  });
+  document.getElementById('dateFrom').addEventListener('change', render);
+  document.getElementById('dateTo').addEventListener('change', render);
   document.getElementById('clearFilters').addEventListener('click', () => {
     currentMarketplace = 'ALL';
     currentGroup = 'ALL';
+    currentDateFilter = 'TODAY';
     document.getElementById('marketplaceFilter').value = 'ALL';
     document.getElementById('groupFilter').value = 'ALL';
+    document.getElementById('dateFilter').value = 'TODAY';
+    document.getElementById('customDateRange').classList.remove('show');
     render();
   });
 
@@ -133,6 +144,7 @@ function render() {
   if (currentStatus !== 'ALL') list = list.filter((p) => p.status === currentStatus);
   if (currentMarketplace !== 'ALL') list = list.filter((p) => p.marketplaces?.slug === currentMarketplace);
   if (currentGroup !== 'ALL') list = list.filter((p) => p.watch_group_id === currentGroup);
+  list = applyDateFilter(list);
 
   if (list.length === 0) {
     grid.innerHTML = '';
@@ -157,6 +169,42 @@ function render() {
       setTimeout(() => { btn.textContent = original; }, 1500);
     });
   });
+}
+
+function toLocalDateKey(dateStr) {
+  const d = new Date(dateStr);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function applyDateFilter(list) {
+  if (currentDateFilter === 'ALL') return list;
+
+  const today = new Date();
+  const todayKey = toLocalDateKey(today);
+
+  if (currentDateFilter === 'TODAY') {
+    return list.filter((p) => toLocalDateKey(p.detected_at) === todayKey);
+  }
+
+  if (currentDateFilter === 'YESTERDAY') {
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yKey = toLocalDateKey(yesterday);
+    return list.filter((p) => toLocalDateKey(p.detected_at) === yKey);
+  }
+
+  if (currentDateFilter === 'CUSTOM') {
+    const from = document.getElementById('dateFrom').value;
+    const to = document.getElementById('dateTo').value;
+    return list.filter((p) => {
+      const key = toLocalDateKey(p.detected_at);
+      if (from && key < from) return false;
+      if (to && key > to) return false;
+      return true;
+    });
+  }
+
+  return list;
 }
 
 function renderCard(promo) {
