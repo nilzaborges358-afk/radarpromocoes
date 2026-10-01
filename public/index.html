@@ -48,6 +48,11 @@
     background:#0d0e10; border:1px solid var(--line); color: var(--ink);
     padding:7px 10px; font-family: var(--font-body); font-size:12.5px; cursor:pointer;
   }
+  .filters input[type="date"] {
+    background:#0d0e10; border:1px solid var(--line); color: var(--ink);
+    padding:6px 10px; font-family: var(--font-body); font-size:12.5px;
+  }
+  #customDateRange.show { display:flex !important; }
   .filters .clear-btn { font-size:12px; color: var(--muted); background:none; border:none; cursor:pointer; text-decoration:underline; }
 
   #fatalError { display:none; margin:24px 32px; padding:16px 18px; background:#2a1712; border:1px solid var(--bad); color:#ffcfc2; font-size:13px; line-height:1.5; }
@@ -118,6 +123,20 @@
     <div>
       <label>Grupo</label>
       <select id="groupFilter"><option value="ALL">Todos</option></select>
+    </div>
+    <div>
+      <label>Buscada em</label>
+      <select id="dateFilter">
+        <option value="TODAY" selected>Hoje</option>
+        <option value="YESTERDAY">Ontem</option>
+        <option value="ALL">Todos os dias</option>
+        <option value="CUSTOM">Personalizado</option>
+      </select>
+    </div>
+    <div id="customDateRange" style="display:none; gap:8px; align-items:center;">
+      <input type="date" id="dateFrom" />
+      <span style="color:var(--muted); font-size:12px;">até</span>
+      <input type="date" id="dateTo" />
     </div>
     <button class="clear-btn" id="clearFilters">Limpar filtros</button>
   </div>
