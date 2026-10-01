@@ -57,24 +57,35 @@ async function processOffer(offer, marketplaceId, group, creds) {
   const discountRate = offer.priceDiscountRate || 0;
   if (discountRate < MIN_DISCOUNT_PCT) return 0;
 
+  const originalUrl = offer.productLink || offer.offerLink;
+
+  // Casa por URL (não por preço) — a Shopee pode variar centavos de uma busca
+  // pra outra, e isso não deve contar como "produto novo".
   const { data: existing } = await supabaseAdmin
     .from('promotions')
-    .select('id')
+    .select('id, watch_group_id, affiliate_url')
     .eq('marketplace_id', marketplaceId)
-    .eq('original_url', offer.productLink || offer.offerLink)
-    .eq('current_price', offer.priceMin)
+    .eq('original_url', originalUrl)
     .maybeSingle();
 
-  if (existing) return 0;
+  if (existing) {
+    // Já vista antes: atualiza preço/grupo/data da busca, sem duplicar linha
+    // e sem mexer no status (PENDING/AFFILIATED/IGNORED) que você já definiu.
+    await supabaseAdmin
+      .from('promotions')
+      .update({
+        current_price: offer.priceMin,
+        discount_rate: discountRate,
+        watch_group_id: existing.watch_group_id || group.id, // preenche se estava faltando
+        detected_at: new Date().toISOString(),
+      })
+      .eq('id', existing.id);
+    return 0; // não conta como "nova" pro contador
+  }
 
   let affiliateUrl = null;
   try {
-    affiliateUrl = await generateShortLink(
-      creds.client_id,
-      creds.client_secret,
-      offer.productLink || offer.offerLink,
-      group.name
-    );
+    affiliateUrl = await generateShortLink(creds.client_id, creds.client_secret, originalUrl, group.name);
   } catch (err) {
     await supabaseAdmin.from('integration_logs').insert({
       marketplace_id: marketplaceId,
@@ -88,7 +99,7 @@ async function processOffer(offer, marketplaceId, group, creds) {
     watch_group_id: group.id,
     title: offer.productName,
     image_url: offer.imageUrl,
-    original_url: offer.productLink || offer.offerLink,
+    original_url: originalUrl,
     current_price: offer.priceMin,
     previous_price: null,
     discount_rate: discountRate,
