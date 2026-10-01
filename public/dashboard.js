@@ -10,7 +10,9 @@ const MARKETPLACE_LABELS = {
 const STATUS_LABEL = { PENDING: 'aguardando afiliação', AFFILIATED: 'afiliada', IGNORED: 'ignorada' };
 
 let client = null;
-let currentFilter = 'ALL';
+let currentStatus = 'ALL';
+let currentMarketplace = 'ALL';
+let currentGroup = 'ALL';
 let allPromotions = [];
 
 function showFatalError(message) {
@@ -21,9 +23,7 @@ function showFatalError(message) {
 
 function init() {
   if (typeof supabase === 'undefined') {
-    showFatalError(
-      'A biblioteca do Supabase não carregou (verifique sua internet e recarregue a página).'
-    );
+    showFatalError('A biblioteca do Supabase não carregou (verifique sua internet e recarregue a página).');
     return;
   }
 
@@ -33,9 +33,7 @@ function init() {
     !window.RADAR_CONFIG.SUPABASE_ANON_KEY ||
     window.RADAR_CONFIG.SUPABASE_URL.includes('SEU-PROJETO')
   ) {
-    showFatalError(
-      'O arquivo <code>public/config.js</code> ainda não está preenchido com a URL e a chave reais do Supabase.'
-    );
+    showFatalError('O arquivo <code>public/config.js</code> ainda não está preenchido com a URL e a chave reais do Supabase.');
     return;
   }
 
@@ -50,23 +48,60 @@ function init() {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.tabs button').forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
-      currentFilter = btn.dataset.status;
+      currentStatus = btn.dataset.status;
       render();
     });
   });
 
+  document.getElementById('marketplaceFilter').addEventListener('change', (e) => {
+    currentMarketplace = e.target.value;
+    render();
+  });
+  document.getElementById('groupFilter').addEventListener('change', (e) => {
+    currentGroup = e.target.value;
+    render();
+  });
+  document.getElementById('clearFilters').addEventListener('click', () => {
+    currentMarketplace = 'ALL';
+    currentGroup = 'ALL';
+    document.getElementById('marketplaceFilter').value = 'ALL';
+    document.getElementById('groupFilter').value = 'ALL';
+    render();
+  });
+
   document.getElementById('scanBtn').addEventListener('click', runScan);
 
+  loadFilterOptions();
   loadPromotions();
-  setInterval(loadPromotions, 60000); // só relê o que já está salvo — não dispara nova busca no ML
+  setInterval(loadPromotions, 60000); // só relê o que já está salvo — não dispara nova busca
+}
+
+async function loadFilterOptions() {
+  const { data: marketplaces } = await client.from('marketplaces').select('slug, name').order('name');
+  const mpSelect = document.getElementById('marketplaceFilter');
+  (marketplaces || []).forEach((mp) => {
+    const opt = document.createElement('option');
+    opt.value = mp.slug;
+    opt.textContent = MARKETPLACE_LABELS[mp.slug]?.name || mp.name;
+    mpSelect.appendChild(opt);
+  });
+
+  const { data: groups } = await client.from('watch_groups').select('id, name').order('name');
+  const groupSelect = document.getElementById('groupFilter');
+  (groups || []).forEach((g) => {
+    const opt = document.createElement('option');
+    opt.value = g.id;
+    opt.textContent = g.name;
+    groupSelect.appendChild(opt);
+  });
 }
 
 async function loadPromotions() {
   const { data, error } = await client
     .from('promotions')
-    .select('*, marketplaces(slug, name, logo_url)')
+    .select('*, marketplaces(slug, name, logo_url), watch_groups(name)')
     .order('detected_at', { ascending: false })
-    .limit(200);
+    .limit(300);
 
   if (error) {
     showFatalError(`Erro ao carregar as promoções: ${error.message}`);
@@ -74,7 +109,16 @@ async function loadPromotions() {
   }
 
   allPromotions = data || [];
+  updateLastScanLabel();
   render();
+}
+
+function updateLastScanLabel() {
+  const el = document.getElementById('lastScan');
+  if (!allPromotions.length) { el.textContent = ''; return; }
+  const latest = allPromotions.reduce((max, p) => (p.detected_at > max ? p.detected_at : max), allPromotions[0].detected_at);
+  const formatted = new Date(latest).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+  el.innerHTML = `Última busca com resultado: <strong>${formatted}</strong>`;
 }
 
 function render() {
@@ -85,7 +129,10 @@ function render() {
   document.getElementById('countPending').textContent = allPromotions.filter((p) => p.status === 'PENDING').length;
   document.getElementById('countAffiliated').textContent = allPromotions.filter((p) => p.status === 'AFFILIATED').length;
 
-  const list = currentFilter === 'ALL' ? allPromotions : allPromotions.filter((p) => p.status === currentFilter);
+  let list = allPromotions;
+  if (currentStatus !== 'ALL') list = list.filter((p) => p.status === currentStatus);
+  if (currentMarketplace !== 'ALL') list = list.filter((p) => p.marketplaces?.slug === currentMarketplace);
+  if (currentGroup !== 'ALL') list = list.filter((p) => p.watch_group_id === currentGroup);
 
   if (list.length === 0) {
     grid.innerHTML = '';
@@ -113,17 +160,19 @@ function render() {
 }
 
 function renderCard(promo) {
-  const slug = promo.marketplaces?.slug || 'desconhecido';
-  const label = MARKETPLACE_LABELS[slug] || { name: slug, color: '#444', textColor: '#fff' };
-  const detectedAt = new Date(promo.detected_at).toLocaleString('pt-BR', {
-    day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
-  });
+  const slug = promo.marketplaces?.slug;
+  const label = MARKETPLACE_LABELS[slug] || { name: promo.marketplaces?.name || 'Marketplace', color: '#444', textColor: '#fff' };
+  const groupName = promo.watch_groups?.name;
+  const detectedAt = new Date(promo.detected_at).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
   const discount = promo.discount_rate ? `-${Math.round(promo.discount_rate)}%` : '';
 
   return `
     <div class="card">
       <div class="card-media">
-        <span class="tag" style="background:${label.color}; color:${label.textColor}">${label.name}</span>
+        <div class="tag-row">
+          <span class="tag" style="background:${label.color}; color:${label.textColor}">${label.name}</span>
+          ${groupName ? `<span class="tag-group">${escapeHtml(groupName)}</span>` : ''}
+        </div>
         <img src="${promo.image_url || ''}" alt="${escapeHtml(promo.title)}" loading="lazy" />
       </div>
       <div class="card-body">
@@ -135,7 +184,7 @@ function renderCard(promo) {
         </div>
         <div class="meta-row status-${promo.status}">
           <span class="status-dot"></span>
-          Detectada em ${detectedAt} · ${STATUS_LABEL[promo.status] || promo.status}
+          Buscada em ${detectedAt} · ${STATUS_LABEL[promo.status] || promo.status}
         </div>
         <div class="actions">
           <a href="${promo.original_url}" target="_blank" rel="noopener">Abrir original</a>
