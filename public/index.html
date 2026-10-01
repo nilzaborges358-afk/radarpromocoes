@@ -9,218 +9,72 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #101114;
-    --panel: #17181c;
-    --line: #2b2d33;
-    --ink: #f3f2ee;
-    --muted: #8b8d94;
-    --accent: #e7b24a;
-    --good: #5fcb8f;
-    --bad: #e2604a;
-    --font-display: 'Space Grotesk', sans-serif;
-    --font-body: 'Inter', sans-serif;
+    --bg: #101114; --panel: #17181c; --line: #2b2d33; --ink: #f3f2ee;
+    --muted: #8b8d94; --accent: #e7b24a; --good: #5fcb8f; --bad: #e2604a;
+    --font-display: 'Space Grotesk', sans-serif; --font-body: 'Inter', sans-serif;
   }
   * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--ink);
-    font-family: var(--font-body);
-    -webkit-font-smoothing: antialiased;
-  }
-
-  /* ---------- Masthead ---------- */
-  .masthead {
-    border-bottom: 1px solid var(--line);
-    padding: 28px 32px 20px;
-  }
-  .masthead-top {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 16px;
-    flex-wrap: wrap;
-  }
-  .wordmark {
-    font-family: var(--font-display);
-    font-weight: 700;
-    font-size: 26px;
-    letter-spacing: -0.02em;
-    margin: 0;
-  }
-  .wordmark span { color: var(--accent); }
-  .tagline {
-    font-size: 13px;
-    color: var(--muted);
-    margin: 4px 0 0;
-  }
-  #scanBtn {
-    background: var(--accent);
-    color: #1a1204;
-    border: none;
-    font-family: var(--font-body);
-    font-weight: 600;
-    font-size: 13px;
-    padding: 10px 18px;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  #scanBtn:hover { filter: brightness(1.08); }
-  #scanBtn:disabled { opacity: 0.55; cursor: wait; }
-  #scanResult {
-    font-size: 12px;
-    color: var(--muted);
-    margin-top: 10px;
-    min-height: 16px;
-  }
-
-  /* ---------- Stat ticker ---------- */
-  .ticker {
-    display: flex;
-    gap: 32px;
-    padding: 16px 32px;
-    border-bottom: 1px solid var(--line);
-    flex-wrap: wrap;
-  }
-  .ticker-item .num {
-    font-family: var(--font-display);
-    font-size: 22px;
-    font-weight: 600;
-    display: block;
-    line-height: 1;
-  }
-  .ticker-item .lbl {
-    font-size: 12px;
-    color: var(--muted);
-    margin-top: 4px;
-    display: block;
-  }
-  .ticker-item.pending .num { color: var(--accent); }
-  .ticker-item.affiliated .num { color: var(--good); }
-
-  /* ---------- Filter tabs (underline style, not pills) ---------- */
-  .tabs {
-    display: flex;
-    gap: 24px;
-    padding: 0 32px;
-    border-bottom: 1px solid var(--line);
-  }
-  .tabs button {
-    background: none;
-    border: none;
-    color: var(--muted);
-    font-family: var(--font-body);
-    font-size: 13px;
-    font-weight: 500;
-    padding: 14px 0;
-    cursor: pointer;
-    border-bottom: 2px solid transparent;
-    margin-bottom: -1px;
-  }
-  .tabs button.active { color: var(--ink); border-bottom-color: var(--accent); }
-
-  /* ---------- Fatal error banner ---------- */
-  #fatalError {
-    display: none;
-    margin: 24px 32px;
-    padding: 16px 18px;
-    background: #2a1712;
-    border: 1px solid var(--bad);
-    color: #ffcfc2;
-    font-size: 13px;
-    line-height: 1.5;
-  }
-  #fatalError strong { color: #fff; }
-
-  /* ---------- Grid ---------- */
-  #grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-    gap: 1px;
-    background: var(--line);
-    padding: 1px;
-  }
-  .card {
-    background: var(--panel);
-    display: flex;
-    flex-direction: column;
-  }
-  .card-media {
-    position: relative;
-    background: #fff;
-    height: 170px;
-  }
-  .card-media img { width: 100%; height: 100%; object-fit: contain; }
-  .tag {
-    position: absolute;
-    top: 0; left: 0;
-    font-size: 11px;
-    font-weight: 600;
-    padding: 4px 10px;
-  }
-  .card-body { padding: 16px; display: flex; flex-direction: column; gap: 10px; flex: 1; }
-  .card-title {
-    font-size: 13.5px;
-    line-height: 1.35;
-    min-height: 36px;
-    color: var(--ink);
-  }
-  .price-row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
-  .price-current {
-    font-family: var(--font-display);
-    font-size: 21px;
-    font-weight: 600;
-  }
-  .price-previous {
-    font-size: 13px;
-    color: var(--muted);
-    text-decoration: line-through;
-  }
-  .discount-pill {
-    font-family: var(--font-display);
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--good);
-    border: 1px solid var(--good);
-    padding: 1px 6px;
-  }
-  .meta-row {
-    font-size: 11.5px;
-    color: var(--muted);
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .status-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
-  .status-PENDING .status-dot { background: var(--accent); }
-  .status-AFFILIATED .status-dot { background: var(--good); }
-  .status-IGNORED .status-dot { background: var(--muted); }
-  .actions { display: flex; gap: 8px; margin-top: auto; padding-top: 4px; }
-  .actions a, .actions button {
-    flex: 1;
-    text-align: center;
-    padding: 9px 6px;
-    font-size: 12px;
-    font-weight: 500;
-    text-decoration: none;
-    border: 1px solid var(--line);
-    background: transparent;
-    color: var(--ink);
-    cursor: pointer;
-    font-family: var(--font-body);
-  }
-  .actions a:hover, .actions button:hover { border-color: var(--accent); color: var(--accent); }
+  body { margin:0; background: var(--bg); color: var(--ink); font-family: var(--font-body); -webkit-font-smoothing: antialiased; }
 
   nav { display:flex; gap:24px; padding:18px 32px; border-bottom:1px solid var(--line); }
   nav a { color: var(--muted); text-decoration:none; font-size:13px; font-weight:500; padding-bottom:4px; border-bottom:2px solid transparent; }
   nav a.active { color: var(--ink); border-bottom-color: var(--accent); }
 
-  #empty {
-    padding: 80px 32px;
-    text-align: center;
-    color: var(--muted);
-    font-size: 14px;
+  .masthead { padding: 28px 32px 20px; border-bottom:1px solid var(--line); }
+  .masthead-top { display:flex; align-items:baseline; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+  .wordmark { font-family: var(--font-display); font-weight:700; font-size:26px; margin:0; letter-spacing:-0.02em; }
+  .wordmark span { color: var(--accent); }
+  .tagline { font-size:13px; color: var(--muted); margin:4px 0 0; }
+  #scanBtn { background: var(--accent); color:#1a1204; border:none; font-weight:600; font-size:13px; padding:10px 18px; cursor:pointer; white-space:nowrap; }
+  #scanBtn:hover { filter: brightness(1.08); }
+  #scanBtn:disabled { opacity:0.55; cursor:wait; }
+  #scanResult { font-size:12px; color: var(--muted); margin-top:10px; min-height:16px; }
+  #lastScan { font-size:12px; color: var(--muted); margin-top:4px; }
+  #lastScan strong { color: var(--ink); font-weight:600; }
+
+  .ticker { display:flex; gap:32px; padding:16px 32px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  .ticker-item .num { font-family: var(--font-display); font-size:22px; font-weight:600; display:block; line-height:1; }
+  .ticker-item .lbl { font-size:12px; color: var(--muted); margin-top:4px; display:block; }
+  .ticker-item.pending .num { color: var(--accent); }
+  .ticker-item.affiliated .num { color: var(--good); }
+
+  .tabs { display:flex; gap:24px; padding:0 32px; border-bottom:1px solid var(--line); }
+  .tabs button { background:none; border:none; color: var(--muted); font-family: var(--font-body); font-size:13px; font-weight:500; padding:14px 0; cursor:pointer; border-bottom:2px solid transparent; margin-bottom:-1px; }
+  .tabs button.active { color: var(--ink); border-bottom-color: var(--accent); }
+
+  .filters { display:flex; gap:12px; padding:14px 32px; border-bottom:1px solid var(--line); flex-wrap:wrap; align-items:center; }
+  .filters label { font-size:11px; color: var(--muted); margin-right:6px; }
+  .filters select {
+    background:#0d0e10; border:1px solid var(--line); color: var(--ink);
+    padding:7px 10px; font-family: var(--font-body); font-size:12.5px; cursor:pointer;
   }
+  .filters .clear-btn { font-size:12px; color: var(--muted); background:none; border:none; cursor:pointer; text-decoration:underline; }
+
+  #fatalError { display:none; margin:24px 32px; padding:16px 18px; background:#2a1712; border:1px solid var(--bad); color:#ffcfc2; font-size:13px; line-height:1.5; }
+
+  #grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap:1px; background: var(--line); padding:1px; }
+  .card { background: var(--panel); display:flex; flex-direction:column; }
+  .card-media { position:relative; background:#fff; height:170px; }
+  .card-media img { width:100%; height:100%; object-fit:contain; }
+  .tag-row { position:absolute; top:0; left:0; right:0; display:flex; justify-content:space-between; }
+  .tag { font-size:11px; font-weight:600; padding:4px 10px; }
+  .tag-group { font-size:10.5px; font-weight:600; padding:4px 8px; background:rgba(16,17,20,0.85); color: var(--ink); }
+  .card-body { padding:16px; display:flex; flex-direction:column; gap:10px; flex:1; }
+  .card-title { font-size:13.5px; line-height:1.35; min-height:36px; color: var(--ink); }
+  .price-row { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+  .price-current { font-family: var(--font-display); font-size:21px; font-weight:600; }
+  .price-previous { font-size:13px; color: var(--muted); text-decoration:line-through; }
+  .discount-pill { font-family: var(--font-display); font-size:12px; font-weight:600; color: var(--good); border:1px solid var(--good); padding:1px 6px; }
+  .meta-row { font-size:11.5px; color: var(--muted); display:flex; align-items:center; gap:6px; }
+  .status-dot { width:6px; height:6px; border-radius:50%; flex-shrink:0; }
+  .status-PENDING .status-dot { background: var(--accent); }
+  .status-AFFILIATED .status-dot { background: var(--good); }
+  .status-IGNORED .status-dot { background: var(--muted); }
+  .actions { display:flex; gap:8px; margin-top:auto; padding-top:4px; flex-wrap:wrap; }
+  .actions a, .actions button { flex:1; text-align:center; padding:9px 6px; font-size:12px; font-weight:500; text-decoration:none; border:1px solid var(--line); background:transparent; color: var(--ink); cursor:pointer; font-family: var(--font-body); min-width:90px; }
+  .actions a:hover, .actions button:hover { border-color: var(--accent); color: var(--accent); }
+
+  #empty { padding:80px 32px; text-align:center; color: var(--muted); font-size:14px; }
 </style>
 </head>
 <body>
@@ -239,6 +93,7 @@
       </div>
       <button id="scanBtn">Buscar promoções agora</button>
     </div>
+    <div id="lastScan"></div>
     <div id="scanResult"></div>
   </div>
 
@@ -253,6 +108,18 @@
     <button data-status="PENDING">Pendentes</button>
     <button data-status="AFFILIATED">Já afiliadas</button>
     <button data-status="IGNORED">Ignoradas</button>
+  </div>
+
+  <div class="filters">
+    <div>
+      <label>Marketplace</label>
+      <select id="marketplaceFilter"><option value="ALL">Todos</option></select>
+    </div>
+    <div>
+      <label>Grupo</label>
+      <select id="groupFilter"><option value="ALL">Todos</option></select>
+    </div>
+    <button class="clear-btn" id="clearFilters">Limpar filtros</button>
   </div>
 
   <div id="fatalError"></div>
