@@ -64,18 +64,30 @@ async function checkProduct(product, marketplaceId) {
 
   if (!hasPromotion) return 0;
 
+  const discountRate = salePrice.regular_amount
+    ? Number((((salePrice.regular_amount - salePrice.amount) / salePrice.regular_amount) * 100).toFixed(2))
+    : null;
+
+  // Casa por produto + preço (mesma promoção de verdade). Se o preço mudou,
+  // é uma nova oportunidade e vira uma linha nova — senão, só atualiza
+  // grupo (caso estivesse faltando) e a data da busca.
   const { data: existing } = await supabaseAdmin
     .from('promotions')
-    .select('id')
+    .select('id, watch_group_id')
     .eq('product_id', product.id)
     .eq('current_price', salePrice.amount)
     .maybeSingle();
 
-  if (existing) return 0;
-
-  const discountRate = salePrice.regular_amount
-    ? Number((((salePrice.regular_amount - salePrice.amount) / salePrice.regular_amount) * 100).toFixed(2))
-    : null;
+  if (existing) {
+    await supabaseAdmin
+      .from('promotions')
+      .update({
+        watch_group_id: existing.watch_group_id || product.watch_group_id || null,
+        detected_at: new Date().toISOString(),
+      })
+      .eq('id', existing.id);
+    return 0;
+  }
 
   await supabaseAdmin.from('promotions').insert({
     marketplace_id: marketplaceId,
