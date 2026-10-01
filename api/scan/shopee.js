@@ -57,7 +57,6 @@ async function processOffer(offer, marketplaceId, group, creds) {
   const discountRate = offer.priceDiscountRate || 0;
   if (discountRate < MIN_DISCOUNT_PCT) return 0;
 
-  // Evita duplicar a mesma oferta se já vimos esse item com esse preço.
   const { data: existing } = await supabaseAdmin
     .from('promotions')
     .select('id')
@@ -86,11 +85,12 @@ async function processOffer(offer, marketplaceId, group, creds) {
 
   await supabaseAdmin.from('promotions').insert({
     marketplace_id: marketplaceId,
+    watch_group_id: group.id,
     title: offer.productName,
     image_url: offer.imageUrl,
     original_url: offer.productLink || offer.offerLink,
     current_price: offer.priceMin,
-    previous_price: null, // a Shopee não retorna o "preço de antes" nesse endpoint — só a taxa de desconto
+    previous_price: null,
     discount_rate: discountRate,
     source: 'shopee_affiliate_api',
     status: 'PENDING',
