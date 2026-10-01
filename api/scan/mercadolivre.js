@@ -80,6 +80,7 @@ async function checkProduct(product, marketplaceId) {
   await supabaseAdmin.from('promotions').insert({
     marketplace_id: marketplaceId,
     product_id: product.id,
+    watch_group_id: product.watch_group_id || null,
     title: product.title,
     image_url: product.image_url,
     original_url: product.permalink,
