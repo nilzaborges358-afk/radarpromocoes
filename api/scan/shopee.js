@@ -33,7 +33,8 @@ module.exports = async function handler(req, res) {
 
     for (const group of groups || []) {
       try {
-        const offers = await searchProductOffers(creds.client_id, creds.client_secret, group.name, { limit: 20 });
+        const keyword = group.search_keyword || group.name;
+        const offers = await searchProductOffers(creds.client_id, creds.client_secret, keyword, { limit: 20 });
         for (const offer of offers) {
           found += await processOffer(offer, marketplace.id, group, creds);
         }
