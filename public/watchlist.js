@@ -9,6 +9,7 @@ async function load() {
     groups = data.groups;
     products = data.products;
     renderGroupSelect();
+    renderGroupsList();
     renderList();
   } catch (err) {
     document.getElementById('groups').innerHTML = `<p style="color:#e2604a; padding: 0 32px;">Erro ao carregar: ${err.message}</p>`;
@@ -20,6 +21,27 @@ function renderGroupSelect() {
   select.innerHTML =
     `<option value="">Sem grupo</option>` +
     groups.map((g) => `<option value="${g.id}">${escapeHtml(g.name)}</option>`).join('');
+}
+
+function renderGroupsList() {
+  const container = document.getElementById('groupsList');
+  if (groups.length === 0) {
+    container.innerHTML = `<p style="color:var(--muted); font-size:12px;">Nenhum grupo criado ainda.</p>`;
+    return;
+  }
+  container.innerHTML = groups.map((g) => `
+    <div class="group-row">
+      <div>
+        <div class="g-name">${escapeHtml(g.name)}</div>
+        <div class="g-keyword">busca por: "${escapeHtml(g.search_keyword || g.name)}"</div>
+      </div>
+      <button class="remove" data-remove-group="${g.id}">Remover</button>
+    </div>
+  `).join('');
+
+  container.querySelectorAll('[data-remove-group]').forEach((btn) => {
+    btn.addEventListener('click', () => removeGroup(btn.dataset.removeGroup));
+  });
 }
 
 function renderList() {
@@ -119,6 +141,87 @@ async function removeProduct(id) {
   await load();
 }
 
+async function testSearch() {
+  const keyword = document.getElementById('newGroupKeyword').value.trim();
+  const btn = document.getElementById('testSearchBtn');
+  const preview = document.getElementById('testPreview');
+  const msg = document.getElementById('groupMsg');
+
+  if (!keyword) { msg.textContent = 'Digite uma palavra-chave antes de testar.'; return; }
+
+  btn.disabled = true;
+  btn.textContent = 'Testando...';
+  msg.textContent = '';
+  preview.innerHTML = '';
+
+  try {
+    const res = await fetch('/api/groups/test-search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keyword }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Falha ao testar');
+
+    if (data.preview.length === 0) {
+      msg.textContent = 'Nenhum resultado para essa palavra-chave — tente algo mais específico ou diferente.';
+    } else {
+      preview.innerHTML = data.preview.map((item) => `
+        <div class="item">
+          <img src="${item.image || ''}" alt="" loading="lazy" />
+          <div>${escapeHtml(item.title)}</div>
+          <div class="t-price">R$ ${Number(item.price).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</div>
+        </div>
+      `).join('');
+      msg.textContent = 'Isso aqui bate com o que você quer? Se sim, clique em "Criar grupo".';
+    }
+  } catch (err) {
+    msg.textContent = `Erro: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Testar busca';
+  }
+}
+
+async function createGroup() {
+  const name = document.getElementById('newGroupName').value.trim();
+  const keyword = document.getElementById('newGroupKeyword').value.trim();
+  const btn = document.getElementById('createGroupBtn');
+  const msg = document.getElementById('groupMsg');
+
+  if (!name || !keyword) { msg.textContent = 'Preencha o nome e a palavra-chave antes de criar.'; return; }
+
+  btn.disabled = true;
+  btn.textContent = 'Criando...';
+
+  try {
+    const res = await fetch('/api/groups', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, search_keyword: keyword }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Falha ao criar');
+
+    document.getElementById('newGroupName').value = '';
+    document.getElementById('newGroupKeyword').value = '';
+    document.getElementById('testPreview').innerHTML = '';
+    msg.textContent = 'Grupo criado!';
+    await load();
+  } catch (err) {
+    msg.textContent = `Erro: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Criar grupo';
+  }
+}
+
+async function removeGroup(id) {
+  if (!confirm('Remover esse grupo? Produtos e promoções ligados a ele ficam "sem grupo", mas não são apagados.')) return;
+  await fetch(`/api/groups?id=${id}`, { method: 'DELETE' });
+  await load();
+}
+
 function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str || '';
@@ -126,4 +229,6 @@ function escapeHtml(str) {
 }
 
 document.getElementById('addBtn').addEventListener('click', addProduct);
+document.getElementById('testSearchBtn').addEventListener('click', testSearch);
+document.getElementById('createGroupBtn').addEventListener('click', createGroup);
 load();
