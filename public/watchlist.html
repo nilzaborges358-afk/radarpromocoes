@@ -16,7 +16,9 @@
   * { box-sizing: border-box; }
   body { margin:0; background: var(--bg); color: var(--ink); font-family: var(--font-body); -webkit-font-smoothing: antialiased; }
 
-  nav { display:flex; gap:24px; padding:18px 32px; border-bottom:1px solid var(--line); }
+  nav { display:flex; justify-content:space-between; align-items:center; padding:18px 32px; border-bottom:1px solid var(--line); }
+  nav .nav-links { display:flex; gap:24px; }
+  nav .logout-link { cursor:pointer; }
   nav a { color: var(--muted); text-decoration:none; font-size:13px; font-weight:500; padding-bottom:4px; border-bottom:2px solid transparent; }
   nav a.active { color: var(--ink); border-bottom-color: var(--accent); }
 
@@ -85,9 +87,12 @@
 <body>
 
   <nav>
-    <a href="index.html">Painel geral</a>
-    <a href="marketplaces.html">Marketplaces</a>
-    <a href="watchlist.html" class="active">Lista de vigilância</a>
+    <div class="nav-links">
+      <a href="index.html">Painel geral</a>
+      <a href="marketplaces.html">Marketplaces</a>
+      <a href="watchlist.html" class="active">Lista de vigilância</a>
+    </div>
+    <a class="logout-link" id="logoutLink">Sair</a>
   </nav>
 
   <div class="masthead">
@@ -136,5 +141,11 @@
   <div id="emptyNote" class="empty-note" style="display:none">Nenhum produto vigiado ainda. Cole um link acima para começar.</div>
 
   <script src="watchlist.js"></script>
+  <script>
+    document.getElementById('logoutLink').addEventListener('click', async () => {
+      await fetch('/api/auth/logout', { method: 'POST' });
+      window.location.href = '/login.html';
+    });
+  </script>
 </body>
 </html>
