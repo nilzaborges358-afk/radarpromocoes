@@ -15,10 +15,17 @@ module.exports = async function handler(req, res) {
       .eq('slug', 'mercadolivre')
       .single();
 
-    const { data: products } = await supabaseAdmin
+    const { data: allProducts } = await supabaseAdmin
       .from('products')
       .select('*')
       .eq('marketplace_id', marketplace.id);
+
+    const groupsParam = req.query.groups ? String(req.query.groups).split(',') : null;
+    const products = groupsParam
+      ? (allProducts || []).filter((p) =>
+          groupsParam.includes(p.watch_group_id || 'none')
+        )
+      : allProducts;
 
     let found = 0;
     const errors = [];
