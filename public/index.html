@@ -16,7 +16,9 @@
   * { box-sizing: border-box; }
   body { margin:0; background: var(--bg); color: var(--ink); font-family: var(--font-body); -webkit-font-smoothing: antialiased; }
 
-  nav { display:flex; gap:24px; padding:18px 32px; border-bottom:1px solid var(--line); }
+  nav { display:flex; justify-content:space-between; align-items:center; padding:18px 32px; border-bottom:1px solid var(--line); }
+  nav .nav-links { display:flex; gap:24px; }
+  nav .logout-link { cursor:pointer; }
   nav a { color: var(--muted); text-decoration:none; font-size:13px; font-weight:500; padding-bottom:4px; border-bottom:2px solid transparent; }
   nav a.active { color: var(--ink); border-bottom-color: var(--accent); }
 
@@ -80,14 +82,34 @@
   .actions a:hover, .actions button:hover { border-color: var(--accent); color: var(--accent); }
 
   #empty { padding:80px 32px; text-align:center; color: var(--muted); font-size:14px; }
+
+  .modal-overlay {
+    display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6);
+    align-items:center; justify-content:center; z-index:50;
+  }
+  .modal-overlay.show { display:flex; }
+  .modal-box { width:100%; max-width:420px; background: var(--panel); border:1px solid var(--line); padding:24px; }
+  .modal-box h3 { font-family: var(--font-display); font-size:16px; margin:0 0 4px; }
+  .modal-box .modal-sub { font-size:12px; color: var(--muted); margin:0 0 18px; }
+  .modal-section { margin-bottom:16px; }
+  .modal-section label.section-label { display:block; font-size:11px; color: var(--muted); text-transform:uppercase; letter-spacing:0.04em; margin-bottom:8px; }
+  .radio-row, .check-row { display:flex; align-items:center; gap:8px; padding:7px 0; font-size:13.5px; cursor:pointer; }
+  .modal-actions { display:flex; gap:10px; margin-top:8px; }
+  .modal-actions button { flex:1; padding:10px; font-size:13px; font-weight:600; cursor:pointer; border:1px solid var(--line); background:transparent; color: var(--ink); }
+  .modal-actions button.confirm { background: var(--accent); color:#1a1204; border:none; }
+  .modal-actions button.confirm:disabled { opacity:0.5; cursor:not-allowed; }
+  .modal-note { font-size:11px; color: var(--muted); margin-top:4px; }
 </style>
 </head>
 <body>
 
   <nav>
-    <a href="index.html" class="active">Painel geral</a>
-    <a href="marketplaces.html">Marketplaces</a>
-    <a href="watchlist.html">Lista de vigilância</a>
+    <div class="nav-links">
+      <a href="index.html" class="active">Painel geral</a>
+      <a href="marketplaces.html">Marketplaces</a>
+      <a href="watchlist.html">Lista de vigilância</a>
+    </div>
+    <a class="logout-link" id="logoutLink">Sair</a>
   </nav>
 
   <div class="masthead">
@@ -145,8 +167,38 @@
   <div id="grid"></div>
   <div id="empty" style="display:none">Nenhuma promoção por aqui ainda. Clique em "Buscar promoções agora" no topo.</div>
 
+  <div class="modal-overlay" id="scanModalOverlay">
+    <div class="modal-box">
+      <h3>Buscar promoções</h3>
+      <p class="modal-sub">Escolha um marketplace por vez — isso evita sobrecarregar o sistema buscando tudo de uma vez.</p>
+
+      <div class="modal-section">
+        <label class="section-label">Marketplace (escolha um)</label>
+        <label class="radio-row"><input type="radio" name="scanMarketplace" value="mercadolivre" /> Mercado Livre</label>
+        <label class="radio-row"><input type="radio" name="scanMarketplace" value="shopee" /> Shopee</label>
+      </div>
+
+      <div class="modal-section">
+        <label class="section-label">Grupos a considerar (pode marcar vários)</label>
+        <div id="scanGroupsCheckboxes"></div>
+      </div>
+
+      <div class="modal-actions">
+        <button id="scanModalCancel">Cancelar</button>
+        <button class="confirm" id="scanModalConfirm" disabled>Buscar</button>
+      </div>
+      <div class="modal-note" id="scanModalMsg"></div>
+    </div>
+  </div>
+
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="config.js"></script>
   <script src="dashboard.js"></script>
+  <script>
+    document.getElementById('logoutLink').addEventListener('click', async () => {
+      await fetch('/api/auth/logout', { method: 'POST' });
+      window.location.href = '/login.html';
+    });
+  </script>
 </body>
 </html>
