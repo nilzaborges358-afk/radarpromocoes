@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8" />
+<title>Radar — Login</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #101114; --panel: #17181c; --line: #2b2d33; --ink: #f3f2ee;
+    --muted: #8b8d94; --accent: #e7b24a; --bad: #e2604a;
+    --font-display: 'Space Grotesk', sans-serif; --font-body: 'Inter', sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+    background: var(--bg); color: var(--ink); font-family: var(--font-body);
+  }
+  .box { width:100%; max-width:340px; padding:32px; background: var(--panel); border:1px solid var(--line); }
+  .wordmark { font-family: var(--font-display); font-weight:700; font-size:24px; margin:0 0 4px; letter-spacing:-0.02em; }
+  .wordmark span { color: var(--accent); }
+  .tagline { font-size:12.5px; color: var(--muted); margin:0 0 24px; }
+  label { display:block; font-size:12px; color: var(--muted); margin-bottom:6px; }
+  input {
+    width:100%; background:#0d0e10; border:1px solid var(--line); color: var(--ink);
+    padding:10px 12px; font-family: var(--font-body); font-size:14px; margin-bottom:14px;
+  }
+  button {
+    width:100%; background: var(--accent); color:#1a1204; border:none; font-weight:600;
+    font-size:14px; padding:11px; cursor:pointer;
+  }
+  button:disabled { opacity:0.6; cursor:wait; }
+  #msg { font-size:12.5px; color: var(--bad); margin-top:12px; min-height:16px; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1 class="wordmark">RADAR<span>.</span></h1>
+    <p class="tagline">Acesso restrito</p>
+    <label>Senha</label>
+    <input type="password" id="password" autofocus />
+    <button id="loginBtn">Entrar</button>
+    <div id="msg"></div>
+  </div>
+
+  <script>
+    async function doLogin() {
+      const password = document.getElementById('password').value;
+      const btn = document.getElementById('loginBtn');
+      const msg = document.getElementById('msg');
+      btn.disabled = true;
+      msg.textContent = '';
+
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Senha incorreta.');
+        window.location.href = '/index.html';
+      } catch (err) {
+        msg.textContent = err.message;
+        btn.disabled = false;
+      }
+    }
+
+    document.getElementById('loginBtn').addEventListener('click', doLogin);
+    document.getElementById('password').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') doLogin();
+    });
+  </script>
+</body>
+</html>
