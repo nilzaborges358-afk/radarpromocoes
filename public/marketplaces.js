@@ -45,7 +45,7 @@ function renderForm(slug) {
       </div>
       <div class="row-actions">
         <button class="primary" onclick="saveCredentials('mercadolivre')">Salvar credenciais</button>
-        <a class="primary" style="background:transparent; color:var(--accent); border:1px solid var(--accent);" href="/api/auth/mercadolivre/login" target="_blank">Conectar minha loja</a>
+        <a class="primary" style="background:transparent; color:var(--accent); border:1px solid var(--accent);" href="/api/auth/mercadolivre" target="_blank">Conectar minha loja</a>
       </div>
       <div class="save-msg" id="mercadolivre-save-msg"></div>
       <p class="soon-note" style="margin-top:10px;">Só usado para a sua própria loja (webhook). A busca de promoções de terceiros no Mercado Livre está bloqueada pela plataforma — veja a tela de Vigilância para o que ainda funciona.</p>
