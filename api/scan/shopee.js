@@ -26,7 +26,12 @@ module.exports = async function handler(req, res) {
       return;
     }
 
-    const { data: groups } = await supabaseAdmin.from('watch_groups').select('*');
+    const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
+
+    const groupsParam = req.query.groups ? String(req.query.groups).split(',') : null;
+    const groups = groupsParam
+      ? (allGroups || []).filter((g) => groupsParam.includes(g.id))
+      : allGroups;
 
     let found = 0;
     const errors = [];
