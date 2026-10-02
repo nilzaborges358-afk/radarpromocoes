@@ -15,6 +15,7 @@ let currentMarketplace = 'ALL';
 let currentGroup = 'ALL';
 let currentDateFilter = 'TODAY';
 let allPromotions = [];
+let knownGroups = [];
 
 function showFatalError(message) {
   const box = document.getElementById('fatalError');
@@ -80,31 +81,48 @@ function init() {
     render();
   });
 
-  document.getElementById('scanBtn').addEventListener('click', runScan);
+  document.getElementById('scanBtn').addEventListener('click', openScanModal);
+  document.getElementById('scanModalCancel').addEventListener('click', closeScanModal);
+  document.getElementById('scanModalConfirm').addEventListener('click', confirmScan);
+  document.querySelectorAll('input[name="scanMarketplace"]').forEach((radio) => {
+    radio.addEventListener('change', updateScanConfirmState);
+  });
 
   loadFilterOptions();
   loadPromotions();
   setInterval(loadPromotions, 60000); // só relê o que já está salvo — não dispara nova busca
+  setInterval(loadFilterOptions, 60000); // pega grupos/marketplaces novos sem precisar recarregar a página
 }
 
 async function loadFilterOptions() {
-  const { data: marketplaces } = await client.from('marketplaces').select('slug, name').order('name');
+  const { data: marketplaces, error: mpError } = await client.from('marketplaces').select('slug, name').order('name');
+  if (mpError) { showFatalError(`Erro ao carregar marketplaces: ${mpError.message}`); return; }
+
   const mpSelect = document.getElementById('marketplaceFilter');
+  const mpPrevValue = mpSelect.value;
+  mpSelect.innerHTML = '<option value="ALL">Todos</option>';
   (marketplaces || []).forEach((mp) => {
     const opt = document.createElement('option');
     opt.value = mp.slug;
     opt.textContent = MARKETPLACE_LABELS[mp.slug]?.name || mp.name;
     mpSelect.appendChild(opt);
   });
+  if ([...mpSelect.options].some((o) => o.value === mpPrevValue)) mpSelect.value = mpPrevValue;
 
-  const { data: groups } = await client.from('watch_groups').select('id, name').order('name');
+  const { data: groups, error: groupError } = await client.from('watch_groups').select('id, name').order('name');
+  if (groupError) { showFatalError(`Erro ao carregar grupos: ${groupError.message}`); return; }
+
+  knownGroups = groups || [];
   const groupSelect = document.getElementById('groupFilter');
-  (groups || []).forEach((g) => {
+  const groupPrevValue = groupSelect.value;
+  groupSelect.innerHTML = '<option value="ALL">Todos</option>';
+  knownGroups.forEach((g) => {
     const opt = document.createElement('option');
     opt.value = g.id;
     opt.textContent = g.name;
     groupSelect.appendChild(opt);
   });
+  if ([...groupSelect.options].some((o) => o.value === groupPrevValue)) groupSelect.value = groupPrevValue;
 }
 
 async function loadPromotions() {
@@ -253,34 +271,72 @@ async function markStatus(id, status) {
   await loadPromotions();
 }
 
-async function runScan() {
-  const btn = document.getElementById('scanBtn');
-  const resultEl = document.getElementById('scanResult');
-  btn.disabled = true;
-  btn.textContent = 'Buscando...';
-  resultEl.textContent = '';
+function openScanModal() {
+  // Monta as checkboxes de grupo (+ "Sem grupo"), todas marcadas por padrão.
+  const container = document.getElementById('scanGroupsCheckboxes');
+  const groupOptions = [...knownGroups.map((g) => ({ id: g.id, name: g.name })), { id: 'none', name: 'Sem grupo' }];
 
-  const results = await Promise.allSettled([
-    fetch('/api/scan/mercadolivre').then((r) => r.json().then((data) => ({ ok: r.ok, data, name: 'Mercado Livre' }))),
-    fetch('/api/scan/shopee').then((r) => r.json().then((data) => ({ ok: r.ok, data, name: 'Shopee' }))),
-  ]);
+  container.innerHTML = groupOptions.map((g) => `
+    <label class="check-row">
+      <input type="checkbox" class="scan-group-checkbox" value="${g.id}" checked /> ${escapeHtml(g.name)}
+    </label>
+  `).join('');
 
-  const parts = results.map((result) => {
-    if (result.status !== 'fulfilled') return `Erro inesperado: ${result.reason}`;
-    const { ok, data, name } = result.value;
-    if (!ok) return `${name}: erro — ${data.error || 'falha desconhecida'}`;
+  document.querySelectorAll('input[name="scanMarketplace"]').forEach((r) => { r.checked = false; });
+  document.getElementById('scanModalMsg').textContent = '';
+  updateScanConfirmState();
+  document.getElementById('scanModalOverlay').classList.add('show');
+}
+
+function closeScanModal() {
+  document.getElementById('scanModalOverlay').classList.remove('show');
+}
+
+function updateScanConfirmState() {
+  const selected = document.querySelector('input[name="scanMarketplace"]:checked');
+  document.getElementById('scanModalConfirm').disabled = !selected;
+}
+
+async function confirmScan() {
+  const marketplace = document.querySelector('input[name="scanMarketplace"]:checked')?.value;
+  if (!marketplace) return;
+
+  const groupIds = [...document.querySelectorAll('.scan-group-checkbox:checked')].map((cb) => cb.value);
+  const msg = document.getElementById('scanModalMsg');
+  const confirmBtn = document.getElementById('scanModalConfirm');
+
+  if (groupIds.length === 0) {
+    msg.textContent = 'Marque pelo menos um grupo (ou "Sem grupo") antes de buscar.';
+    return;
+  }
+
+  confirmBtn.disabled = true;
+  confirmBtn.textContent = 'Buscando...';
+  msg.textContent = '';
+
+  const marketplaceName = marketplace === 'mercadolivre' ? 'Mercado Livre' : 'Shopee';
+
+  try {
+    const res = await fetch(`/api/scan/${marketplace}?groups=${groupIds.join(',')}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Falha na busca');
+
     const found = data.promotionsFound ?? 0;
     const scannedLabel = data.categoriesScanned !== undefined
       ? `${data.categoriesScanned} categoria(s)`
       : `${data.groupsSearched ?? data.productsChecked ?? 0} grupo(s)/produto(s)`;
-    return `${name}: ${scannedLabel}, ${found} nova(s)`;
-  });
 
-  resultEl.textContent = parts.join(' · ');
-  await loadPromotions();
+    document.getElementById('scanResult').textContent = `${marketplaceName}: ${scannedLabel}, ${found} nova(s)` +
+      (data.errors?.length ? ` (${data.errors.length} erro(s) — veja integration_logs)` : '');
 
-  btn.disabled = false;
-  btn.textContent = 'Buscar promoções agora';
+    closeScanModal();
+    await loadPromotions();
+  } catch (err) {
+    msg.textContent = `Erro: ${err.message}`;
+  } finally {
+    confirmBtn.disabled = false;
+    confirmBtn.textContent = 'Buscar';
+  }
 }
 
 function formatPrice(value) {
