@@ -196,7 +196,7 @@
   <script src="dashboard.js"></script>
   <script>
     document.getElementById('logoutLink').addEventListener('click', async () => {
-      await fetch('/api/auth/logout', { method: 'POST' });
+      await fetch('/api/auth/session', { method: 'DELETE' });
       window.location.href = '/login.html';
     });
   </script>
