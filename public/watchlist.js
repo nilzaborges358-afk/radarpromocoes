@@ -155,10 +155,10 @@ async function testSearch() {
   preview.innerHTML = '';
 
   try {
-    const res = await fetch('/api/groups/test-search', {
+    const res = await fetch('/api/groups', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ keyword }),
+      body: JSON.stringify({ action: 'test', keyword }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Falha ao testar');
