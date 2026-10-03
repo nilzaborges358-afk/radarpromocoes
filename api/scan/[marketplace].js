@@ -2,7 +2,7 @@ const { getSalePrice } = require('../../src/integrations/mercadolivre/client');
 const { searchProductOffers, generateShortLink } = require('../../src/integrations/shopee/client');
 const { supabaseAdmin } = require('../../src/core/database/supabaseClient');
 
-const MIN_DISCOUNT_PCT = 15;
+const MIN_DISCOUNT_PCT = 10; // era 15 — baixei pra achar mais resultado em categorias mais de nicho
 
 // GET /api/scan/mercadolivre?groups=id1,id2,none
 // GET /api/scan/shopee?groups=id1,id2
@@ -146,7 +146,7 @@ async function scanShopee(req, res) {
     for (const group of groups || []) {
       try {
         const keyword = group.search_keyword || group.name;
-        const offers = await searchProductOffers(creds.client_id, creds.client_secret, keyword, { limit: 20 });
+        const offers = await searchProductOffers(creds.client_id, creds.client_secret, keyword);
         for (const offer of offers) {
           found += await processShopeeOffer(offer, marketplace.id, group, creds);
         }
