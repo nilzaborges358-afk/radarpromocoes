@@ -45,11 +45,21 @@ async function graphqlRequest(appId, appSecret, query, variables) {
  * API — a Shopee não publica o schema GraphQL completo. Assim que as credenciais forem
  * aprovadas, rode uma query de introspecção (`{ __schema { types { name } } }`) ou teste
  * uma chamada real e confirme se os nomes batem; ajuste aqui se vier diferente.
+ *
+ * sortType — a API aceita: 1 relevância · 2 mais vendidos · 3 preço (maior→menor)
+ * · 4 preço (menor→maior) · 5 maior comissão (padrão da API se não informado).
+ * Usamos 2 (mais vendidos) de propósito: ordenar por comissão tende a devolver
+ * sempre o mesmo pequeno grupo de produtos (comissão não muda a cada busca) e
+ * não tem nenhuma relação com desconto. NÃO EXISTE na API um sortType de
+ * "maior desconto" nem um sinal de "promoção ativa agora" — o campo
+ * priceDiscountRate é só a diferença entre o preço de tabela e o de venda
+ * daquele anúncio, não uma oferta relâmpago com prazo. Isso é um limite real
+ * da API pública de afiliados, não algo que dá pra contornar aqui.
  */
-async function searchProductOffers(appId, appSecret, keyword, { page = 1, limit = 20 } = {}) {
+async function searchProductOffers(appId, appSecret, keyword, { page = 1, limit = 40, sortType = 2 } = {}) {
   const query = `
-    query ProductOfferQuery($keyword: String, $page: Int, $limit: Int) {
-      productOfferV2(keyword: $keyword, page: $page, limit: $limit) {
+    query ProductOfferQuery($keyword: String, $page: Int, $limit: Int, $sortType: Int) {
+      productOfferV2(keyword: $keyword, page: $page, limit: $limit, sortType: $sortType) {
         nodes {
           itemId
           productName
@@ -64,7 +74,7 @@ async function searchProductOffers(appId, appSecret, keyword, { page = 1, limit 
       }
     }
   `;
-  const data = await graphqlRequest(appId, appSecret, query, { keyword, page, limit });
+  const data = await graphqlRequest(appId, appSecret, query, { keyword, page, limit, sortType });
   return data?.productOfferV2?.nodes || [];
 }
 
