@@ -1,7 +1,7 @@
 const MARKETPLACES = [
   { slug: 'mercadolivre', name: 'Mercado Livre', color: '#fff159', implemented: true },
   { slug: 'shopee', name: 'Shopee', color: '#ee4d2d', implemented: true },
-  { slug: 'amazon', name: 'Amazon', color: '#ff9900', implemented: false },
+  { slug: 'amazon', name: 'Amazon', color: '#ff9900', implemented: true },
   { slug: 'magalu', name: 'Magalu', color: '#0086ff', implemented: false },
   { slug: 'tiktokshop', name: 'TikTok Shop', color: '#ffffff', implemented: false },
   { slug: 'netshoes', name: 'Netshoes', color: '#f5761a', implemented: false },
@@ -30,6 +30,7 @@ function render() {
 
   loadStatus('mercadolivre');
   loadStatus('shopee');
+  loadStatus('amazon');
 }
 
 function renderForm(slug) {
@@ -70,6 +71,32 @@ function renderForm(slug) {
     `;
   }
 
+  if (slug === 'amazon') {
+    return `
+      <div class="field">
+        <label>Associate Tag (do programa Associados)</label>
+        <input type="text" id="amazon-tag" placeholder="Ex: seunome-20" />
+      </div>
+      <div class="field">
+        <label>Creators API Access Key</label>
+        <input type="text" id="amazon-id" placeholder="Cole a Access Key" />
+      </div>
+      <div class="field">
+        <label>Creators API Secret Key</label>
+        <input type="password" id="amazon-secret" placeholder="Cole a Secret Key" />
+      </div>
+      <div class="row-actions">
+        <button class="primary" onclick="saveCredentials('amazon')">Salvar credenciais</button>
+      </div>
+      <div class="save-msg" id="amazon-save-msg"></div>
+      <p class="soon-note" style="margin-top:10px; color:var(--accent);">
+        ⚠️ A Amazon só libera a busca de produtos depois que sua conta tiver 10 vendas qualificadas
+        nos últimos 30 dias como Associado. Pode salvar as credenciais desde já — a busca fica
+        "esperando" até o requisito ser atingido.
+      </p>
+    `;
+  }
+
   return '';
 }
 
@@ -89,8 +116,16 @@ async function loadStatus(slug) {
       dot.className = 'dot on';
       statusText.textContent = `Conectado${data.sellerId ? ` (seller ${data.sellerId})` : ''}`;
     } else if (data.hasCredentials) {
-      dot.className = slug === 'shopee' ? 'dot on' : 'dot off';
-      statusText.textContent = slug === 'shopee' ? 'Credenciais salvas' : 'Credenciais salvas — falta conectar a loja';
+      if (slug === 'shopee') {
+        dot.className = 'dot on';
+        statusText.textContent = 'Credenciais salvas';
+      } else if (slug === 'amazon') {
+        dot.className = 'dot off';
+        statusText.textContent = 'Credenciais salvas — aguardando requisito de vendas';
+      } else {
+        dot.className = 'dot off';
+        statusText.textContent = 'Credenciais salvas — falta conectar a loja';
+      }
     } else {
       dot.className = 'dot off';
       statusText.textContent = 'Não configurado';
@@ -99,6 +134,10 @@ async function loadStatus(slug) {
     if (data.clientId) {
       const input = document.getElementById(`${slug}-id`);
       if (input) input.value = data.clientId;
+    }
+    if (data.extraCredential) {
+      const tagInput = document.getElementById(`${slug}-tag`);
+      if (tagInput) tagInput.value = data.extraCredential;
     }
   } catch (err) {
     const statusText = document.getElementById(`status-${slug}`);
@@ -118,9 +157,18 @@ async function saveCredentials(slug) {
 
   msg.textContent = 'Salvando...';
   try {
-    const body = slug === 'shopee'
-      ? { app_id: id, app_secret: secret }
-      : { client_id: id, client_secret: secret };
+    let body;
+    if (slug === 'shopee') {
+      body = { app_id: id, app_secret: secret };
+    } else if (slug === 'amazon') {
+      body = {
+        access_key: id,
+        secret_key: secret,
+        associate_tag: document.getElementById('amazon-tag').value.trim(),
+      };
+    } else {
+      body = { client_id: id, client_secret: secret };
+    }
 
     const res = await fetch(`/api/credentials/${slug}`, {
       method: 'POST',
