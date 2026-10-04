@@ -11,6 +11,7 @@ module.exports = async function handler(req, res) {
   const slug = req.query.marketplace;
   if (slug === 'mercadolivre') return scanMercadoLivre(req, res);
   if (slug === 'shopee') return scanShopee(req, res);
+  if (slug === 'amazon') return scanAmazon(req, res);
   res.status(404).json({ error: `Marketplace "${slug}" não suportado.` });
 };
 
@@ -115,6 +116,47 @@ async function checkMlProduct(product, marketplaceId) {
   return 1;
 }
 
+// ---------------- Amazon ----------------
+//
+// A Creators API da Amazon (que substituiu a antiga PA-API, desativada em 2026)
+// só libera consulta de catálogo depois que a conta de Associado tiver pelo
+// menos 10 vendas qualificadas nos últimos 30 dias — é uma trava da própria
+// Amazon, documentada por eles. Enquanto isso, não dá pra implementar a
+// chamada de verdade sem arriscar inventar um endpoint que eu não confirmei.
+// Assim que a conta atingir o requisito e a documentação completa abrir,
+// essa função troca por uma implementação real.
+async function scanAmazon(req, res) {
+  try {
+    const { data: marketplace } = await supabaseAdmin
+      .from('marketplaces')
+      .select('id')
+      .eq('slug', 'amazon')
+      .single();
+
+    const { data: creds } = await supabaseAdmin
+      .from('marketplace_credentials')
+      .select('client_id, client_secret, extra_credential')
+      .eq('marketplace_id', marketplace.id)
+      .maybeSingle();
+
+    if (!creds?.client_id || !creds?.client_secret || !creds?.extra_credential) {
+      res.status(400).json({ error: 'Credenciais da Amazon não cadastradas. Vá em /marketplaces.html.' });
+      return;
+    }
+
+    res.status(200).json({
+      ok: true,
+      productsChecked: 0,
+      promotionsFound: 0,
+      errors: [],
+      note:
+        'Credenciais salvas, mas a Creators API da Amazon só libera consulta depois que sua conta tiver 10 vendas qualificadas nos últimos 30 dias. Assim que isso acontecer, me avise pra eu implementar a busca de verdade.',
+    });
+  } catch (err) {
+    res.status(500).json({ error: `Erro no servidor: ${err.message}` });
+  }
+}
+
 // ---------------- Shopee ----------------
 
 async function scanShopee(req, res) {
@@ -166,9 +208,28 @@ async function scanShopee(req, res) {
   }
 }
 
+// Checa se o título do produto realmente tem a ver com a palavra-chave buscada.
+// A busca da Shopee é por relevância ampla — alguns vendedores colocam palavras
+// populares no título só pra aparecer em mais buscas ("keyword stuffing"). Isso
+// descarta o caso óbvio de vazamento (ex: produto de cozinha aparecendo na
+// busca de "corrida"), sem precisar de um filtro perfeito.
+function titleMatchesKeyword(title, keyword) {
+  const stopWords = new Set(['de', 'da', 'do', 'das', 'dos', 'e', 'com', 'para', 'em', 'a', 'o']);
+  const words = keyword
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((w) => w.length > 2 && !stopWords.has(w));
+  if (words.length === 0) return true; // palavra-chave só com termos curtos — não filtra
+  const titleLower = title.toLowerCase();
+  return words.some((w) => titleLower.includes(w));
+}
+
 async function processShopeeOffer(offer, marketplaceId, group, creds) {
   const discountRate = offer.priceDiscountRate || 0;
   if (discountRate < MIN_DISCOUNT_PCT) return 0;
+
+  const keyword = group.search_keyword || group.name;
+  if (!titleMatchesKeyword(offer.productName || '', keyword)) return 0;
 
   const originalUrl = offer.productLink || offer.offerLink;
 
