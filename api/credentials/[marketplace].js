@@ -8,7 +8,7 @@ const { supabaseAdmin } = require('../../src/core/database/supabaseClient');
 // agora é 1 só.
 module.exports = async function handler(req, res) {
   const slug = req.query.marketplace;
-  if (!['mercadolivre', 'shopee'].includes(slug)) {
+  if (!['mercadolivre', 'shopee', 'amazon'].includes(slug)) {
     res.status(404).json({ error: `Marketplace "${slug}" não suportado.` });
     return;
   }
@@ -35,7 +35,7 @@ module.exports = async function handler(req, res) {
     if (req.method === 'GET') {
       const { data: creds } = await supabaseAdmin
         .from('marketplace_credentials')
-        .select('client_id, access_token, seller_id')
+        .select('client_id, access_token, seller_id, extra_credential')
         .eq('marketplace_id', marketplace.id)
         .maybeSingle();
 
@@ -44,17 +44,19 @@ module.exports = async function handler(req, res) {
         hasAccessToken: Boolean(creds?.access_token),
         sellerId: creds?.seller_id || null,
         clientId: creds?.client_id || null,
+        extraCredential: creds?.extra_credential || null,
       });
       return;
     }
 
     if (req.method === 'POST') {
       const body = req.body || {};
-      const clientId = slug === 'shopee' ? body.app_id : body.client_id;
-      const clientSecret = slug === 'shopee' ? body.app_secret : body.client_secret;
+      const clientId = slug === 'shopee' ? body.app_id : slug === 'amazon' ? body.access_key : body.client_id;
+      const clientSecret = slug === 'shopee' ? body.app_secret : slug === 'amazon' ? body.secret_key : body.client_secret;
+      const extraCredential = slug === 'amazon' ? body.associate_tag : null;
 
-      if (!clientId || !clientSecret) {
-        res.status(400).json({ error: 'Preencha os dois campos de credencial.' });
+      if (!clientId || !clientSecret || (slug === 'amazon' && !extraCredential)) {
+        res.status(400).json({ error: 'Preencha todos os campos de credencial.' });
         return;
       }
 
@@ -63,6 +65,7 @@ module.exports = async function handler(req, res) {
           marketplace_id: marketplace.id,
           client_id: clientId,
           client_secret: clientSecret,
+          extra_credential: extraCredential,
           updated_at: new Date().toISOString(),
         },
         { onConflict: 'marketplace_id' }
