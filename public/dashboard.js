@@ -314,7 +314,8 @@ async function confirmScan() {
   confirmBtn.textContent = 'Buscando...';
   msg.textContent = '';
 
-  const marketplaceName = marketplace === 'mercadolivre' ? 'Mercado Livre' : 'Shopee';
+  const marketplaceNames = { mercadolivre: 'Mercado Livre', shopee: 'Shopee', amazon: 'Amazon' };
+  const marketplaceName = marketplaceNames[marketplace] || marketplace;
 
   try {
     const res = await fetch(`/api/scan/${marketplace}?groups=${groupIds.join(',')}`);
@@ -326,7 +327,8 @@ async function confirmScan() {
       ? `${data.categoriesScanned} categoria(s)`
       : `${data.groupsSearched ?? data.productsChecked ?? 0} grupo(s)/produto(s)`;
 
-    document.getElementById('scanResult').textContent = `${marketplaceName}: ${scannedLabel}, ${found} nova(s)` +
+    const noteSuffix = data.note ? ` — ${data.note}` : '';
+    document.getElementById('scanResult').textContent = `${marketplaceName}: ${scannedLabel}, ${found} nova(s)${noteSuffix}` +
       (data.errors?.length ? ` (${data.errors.length} erro(s) — veja integration_logs)` : '');
 
     closeScanModal();
