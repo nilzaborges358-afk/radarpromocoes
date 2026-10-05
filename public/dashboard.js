@@ -179,6 +179,23 @@ function render() {
   grid.querySelectorAll('[data-ignore]').forEach((btn) => {
     btn.addEventListener('click', () => markStatus(btn.dataset.ignore, 'IGNORED'));
   });
+  grid.querySelectorAll('[data-share-wa]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const promo = allPromotions.find((p) => p.id === btn.dataset.shareWa);
+      if (!promo) return;
+      const message = buildShareMessage(promo);
+      window.open(`https://wa.me/?text=${encodeURIComponent(message)}`, '_blank');
+    });
+  });
+  grid.querySelectorAll('[data-share-tg]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const promo = allPromotions.find((p) => p.id === btn.dataset.shareTg);
+      if (!promo) return;
+      const message = buildShareMessage(promo, { includeLink: false });
+      const url = `https://t.me/share/url?url=${encodeURIComponent(promo.affiliate_url)}&text=${encodeURIComponent(message)}`;
+      window.open(url, '_blank');
+    });
+  });
   grid.querySelectorAll('[data-copy-link]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       await navigator.clipboard.writeText(btn.dataset.copyLink);
@@ -254,7 +271,11 @@ function renderCard(promo) {
         </div>
         <div class="actions">
           <a href="${promo.original_url}" target="_blank" rel="noopener">Abrir original</a>
-          ${promo.affiliate_url ? `<button data-copy-link="${escapeHtml(promo.affiliate_url)}" style="color:var(--good); border-color:var(--good);">Copiar link de afiliado</button>` : ''}
+          ${promo.affiliate_url ? `
+            <button data-share-wa="${promo.id}" style="color:var(--good); border-color:var(--good);">📱 WhatsApp</button>
+            <button data-share-tg="${promo.id}" style="color:#54a9eb; border-color:#54a9eb;">✈️ Telegram</button>
+            <button data-copy-link="${escapeHtml(promo.affiliate_url)}">Copiar link</button>
+          ` : ''}
           ${promo.status === 'PENDING' ? `
             <button data-mark-affiliated="${promo.id}">Já afiliei</button>
             <button data-ignore="${promo.id}">Ignorar</button>
@@ -339,6 +360,26 @@ async function confirmScan() {
     confirmBtn.disabled = false;
     confirmBtn.textContent = 'Buscar';
   }
+}
+
+const MESSAGE_OPENERS = ['🔥 OLHA ESSA OFERTA!', '🎯 Achado do dia:', '⚡ Promoção boa de aproveitar:', '👀 Vale a pena ver isso:'];
+
+function buildShareMessage(promo, { includeLink = true } = {}) {
+  // Varia o texto de abertura pra não ficar sempre igual — escolhido meio
+  // aleatório, baseado no id da promoção (fica igual toda vez que você
+  // clicar na MESMA promoção, mas muda de uma promoção pra outra).
+  const seed = [...promo.id].reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+  const opener = MESSAGE_OPENERS[seed % MESSAGE_OPENERS.length];
+
+  const priceLine = promo.previous_price
+    ? `De R$ ${formatPrice(promo.previous_price)} por *R$ ${formatPrice(promo.current_price)}*${promo.discount_rate ? ` (${Math.round(promo.discount_rate)}% OFF)` : ''}`
+    : `Por *R$ ${formatPrice(promo.current_price)}*`;
+
+  const lines = [opener, '', promo.title, '', priceLine];
+  if (includeLink) {
+    lines.push('', `👉 ${promo.affiliate_url || promo.original_url}`);
+  }
+  return lines.join('\n');
 }
 
 function formatPrice(value) {
