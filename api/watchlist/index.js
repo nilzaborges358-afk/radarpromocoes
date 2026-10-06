@@ -19,8 +19,9 @@ module.exports = async function handler(req, res) {
         .select('*, watch_groups(name)')
         .eq('marketplace_id', marketplace.id)
         .order('created_at', { ascending: false });
+      const { data: marketplaces } = await supabaseAdmin.from('marketplaces').select('slug, name').order('name');
 
-      res.status(200).json({ groups: groups || [], products: products || [] });
+      res.status(200).json({ groups: groups || [], products: products || [], marketplaces: marketplaces || [] });
       return;
     }
 
