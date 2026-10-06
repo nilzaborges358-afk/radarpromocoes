@@ -1,5 +1,6 @@
 const { getSalePrice } = require('../../src/integrations/mercadolivre/client');
 const { searchProductOffers, generateShortLink } = require('../../src/integrations/shopee/client');
+const netshoesClient = require('../../src/integrations/netshoes/client');
 const { supabaseAdmin } = require('../../src/core/database/supabaseClient');
 
 const MIN_DISCOUNT_PCT = 10; // era 15 — baixei pra achar mais resultado em categorias mais de nicho
@@ -12,6 +13,7 @@ module.exports = async function handler(req, res) {
   if (slug === 'mercadolivre') return scanMercadoLivre(req, res);
   if (slug === 'shopee') return scanShopee(req, res);
   if (slug === 'amazon') return scanAmazon(req, res);
+  if (slug === 'netshoes') return scanNetshoes(req, res);
   res.status(404).json({ error: `Marketplace "${slug}" não suportado.` });
 };
 
@@ -155,6 +157,119 @@ async function scanAmazon(req, res) {
   } catch (err) {
     res.status(500).json({ error: `Erro no servidor: ${err.message}` });
   }
+}
+
+// ---------------- Netshoes (via Rakuten Advertising) ----------------
+
+async function scanNetshoes(req, res) {
+  try {
+    const { data: marketplace } = await supabaseAdmin
+      .from('marketplaces')
+      .select('id')
+      .eq('slug', 'netshoes')
+      .single();
+
+    const { data: creds } = await supabaseAdmin
+      .from('marketplace_credentials')
+      .select('client_id, client_secret, extra_credential, extra_credential_2')
+      .eq('marketplace_id', marketplace.id)
+      .maybeSingle();
+
+    if (!creds?.client_id || !creds?.client_secret || !creds?.extra_credential || !creds?.extra_credential_2) {
+      res.status(400).json({ error: 'Credenciais da Netshoes/Rakuten incompletas. Vá em /marketplaces.html.' });
+      return;
+    }
+
+    const publisherId = creds.extra_credential;
+    const mid = creds.extra_credential_2;
+
+    const accessToken = await netshoesClient.getAccessToken(creds.client_id, creds.client_secret);
+
+    const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
+    const groupsParam = req.query.groups ? String(req.query.groups).split(',') : null;
+    const groups = groupsParam ? (allGroups || []).filter((g) => groupsParam.includes(g.id)) : allGroups;
+
+    let found = 0;
+    const errors = [];
+
+    for (const group of groups || []) {
+      try {
+        const keyword = group.search_keyword || group.name;
+        const items = await netshoesClient.searchProducts(accessToken, mid, keyword);
+        for (const item of items) {
+          found += await processNetshoesItem(item, marketplace.id, group, publisherId, mid);
+        }
+      } catch (err) {
+        errors.push(`${group.name}: ${err.message}`);
+        await supabaseAdmin.from('integration_logs').insert({
+          marketplace_id: marketplace.id,
+          level: 'error',
+          message: `Falha ao buscar produtos Netshoes para "${group.name}": ${err.message}`,
+        });
+      }
+    }
+
+    res.status(200).json({ ok: true, groupsSearched: (groups || []).length, promotionsFound: found, errors });
+  } catch (err) {
+    res.status(500).json({ error: `Erro no servidor: ${err.message}` });
+  }
+}
+
+// ATENÇÃO: os nomes de campo do item (itemName, price, salePrice, imageUrl,
+// linkUrl, sku) ainda não foram confirmados contra uma resposta real da API —
+// ajuste aqui assim que testar com credenciais de verdade.
+async function processNetshoesItem(item, marketplaceId, group, publisherId, mid) {
+  const title = item.itemName || item.productName || item.name;
+  const productUrl = item.linkUrl || item.productUrl || item.url;
+  const price = parseFloat(item.salePrice || item.price);
+  const regularPrice = item.price && item.salePrice ? parseFloat(item.price) : null;
+
+  if (!title || !productUrl || !price) return 0; // resposta em formato inesperado — pula sem quebrar o resto
+
+  const discountRate = regularPrice && regularPrice > price
+    ? Number((((regularPrice - price) / regularPrice) * 100).toFixed(2))
+    : null;
+
+  if (!discountRate || discountRate < MIN_DISCOUNT_PCT) return 0;
+
+  const { data: existing } = await supabaseAdmin
+    .from('promotions')
+    .select('id, watch_group_id')
+    .eq('marketplace_id', marketplaceId)
+    .eq('original_url', productUrl)
+    .maybeSingle();
+
+  const affiliateUrl = netshoesClient.buildAffiliateLink(publisherId, mid, productUrl);
+
+  if (existing) {
+    await supabaseAdmin
+      .from('promotions')
+      .update({
+        current_price: price,
+        discount_rate: discountRate,
+        watch_group_id: existing.watch_group_id || group.id,
+        detected_at: new Date().toISOString(),
+      })
+      .eq('id', existing.id);
+    return 0;
+  }
+
+  await supabaseAdmin.from('promotions').insert({
+    marketplace_id: marketplaceId,
+    watch_group_id: group.id,
+    title,
+    image_url: item.imageUrl || item.image || null,
+    original_url: productUrl,
+    current_price: price,
+    previous_price: regularPrice,
+    discount_rate: discountRate,
+    source: 'netshoes_rakuten_api',
+    status: 'PENDING',
+    affiliate_url: affiliateUrl,
+    affiliate_url_added_at: new Date().toISOString(),
+  });
+
+  return 1;
 }
 
 // ---------------- Shopee ----------------
