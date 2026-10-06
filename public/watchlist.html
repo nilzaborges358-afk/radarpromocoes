@@ -124,6 +124,50 @@
     </div>
   </div>
 
+  <div class="group-manager">
+    <div class="group-manager-title">Adicionar promoção manual</div>
+    <p class="group-manager-sub">Para marketplaces sem API de afiliados (Magalu, por enquanto) — você mesmo encontra a promoção e cadastra aqui.</p>
+
+    <div class="new-group-form" id="manualForm">
+      <div class="field">
+        <label>Marketplace</label>
+        <select id="manual-marketplace"></select>
+      </div>
+      <div class="field">
+        <label>Grupo (opcional)</label>
+        <select id="manual-group"><option value="">Sem grupo</option></select>
+      </div>
+      <div class="field" style="flex-basis:100%;">
+        <label>Título do produto</label>
+        <input type="text" id="manual-title" placeholder="Ex: Air Fryer 12L" />
+      </div>
+      <div class="field">
+        <label>Link original (da página do produto)</label>
+        <input type="text" id="manual-url" placeholder="https://..." />
+      </div>
+      <div class="field">
+        <label>Link de afiliado (se já tiver gerado)</label>
+        <input type="text" id="manual-affiliate" placeholder="https://... (opcional)" />
+      </div>
+      <div class="field">
+        <label>URL da imagem (opcional)</label>
+        <input type="text" id="manual-image" placeholder="https://..." />
+      </div>
+      <div class="field">
+        <label>Preço atual (R$)</label>
+        <input type="text" id="manual-price" placeholder="Ex: 199.90" />
+      </div>
+      <div class="field">
+        <label>Preço anterior (opcional)</label>
+        <input type="text" id="manual-prev-price" placeholder="Ex: 299.90" />
+      </div>
+      <div class="row-actions">
+        <button class="primary" id="manualSubmitBtn">Adicionar ao painel</button>
+      </div>
+      <div class="group-msg" id="manualMsg"></div>
+    </div>
+  </div>
+
   <div class="add-form">
     <div class="field">
       <label>Link do produto</label>
