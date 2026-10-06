@@ -4,7 +4,7 @@ const MARKETPLACES = [
   { slug: 'amazon', name: 'Amazon', color: '#ff9900', implemented: true },
   { slug: 'magalu', name: 'Magalu', color: '#0086ff', implemented: true, manualOnly: true },
   { slug: 'tiktokshop', name: 'TikTok Shop', color: '#ffffff', implemented: false },
-  { slug: 'netshoes', name: 'Netshoes', color: '#f5761a', implemented: false },
+  { slug: 'netshoes', name: 'Netshoes', color: '#f5761a', implemented: true },
 ];
 
 const list = document.getElementById('list');
@@ -33,6 +33,7 @@ function render() {
   loadStatus('mercadolivre');
   loadStatus('shopee');
   loadStatus('amazon');
+  loadStatus('netshoes');
 }
 
 function renderForm(slug) {
@@ -70,6 +71,32 @@ function renderForm(slug) {
       </div>
       <div class="save-msg" id="shopee-save-msg"></div>
       <p class="soon-note" style="margin-top:10px;">Não precisa de "conectar" — assim que salvar, o botão "Buscar promoções agora" do painel geral já passa a buscar na Shopee também, usando os grupos da Lista de vigilância como palavra-chave.</p>
+    `;
+  }
+
+  if (slug === 'netshoes') {
+    return `
+      <div class="field">
+        <label>Publisher ID (Rakuten Advertising)</label>
+        <input type="text" id="netshoes-tag" placeholder="Ex: seuID123" />
+      </div>
+      <div class="field">
+        <label>MID da Netshoes (Advertiser ID)</label>
+        <input type="text" id="netshoes-mid" placeholder="Ex: 42034" />
+      </div>
+      <div class="field">
+        <label>Rakuten Client ID</label>
+        <input type="text" id="netshoes-id" placeholder="Cole o Client ID" />
+      </div>
+      <div class="field">
+        <label>Rakuten Client Secret</label>
+        <input type="password" id="netshoes-secret" placeholder="Cole o Client Secret" />
+      </div>
+      <div class="row-actions">
+        <button class="primary" onclick="saveCredentials('netshoes')">Salvar credenciais</button>
+      </div>
+      <div class="save-msg" id="netshoes-save-msg"></div>
+      <p class="soon-note" style="margin-top:10px;">O Publisher ID e o MID você encontra no seu painel da Rakuten Advertising, depois de aprovado no programa "Parceiro Netshoes".</p>
     `;
   }
 
@@ -118,7 +145,7 @@ async function loadStatus(slug) {
       dot.className = 'dot on';
       statusText.textContent = `Conectado${data.sellerId ? ` (seller ${data.sellerId})` : ''}`;
     } else if (data.hasCredentials) {
-      if (slug === 'shopee') {
+      if (slug === 'shopee' || slug === 'netshoes') {
         dot.className = 'dot on';
         statusText.textContent = 'Credenciais salvas';
       } else if (slug === 'amazon') {
@@ -140,6 +167,10 @@ async function loadStatus(slug) {
     if (data.extraCredential) {
       const tagInput = document.getElementById(`${slug}-tag`);
       if (tagInput) tagInput.value = data.extraCredential;
+    }
+    if (data.extraCredential2) {
+      const midInput = document.getElementById(`${slug}-mid`);
+      if (midInput) midInput.value = data.extraCredential2;
     }
   } catch (err) {
     const statusText = document.getElementById(`status-${slug}`);
@@ -167,6 +198,13 @@ async function saveCredentials(slug) {
         access_key: id,
         secret_key: secret,
         associate_tag: document.getElementById('amazon-tag').value.trim(),
+      };
+    } else if (slug === 'netshoes') {
+      body = {
+        rakuten_client_id: id,
+        rakuten_client_secret: secret,
+        publisher_id: document.getElementById('netshoes-tag').value.trim(),
+        mid: document.getElementById('netshoes-mid').value.trim(),
       };
     } else {
       body = { client_id: id, client_secret: secret };
