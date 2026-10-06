@@ -8,7 +8,7 @@ const { supabaseAdmin } = require('../../src/core/database/supabaseClient');
 // agora é 1 só.
 module.exports = async function handler(req, res) {
   const slug = req.query.marketplace;
-  if (!['mercadolivre', 'shopee', 'amazon'].includes(slug)) {
+  if (!['mercadolivre', 'shopee', 'amazon', 'netshoes'].includes(slug)) {
     res.status(404).json({ error: `Marketplace "${slug}" não suportado.` });
     return;
   }
@@ -35,7 +35,7 @@ module.exports = async function handler(req, res) {
     if (req.method === 'GET') {
       const { data: creds } = await supabaseAdmin
         .from('marketplace_credentials')
-        .select('client_id, access_token, seller_id, extra_credential')
+        .select('client_id, access_token, seller_id, extra_credential, extra_credential_2')
         .eq('marketplace_id', marketplace.id)
         .maybeSingle();
 
@@ -45,17 +45,31 @@ module.exports = async function handler(req, res) {
         sellerId: creds?.seller_id || null,
         clientId: creds?.client_id || null,
         extraCredential: creds?.extra_credential || null,
+        extraCredential2: creds?.extra_credential_2 || null,
       });
       return;
     }
 
     if (req.method === 'POST') {
       const body = req.body || {};
-      const clientId = slug === 'shopee' ? body.app_id : slug === 'amazon' ? body.access_key : body.client_id;
-      const clientSecret = slug === 'shopee' ? body.app_secret : slug === 'amazon' ? body.secret_key : body.client_secret;
-      const extraCredential = slug === 'amazon' ? body.associate_tag : null;
+      const clientId = slug === 'shopee' ? body.app_id
+        : slug === 'amazon' ? body.access_key
+        : slug === 'netshoes' ? body.rakuten_client_id
+        : body.client_id;
+      const clientSecret = slug === 'shopee' ? body.app_secret
+        : slug === 'amazon' ? body.secret_key
+        : slug === 'netshoes' ? body.rakuten_client_secret
+        : body.client_secret;
+      const extraCredential = slug === 'amazon' ? body.associate_tag
+        : slug === 'netshoes' ? body.publisher_id
+        : null;
+      const extraCredential2 = slug === 'netshoes' ? body.mid : null;
 
-      if (!clientId || !clientSecret || (slug === 'amazon' && !extraCredential)) {
+      const missingRequired = !clientId || !clientSecret
+        || (slug === 'amazon' && !extraCredential)
+        || (slug === 'netshoes' && (!extraCredential || !extraCredential2));
+
+      if (missingRequired) {
         res.status(400).json({ error: 'Preencha todos os campos de credencial.' });
         return;
       }
@@ -66,6 +80,7 @@ module.exports = async function handler(req, res) {
           client_id: clientId,
           client_secret: clientSecret,
           extra_credential: extraCredential,
+          extra_credential_2: extraCredential2,
           updated_at: new Date().toISOString(),
         },
         { onConflict: 'marketplace_id' }
