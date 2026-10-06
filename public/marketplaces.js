@@ -2,7 +2,7 @@ const MARKETPLACES = [
   { slug: 'mercadolivre', name: 'Mercado Livre', color: '#fff159', implemented: true },
   { slug: 'shopee', name: 'Shopee', color: '#ee4d2d', implemented: true },
   { slug: 'amazon', name: 'Amazon', color: '#ff9900', implemented: true },
-  { slug: 'magalu', name: 'Magalu', color: '#0086ff', implemented: false },
+  { slug: 'magalu', name: 'Magalu', color: '#0086ff', implemented: true, manualOnly: true },
   { slug: 'tiktokshop', name: 'TikTok Shop', color: '#ffffff', implemented: false },
   { slug: 'netshoes', name: 'Netshoes', color: '#f5761a', implemented: false },
 ];
@@ -14,16 +14,18 @@ function render() {
     <div class="mp-row" id="row-${mp.slug}">
       <div class="mp-head" onclick="toggleRow('${mp.slug}')">
         <div class="mp-name">
-          <span class="dot ${mp.implemented ? 'off' : 'soon'}" id="dot-${mp.slug}"></span>
+          <span class="dot ${mp.manualOnly ? 'soon' : mp.implemented ? 'off' : 'soon'}" id="dot-${mp.slug}"></span>
           ${mp.name}
         </div>
         <div style="display:flex; align-items:center; gap:10px;">
-          <span class="status-text" id="status-${mp.slug}">${mp.implemented ? 'carregando…' : 'em breve'}</span>
+          <span class="status-text" id="status-${mp.slug}">${mp.manualOnly ? 'sem API — cadastro manual' : mp.implemented ? 'carregando…' : 'em breve'}</span>
           <span class="chev">▾</span>
         </div>
       </div>
       <div class="mp-body" id="body-${mp.slug}">
-        ${mp.implemented ? renderForm(mp.slug) : `<p class="soon-note">Essa integração ainda não foi implementada. Assim que estiver pronta, o formulário de credenciais aparece aqui.</p>`}
+        ${mp.manualOnly
+          ? `<p class="soon-note">A ${mp.name} não tem API de afiliados — não existe como automatizar descoberta de promoção nem geração de link. Use o <a href="watchlist.html" style="color:var(--accent);">"Adicionar promoção manual"</a> na Lista de vigilância pra cadastrar o que você encontrar.</p>`
+          : mp.implemented ? renderForm(mp.slug) : `<p class="soon-note">Essa integração ainda não foi implementada. Assim que estiver pronta, o formulário de credenciais aparece aqui.</p>`}
       </div>
     </div>
   `).join('');
