@@ -1,5 +1,6 @@
 let groups = [];
 let products = [];
+let marketplaces = [];
 
 async function load() {
   try {
@@ -8,9 +9,11 @@ async function load() {
     if (!res.ok) throw new Error(data.error || 'Falha ao carregar');
     groups = data.groups;
     products = data.products;
+    marketplaces = data.marketplaces || [];
     renderGroupSelect();
     renderGroupsList();
     renderList();
+    renderManualFormOptions();
   } catch (err) {
     document.getElementById('groups').innerHTML = `<p style="color:#e2604a; padding: 0 32px;">Erro ao carregar: ${err.message}</p>`;
   }
@@ -141,6 +144,62 @@ async function removeProduct(id) {
   await load();
 }
 
+function renderManualFormOptions() {
+  const mpSelect = document.getElementById('manual-marketplace');
+  mpSelect.innerHTML = marketplaces.map((m) => `<option value="${m.slug}">${escapeHtml(m.name)}</option>`).join('');
+
+  const groupSelect = document.getElementById('manual-group');
+  groupSelect.innerHTML =
+    `<option value="">Sem grupo</option>` +
+    groups.map((g) => `<option value="${g.id}">${escapeHtml(g.name)}</option>`).join('');
+}
+
+async function submitManualPromotion() {
+  const btn = document.getElementById('manualSubmitBtn');
+  const msg = document.getElementById('manualMsg');
+
+  const payload = {
+    marketplace_slug: document.getElementById('manual-marketplace').value,
+    watch_group_id: document.getElementById('manual-group').value || null,
+    title: document.getElementById('manual-title').value.trim(),
+    original_url: document.getElementById('manual-url').value.trim(),
+    affiliate_url: document.getElementById('manual-affiliate').value.trim() || null,
+    image_url: document.getElementById('manual-image').value.trim() || null,
+    current_price: parseFloat(document.getElementById('manual-price').value.replace(',', '.')),
+    previous_price: document.getElementById('manual-prev-price').value
+      ? parseFloat(document.getElementById('manual-prev-price').value.replace(',', '.'))
+      : null,
+  };
+
+  if (!payload.title || !payload.original_url || !payload.current_price) {
+    msg.textContent = 'Preencha ao menos título, link original e preço atual.';
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = 'Adicionando...';
+  msg.textContent = '';
+
+  try {
+    const res = await fetch('/api/promotions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Falha ao adicionar');
+
+    msg.textContent = 'Adicionada! Já aparece no Painel geral.';
+    ['manual-title', 'manual-url', 'manual-affiliate', 'manual-image', 'manual-price', 'manual-prev-price']
+      .forEach((id) => { document.getElementById(id).value = ''; });
+  } catch (err) {
+    msg.textContent = `Erro: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Adicionar ao painel';
+  }
+}
+
 async function testSearch() {
   const keyword = document.getElementById('newGroupKeyword').value.trim();
   const btn = document.getElementById('testSearchBtn');
@@ -231,4 +290,5 @@ function escapeHtml(str) {
 document.getElementById('addBtn').addEventListener('click', addProduct);
 document.getElementById('testSearchBtn').addEventListener('click', testSearch);
 document.getElementById('createGroupBtn').addEventListener('click', createGroup);
+document.getElementById('manualSubmitBtn').addEventListener('click', submitManualPromotion);
 load();
