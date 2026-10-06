@@ -335,7 +335,7 @@ async function confirmScan() {
   confirmBtn.textContent = 'Buscando...';
   msg.textContent = '';
 
-  const marketplaceNames = { mercadolivre: 'Mercado Livre', shopee: 'Shopee', amazon: 'Amazon' };
+  const marketplaceNames = { mercadolivre: 'Mercado Livre', shopee: 'Shopee', amazon: 'Amazon', netshoes: 'Netshoes' };
   const marketplaceName = marketplaceNames[marketplace] || marketplace;
 
   try {
