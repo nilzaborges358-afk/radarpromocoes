@@ -44,11 +44,23 @@ async function searchProducts(accessToken, mid, keyword, { max = 30 } = {}) {
     },
   });
 
+  const rawText = await res.text();
+
   if (!res.ok) {
-    throw new Error(`Busca de produtos Netshoes/Rakuten falhou (${res.status}): ${await res.text()}`);
+    throw new Error(`Busca de produtos Netshoes/Rakuten falhou (${res.status}): ${rawText.slice(0, 500)}`);
   }
 
-  const data = await res.json();
+  let data;
+  try {
+    data = JSON.parse(rawText);
+  } catch {
+    // A API respondeu em XML em vez de JSON — ainda não implementei o parser
+    // de XML. Por enquanto, mostra o início da resposta real pra entendermos
+    // o que ela está dizendo (pode ser um erro de autenticação/acesso
+    // disfarçado, não necessariamente "não suporta JSON").
+    throw new Error(`Resposta não-JSON da Rakuten (provavelmente XML): ${rawText.slice(0, 800)}`);
+  }
+
   // A API costuma aninhar os itens em algo como data.result.item (array) —
   // tentamos alguns formatos comuns; se nenhum bater, devolve vazio e loga.
   const items = data?.result?.item || data?.items || data?.result || [];
