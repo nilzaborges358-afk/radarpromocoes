@@ -302,10 +302,22 @@ async function scanShopee(req, res) {
 
     for (const group of groups || []) {
       try {
-        const keyword = group.search_keyword || group.name;
-        const offers = await searchProductOffers(creds.client_id, creds.client_secret, keyword);
-        for (const offer of offers) {
-          found += await processShopeeOffer(offer, marketplace.id, group, creds);
+        // Suporta várias palavras-chave por grupo, separadas por vírgula —
+        // busca cada uma separadamente, pra trazer produtos de fato distintos
+        // dentro do nicho, em vez de uma palavra genérica dominada por um
+        // único produto campeão de vendas.
+        const keywords = (group.search_keyword || group.name)
+          .split(',')
+          .map((k) => k.trim())
+          .filter(Boolean);
+
+        const perKeywordLimit = Math.max(10, Math.floor(40 / keywords.length));
+
+        for (const keyword of keywords) {
+          const offers = await searchProductOffers(creds.client_id, creds.client_secret, keyword, { limit: perKeywordLimit });
+          for (const offer of offers) {
+            found += await processShopeeOffer(offer, marketplace.id, group, creds);
+          }
         }
       } catch (err) {
         errors.push(`${group.name}: ${err.message}`);
