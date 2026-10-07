@@ -81,10 +81,17 @@ async function testSearch(req, res, keyword) {
     return;
   }
 
-  const offers = await searchProductOffers(creds.client_id, creds.client_secret, keyword, { limit: 5 });
+  const keywords = keyword.split(',').map((k) => k.trim()).filter(Boolean);
+  const perKeywordLimit = Math.max(2, Math.floor(8 / keywords.length));
+
+  let allOffers = [];
+  for (const kw of keywords) {
+    const offers = await searchProductOffers(creds.client_id, creds.client_secret, kw, { limit: perKeywordLimit });
+    allOffers = allOffers.concat(offers);
+  }
 
   res.status(200).json({
     ok: true,
-    preview: offers.map((o) => ({ title: o.productName, image: o.imageUrl, price: o.priceMin, discount: o.priceDiscountRate })),
+    preview: allOffers.map((o) => ({ title: o.productName, image: o.imageUrl, price: o.priceMin, discount: o.priceDiscountRate })),
   });
 }
