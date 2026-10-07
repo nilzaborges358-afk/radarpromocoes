@@ -36,7 +36,10 @@ async function getAccessToken(clientId, clientSecret) {
  * credenciais e me manda a resposta real se algo vier diferente.
  */
 async function searchProducts(accessToken, mid, keyword, { max = 30 } = {}) {
-  const url = `${API_BASE}/productsearch/1.0?mid=${encodeURIComponent(mid)}&keyword=${encodeURIComponent(keyword)}&max=${max}`;
+  // A API devolveu "No token specified" usando só o header Authorization —
+  // essa API mais antiga da Rakuten espera o token como parâmetro na URL.
+  // Mantive o header também, por garantia, caso ela aceite os dois.
+  const url = `${API_BASE}/productsearch/1.0?token=${encodeURIComponent(accessToken)}&mid=${encodeURIComponent(mid)}&keyword=${encodeURIComponent(keyword)}&max=${max}`;
   const res = await fetch(url, {
     headers: {
       Authorization: `Bearer ${accessToken}`,
