@@ -64,6 +64,9 @@ module.exports = async function handler(req, res) {
         : slug === 'netshoes' ? body.publisher_id
         : null;
       const extraCredential2 = slug === 'netshoes' ? body.mid : null;
+      // Token gerado manualmente no botão "Generate Token" da Rakuten. Se vier
+      // vazio, não sobrescreve o que já estava salvo.
+      const manualAccessToken = slug === 'netshoes' && body.access_token ? body.access_token.trim() : null;
 
       const missingRequired = !clientId || !clientSecret
         || (slug === 'amazon' && !extraCredential)
@@ -81,6 +84,7 @@ module.exports = async function handler(req, res) {
           client_secret: clientSecret,
           extra_credential: extraCredential,
           extra_credential_2: extraCredential2,
+          ...(manualAccessToken ? { access_token: manualAccessToken } : {}),
           updated_at: new Date().toISOString(),
         },
         { onConflict: 'marketplace_id' }
