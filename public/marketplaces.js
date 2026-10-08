@@ -92,6 +92,10 @@ function renderForm(slug) {
         <label>Rakuten Client Secret</label>
         <input type="password" id="netshoes-secret" placeholder="Cole o Client Secret" />
       </div>
+      <div class="field">
+        <label>Access Token (botão "Generate Token" na tela Applications da Rakuten)</label>
+        <input type="password" id="netshoes-token" placeholder="Cole o token gerado — deixe vazio pra manter o que já está salvo" />
+      </div>
       <div class="row-actions">
         <button class="primary" onclick="saveCredentials('netshoes')">Salvar credenciais</button>
       </div>
@@ -205,6 +209,7 @@ async function saveCredentials(slug) {
         rakuten_client_secret: secret,
         publisher_id: document.getElementById('netshoes-tag').value.trim(),
         mid: document.getElementById('netshoes-mid').value.trim(),
+        access_token: document.getElementById('netshoes-token').value.trim(),
       };
     } else {
       body = { client_id: id, client_secret: secret };
