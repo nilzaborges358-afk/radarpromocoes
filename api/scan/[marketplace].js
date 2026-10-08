@@ -171,11 +171,11 @@ async function scanNetshoes(req, res) {
 
     const { data: creds } = await supabaseAdmin
       .from('marketplace_credentials')
-      .select('client_id, client_secret, extra_credential, extra_credential_2')
+      .select('client_id, client_secret, extra_credential, extra_credential_2, access_token')
       .eq('marketplace_id', marketplace.id)
       .maybeSingle();
 
-    if (!creds?.client_id || !creds?.client_secret || !creds?.extra_credential || !creds?.extra_credential_2) {
+    if (!creds?.extra_credential || !creds?.extra_credential_2) {
       res.status(400).json({ error: 'Credenciais da Netshoes/Rakuten incompletas. Vá em /marketplaces.html.' });
       return;
     }
@@ -183,7 +183,17 @@ async function scanNetshoes(req, res) {
     const publisherId = creds.extra_credential;
     const mid = creds.extra_credential_2;
 
-    const accessToken = await netshoesClient.getAccessToken(creds.client_id, creds.client_secret);
+    // Prefere o token gerado manualmente no painel da Rakuten (botão "Generate
+    // Token"). O login automático (client_credentials) devolveu "Invalid token"
+    // nos testes, então só é tentado se não houver token salvo.
+    let accessToken = creds.access_token;
+    if (!accessToken) {
+      if (!creds.client_id || !creds.client_secret) {
+        res.status(400).json({ error: 'Cole o Access Token da Rakuten em /marketplaces.html (botão Generate Token).' });
+        return;
+      }
+      accessToken = await netshoesClient.getAccessToken(creds.client_id, creds.client_secret);
+    }
 
     const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
     const groupsParam = req.query.groups ? String(req.query.groups).split(',') : null;
