@@ -187,6 +187,7 @@ async function scanNetshoes(req, res) {
     // Token"). O login automático (client_credentials) devolveu "Invalid token"
     // nos testes, então só é tentado se não houver token salvo.
     let accessToken = creds.access_token;
+    const tokenSource = accessToken ? 'salvo na tela' : 'automático';
     if (!accessToken) {
       if (!creds.client_id || !creds.client_secret) {
         res.status(400).json({ error: 'Cole o Access Token da Rakuten em /marketplaces.html (botão Generate Token).' });
@@ -200,12 +201,14 @@ async function scanNetshoes(req, res) {
     const groups = groupsParam ? (allGroups || []).filter((g) => groupsParam.includes(g.id)) : allGroups;
 
     let found = 0;
+    let itemsSeen = 0;
     const errors = [];
 
     for (const group of groups || []) {
       try {
         const keyword = group.search_keyword || group.name;
         const items = await netshoesClient.searchProducts(accessToken, mid, keyword);
+        itemsSeen += items.length;
         for (const item of items) {
           found += await processNetshoesItem(item, marketplace.id, group, publisherId, mid);
         }
@@ -214,25 +217,49 @@ async function scanNetshoes(req, res) {
         await supabaseAdmin.from('integration_logs').insert({
           marketplace_id: marketplace.id,
           level: 'error',
-          message: `Falha ao buscar produtos Netshoes para "${group.name}": ${err.message}`,
+          message: `Falha ao buscar produtos Netshoes para "${group.name}" [token ${tokenSource}, ${String(accessToken).length} caracteres]: ${err.message}`,
         });
       }
     }
 
-    res.status(200).json({ ok: true, groupsSearched: (groups || []).length, promotionsFound: found, errors });
+    const note = itemsSeen === 0
+      ? 'A Netshoes não devolveu nenhum produto para essas palavras-chave (ou a leitura da resposta não bateu — veja integration_logs).'
+      : found === 0
+        ? `A Netshoes devolveu ${itemsSeen} produto(s), mas nenhum com preço promocional ${MIN_DISCOUNT_PCT}% abaixo do normal.`
+        : undefined;
+
+    res.status(200).json({
+      ok: true,
+      groupsSearched: (groups || []).length,
+      productsChecked: itemsSeen,
+      promotionsFound: found,
+      errors,
+      note,
+    });
   } catch (err) {
     res.status(500).json({ error: `Erro no servidor: ${err.message}` });
   }
 }
 
-// ATENÇÃO: os nomes de campo do item (itemName, price, salePrice, imageUrl,
-// linkUrl, sku) ainda não foram confirmados contra uma resposta real da API —
-// ajuste aqui assim que testar com credenciais de verdade.
+// Converte "199.90" ou "199,90" em número.
+function parsePrice(value) {
+  if (value === null || value === undefined || value === '') return null;
+  let s = String(value).trim();
+  if (s.includes(',') && s.includes('.')) s = s.replace(/\./g, '').replace(',', '.');
+  else if (s.includes(',')) s = s.replace(',', '.');
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Os campos vêm da leitura do XML da Rakuten (ver parseProductSearchXml no
+// client.js). Os nomes das tags ainda não foram confirmados contra uma resposta
+// real da sua conta.
 async function processNetshoesItem(item, marketplaceId, group, publisherId, mid) {
-  const title = item.itemName || item.productName || item.name;
-  const productUrl = item.linkUrl || item.productUrl || item.url;
-  const price = parseFloat(item.salePrice || item.price);
-  const regularPrice = item.price && item.salePrice ? parseFloat(item.price) : null;
+  const title = item.itemName;
+  const productUrl = item.productUrl || item.linkUrl;
+  const salePrice = parsePrice(item.salePrice);
+  const regularPrice = parsePrice(item.price);
+  const price = salePrice || regularPrice;
 
   if (!title || !productUrl || !price) return 0; // resposta em formato inesperado — pula sem quebrar o resto
 
