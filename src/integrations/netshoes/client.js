@@ -1,12 +1,10 @@
 const API_BASE = 'https://api.linksynergy.com';
 
 /**
- * Pega um token de acesso (OAuth2 client_credentials) pra usar na Product
- * Search API. ATENÇÃO: não confirmei 100% o formato exato do corpo dessa
- * requisição (se é grant_type no body, Basic Auth no header, ou os dois) —
- * baseei no padrão OAuth2 client_credentials mais comum usado por essa
- * família de API (LinkShare/Rakuten). Se der erro de autenticação na
- * primeira tentativa real, me manda a mensagem de erro que eu ajusto.
+ * Login automático (client_credentials). Nos testes reais ele devolveu
+ * "Invalid token" na Product Search API, então hoje é só um plano B — o
+ * caminho principal é o Access Token gerado manualmente no painel da Rakuten
+ * (Applications > Generate Token) e colado em /marketplaces.html.
  */
 async function getAccessToken(clientId, clientSecret) {
   const res = await fetch(`${API_BASE}/token`, {
@@ -22,62 +20,117 @@ async function getAccessToken(clientId, clientSecret) {
     throw new Error(`Falha ao pegar token da Rakuten (${res.status}): ${await res.text()}`);
   }
   const data = await res.json();
-  return data.access_token || data.token;
+  const token = data.access_token || data.token;
+  if (!token) {
+    throw new Error(`A Rakuten respondeu ao login automático sem nenhum token: ${JSON.stringify(data).slice(0, 300)}`);
+  }
+  return token;
+}
+
+// ---------- Leitura de XML (a Product Search API só responde em XML) ----------
+
+function decodeXml(str) {
+  return str
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+function xmlTag(block, tag) {
+  const match = block.match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`, 'i'));
+  if (!match) return null;
+  const inner = match[1].trim().replace(/^<!\[CDATA\[([\s\S]*?)\]\]>$/, '$1').trim();
+  return decodeXml(inner) || null;
+}
+
+function extractProductUrl(linkUrl) {
+  if (!linkUrl) return null;
+  try {
+    // O linkurl vem como link rastreado da Rakuten; a página real do produto
+    // está no parâmetro "murl".
+    return new URL(linkUrl).searchParams.get('murl') || linkUrl;
+  } catch {
+    return linkUrl;
+  }
 }
 
 /**
- * Busca produtos por palavra-chave, filtrando pelo MID (ID do anunciante —
- * no nosso caso, Netshoes) na Product Search API.
- * ATENÇÃO: essa API, historicamente, responde em XML, não JSON — mas
- * versões mais novas (OAuth2) costumam aceitar `Accept: application/json`
- * e devolver JSON. Os nomes de campo abaixo (itemName, price, salePrice,
- * imageUrl, linkUrl, sku) são os mais comuns nessa família de API — ainda
- * NÃO FORAM CONFIRMADOS contra uma resposta real. Teste assim que tiver as
- * credenciais e me manda a resposta real se algo vier diferente.
+ * ATENÇÃO: os nomes das tags abaixo (item, productname, price, saleprice,
+ * imageurl, linkurl, sku) seguem o formato XML conhecido da Product Search API
+ * da Rakuten, mas AINDA NÃO FORAM CONFIRMADOS contra uma resposta real da sua
+ * conta. Se a busca voltar sempre vazia, me mande um trecho da resposta real.
  */
-async function searchProducts(accessToken, mid, keyword, { max = 30 } = {}) {
-  // A API devolveu "No token specified" usando só o header Authorization —
-  // essa API mais antiga da Rakuten espera o token como parâmetro na URL.
-  // Mantive o header também, por garantia, caso ela aceite os dois.
-  const url = `${API_BASE}/productsearch/1.0?token=${encodeURIComponent(accessToken)}&mid=${encodeURIComponent(mid)}&keyword=${encodeURIComponent(keyword)}&max=${max}`;
+function parseProductSearchXml(xml) {
+  const errorId = xmlTag(xml, 'ErrorID');
+  if (errorId) {
+    const err = new Error(`Rakuten (erro ${errorId}): ${xmlTag(xml, 'ErrorText') || 'sem descrição'}`);
+    err.code = errorId;
+    throw err;
+  }
+
+  const blocks = xml.match(/<item(?:\s[^>]*)?>[\s\S]*?<\/item>/gi) || [];
+  return blocks.map((block) => {
+    const linkUrl = xmlTag(block, 'linkurl');
+    return {
+      sku: xmlTag(block, 'sku'),
+      itemName: xmlTag(block, 'productname'),
+      price: xmlTag(block, 'price'),
+      salePrice: xmlTag(block, 'saleprice'),
+      imageUrl: xmlTag(block, 'imageurl'),
+      linkUrl,
+      productUrl: extractProductUrl(linkUrl),
+    };
+  });
+}
+
+async function fetchAndParse(url, accessToken) {
   const res = await fetch(url, {
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      Accept: 'application/json',
+      Accept: 'application/xml',
     },
   });
+  const rawText = (await res.text()).trim();
 
-  const rawText = await res.text();
+  if (!rawText.startsWith('<')) {
+    // Resposta em JSON = erro do portão OAuth (ex: "The access token is missing")
+    throw new Error(`Rakuten respondeu (${res.status}): ${rawText.slice(0, 400)}`);
+  }
 
+  const items = parseProductSearchXml(rawText); // lança erro se vier <Errors>
   if (!res.ok) {
-    throw new Error(`Busca de produtos Netshoes/Rakuten falhou (${res.status}): ${rawText.slice(0, 500)}`);
+    throw new Error(`Rakuten respondeu com status ${res.status}: ${rawText.slice(0, 400)}`);
   }
-
-  let data;
-  try {
-    data = JSON.parse(rawText);
-  } catch {
-    // A API respondeu em XML em vez de JSON — ainda não implementei o parser
-    // de XML. Por enquanto, mostra o início da resposta real pra entendermos
-    // o que ela está dizendo (pode ser um erro de autenticação/acesso
-    // disfarçado, não necessariamente "não suporta JSON").
-    throw new Error(`Resposta não-JSON da Rakuten (provavelmente XML): ${rawText.slice(0, 800)}`);
-  }
-
-  // A API costuma aninhar os itens em algo como data.result.item (array) —
-  // tentamos alguns formatos comuns; se nenhum bater, devolve vazio e loga.
-  const items = data?.result?.item || data?.items || data?.result || [];
-  return Array.isArray(items) ? items : [items].filter(Boolean);
+  return items;
 }
 
 /**
- * Monta o link de afiliado (deep link) — isso É confirmado, é o formato
- * padrão e documentado publicamente da Rakuten/LinkShare, sem precisar de
- * chamada de API nenhuma:
+ * Busca produtos por palavra-chave, filtrando pelo MID (Netshoes).
+ * O token vai no cabeçalho Authorization: Bearer (é o que o portão OAuth da
+ * Rakuten exige). Se a API responder "No token specified" (erro 718614),
+ * tenta de novo mandando o token também na URL.
+ */
+async function searchProducts(accessToken, mid, keyword, { max = 30 } = {}) {
+  const base = `${API_BASE}/productsearch/1.0?mid=${encodeURIComponent(mid)}&keyword=${encodeURIComponent(keyword)}&max=${max}`;
+  try {
+    return await fetchAndParse(base, accessToken);
+  } catch (err) {
+    if (err.code === '718614') {
+      return fetchAndParse(`${base}&token=${encodeURIComponent(accessToken)}`, accessToken);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Monta o link de afiliado (deep link) — confirmado em teste real:
  * https://click.linksynergy.com/deeplink?id={publisherId}&mid={mid}&murl={url}
  */
 function buildAffiliateLink(publisherId, mid, targetUrl) {
   return `https://click.linksynergy.com/deeplink?id=${encodeURIComponent(publisherId)}&mid=${encodeURIComponent(mid)}&murl=${encodeURIComponent(targetUrl)}`;
 }
 
-module.exports = { getAccessToken, searchProducts, buildAffiliateLink };
+module.exports = { getAccessToken, searchProducts, buildAffiliateLink, parseProductSearchXml };
