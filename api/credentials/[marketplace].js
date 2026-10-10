@@ -35,7 +35,7 @@ module.exports = async function handler(req, res) {
     if (req.method === 'GET') {
       const { data: creds } = await supabaseAdmin
         .from('marketplace_credentials')
-        .select('client_id, access_token, seller_id, extra_credential, extra_credential_2')
+        .select('client_id, access_token, seller_id, extra_credential, extra_credential_2, extra_credential_3')
         .eq('marketplace_id', marketplace.id)
         .maybeSingle();
 
@@ -46,6 +46,7 @@ module.exports = async function handler(req, res) {
         clientId: creds?.client_id || null,
         extraCredential: creds?.extra_credential || null,
         extraCredential2: creds?.extra_credential_2 || null,
+        hasExtraCredential3: Boolean(creds?.extra_credential_3),
       });
       return;
     }
@@ -67,6 +68,8 @@ module.exports = async function handler(req, res) {
       // Token gerado manualmente no botão "Generate Token" da Rakuten. Se vier
       // vazio, não sobrescreve o que já estava salvo.
       const manualAccessToken = slug === 'netshoes' && body.access_token ? body.access_token.trim() : null;
+      // Token da página Links > Web Services da Rakuten. Vazio = mantém o que já estava salvo.
+      const webServicesToken = slug === 'netshoes' && body.web_services_token ? body.web_services_token.trim() : null;
 
       const missingRequired = !clientId || !clientSecret
         || (slug === 'amazon' && !extraCredential)
@@ -85,6 +88,7 @@ module.exports = async function handler(req, res) {
           extra_credential: extraCredential,
           extra_credential_2: extraCredential2,
           ...(manualAccessToken ? { access_token: manualAccessToken } : {}),
+          ...(webServicesToken ? { extra_credential_3: webServicesToken } : {}),
           updated_at: new Date().toISOString(),
         },
         { onConflict: 'marketplace_id' }
