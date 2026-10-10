@@ -93,8 +93,8 @@ function renderForm(slug) {
         <input type="password" id="netshoes-secret" placeholder="Cole o Client Secret" />
       </div>
       <div class="field">
-        <label>Access Token (botão "Generate Token" na tela Applications da Rakuten)</label>
-        <input type="password" id="netshoes-token" placeholder="Cole o token gerado — deixe vazio pra manter o que já está salvo" />
+        <label>Web Services Token (painel Rakuten: menu Links → Web Services)</label>
+        <input type="password" id="netshoes-wstoken" placeholder="Cole o token — deixe vazio pra manter o que já está salvo" />
       </div>
       <div class="row-actions">
         <button class="primary" onclick="saveCredentials('netshoes')">Salvar credenciais</button>
@@ -145,7 +145,12 @@ async function loadStatus(slug) {
     const dot = document.getElementById(`dot-${slug}`);
     const statusText = document.getElementById(`status-${slug}`);
 
-    if (data.hasAccessToken) {
+    if (slug === 'netshoes' && data.hasCredentials) {
+      dot.className = data.hasExtraCredential3 ? 'dot on' : 'dot off';
+      statusText.textContent = data.hasExtraCredential3
+        ? 'Credenciais salvas'
+        : 'Credenciais salvas — falta o Web Services Token';
+    } else if (data.hasAccessToken) {
       dot.className = 'dot on';
       statusText.textContent = `Conectado${data.sellerId ? ` (seller ${data.sellerId})` : ''}`;
     } else if (data.hasCredentials) {
@@ -209,7 +214,7 @@ async function saveCredentials(slug) {
         rakuten_client_secret: secret,
         publisher_id: document.getElementById('netshoes-tag').value.trim(),
         mid: document.getElementById('netshoes-mid').value.trim(),
-        access_token: document.getElementById('netshoes-token').value.trim(),
+        web_services_token: document.getElementById('netshoes-wstoken').value.trim(),
       };
     } else {
       body = { client_id: id, client_secret: secret };
