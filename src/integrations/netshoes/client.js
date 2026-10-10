@@ -100,13 +100,8 @@ function parseProductSearchXml(xml) {
   });
 }
 
-async function fetchAndParse(url, accessToken) {
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: 'application/xml',
-    },
-  });
+async function fetchAndParse(url, headers) {
+  const res = await fetch(url, { headers });
   const rawText = (await res.text()).trim();
 
   if (!rawText.startsWith('<')) {
@@ -123,19 +118,33 @@ async function fetchAndParse(url, accessToken) {
 
 /**
  * Busca produtos por palavra-chave, filtrando pelo MID (Netshoes).
- * O token vai no cabeçalho Authorization: Bearer (é o que o portão OAuth da
- * Rakuten exige). Se a API responder "No token specified" (erro 718614),
- * tenta de novo mandando o token também na URL.
+ *
+ * São DOIS tokens diferentes (descoberto pelos erros reais da Rakuten):
+ *  - accessToken: o token OAuth que o sistema gera sozinho (vale ~4h). Vai no
+ *    cabeçalho Authorization: Bearer — o portão da Rakuten exige.
+ *  - webServicesToken: o token fixo da página "Links > Web Services" do painel
+ *    da Rakuten. Vai na URL (?token=) — é o que a API de produtos valida
+ *    ("No token specified" / "Invalid token specified").
+ *
+ * Tenta primeiro o endereço novo (api.linksynergy.com) e, se falhar, o
+ * endereço antigo da Product Search; se os dois falharem, o erro mostra os dois.
  */
-async function searchProducts(accessToken, mid, keyword, { max = 30 } = {}) {
-  const base = `${API_BASE}/productsearch/1.0?mid=${encodeURIComponent(mid)}&keyword=${encodeURIComponent(keyword)}&max=${max}`;
+async function searchProducts(accessToken, webServicesToken, mid, keyword, { max = 30 } = {}) {
+  const query = `token=${encodeURIComponent(webServicesToken)}&mid=${encodeURIComponent(mid)}&keyword=${encodeURIComponent(keyword)}&max=${max}`;
+
   try {
-    return await fetchAndParse(base, accessToken);
-  } catch (err) {
-    if (err.code === '718614') {
-      return fetchAndParse(`${base}&token=${encodeURIComponent(accessToken)}`, accessToken);
+    return await fetchAndParse(`${API_BASE}/productsearch/1.0?${query}`, {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/xml',
+    });
+  } catch (errNew) {
+    try {
+      return await fetchAndParse(`http://productsearch.linksynergy.com/productsearch?${query}`, {
+        Accept: 'application/xml',
+      });
+    } catch (errOld) {
+      throw new Error(`endereço novo: ${errNew.message} | endereço antigo: ${errOld.message}`);
     }
-    throw err;
   }
 }
 
