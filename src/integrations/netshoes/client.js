@@ -1,28 +1,42 @@
 const API_BASE = 'https://api.linksynergy.com';
 
 /**
- * Login automático (client_credentials). Nos testes reais ele devolveu
- * "Invalid token" na Product Search API, então hoje é só um plano B — o
- * caminho principal é o Access Token gerado manualmente no painel da Rakuten
- * (Applications > Generate Token) e colado em /marketplaces.html.
+ * Login automático (OAuth2 client_credentials) em api.linksynergy.com/token.
+ * A Rakuten informa que esses tokens expiram em 4 horas, então não dá pra
+ * depender de um token colado na mão: o sistema gera um novo quando precisa.
+ *
+ * `scope`: opcional. Aqui passamos o Publisher ID (SID), que é como a Rakuten
+ * costuma amarrar o token à conta do publisher. Se a Rakuten recusar esse
+ * escopo, a mensagem de erro dela aparece nos logs e eu ajusto.
  */
-async function getAccessToken(clientId, clientSecret) {
+async function getAccessToken(clientId, clientSecret, scope) {
+  const body = { grant_type: 'client_credentials' };
+  if (scope) body.scope = String(scope);
+
   const res = await fetch(`${API_BASE}/token`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
       Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`,
     },
-    body: new URLSearchParams({ grant_type: 'client_credentials', scope: 'advertiser' }),
+    body: new URLSearchParams(body),
   });
 
+  const rawText = await res.text();
   if (!res.ok) {
-    throw new Error(`Falha ao pegar token da Rakuten (${res.status}): ${await res.text()}`);
+    throw new Error(`Falha ao pegar token da Rakuten (${res.status}): ${rawText.slice(0, 400)}`);
   }
-  const data = await res.json();
+
+  let data;
+  try {
+    data = JSON.parse(rawText);
+  } catch {
+    throw new Error(`Resposta inesperada ao pegar token da Rakuten: ${rawText.slice(0, 300)}`);
+  }
+
   const token = data.access_token || data.token;
   if (!token) {
-    throw new Error(`A Rakuten respondeu ao login automático sem nenhum token: ${JSON.stringify(data).slice(0, 300)}`);
+    throw new Error(`A Rakuten respondeu ao login automático sem nenhum token: ${rawText.slice(0, 300)}`);
   }
   return token;
 }
