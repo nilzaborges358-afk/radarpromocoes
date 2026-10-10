@@ -171,7 +171,7 @@ async function scanNetshoes(req, res) {
 
     const { data: creds } = await supabaseAdmin
       .from('marketplace_credentials')
-      .select('client_id, client_secret, extra_credential, extra_credential_2, access_token')
+      .select('client_id, client_secret, extra_credential, extra_credential_2, extra_credential_3')
       .eq('marketplace_id', marketplace.id)
       .maybeSingle();
 
@@ -183,41 +183,21 @@ async function scanNetshoes(req, res) {
     const publisherId = creds.extra_credential;
     const mid = creds.extra_credential_2;
 
-    // Token: o colado na tela (Generate Token) vale só 4 horas na Rakuten. Então
-    // tentamos o salvo primeiro e, se a Rakuten disser que venceu/é inválido,
-    // geramos um novo automaticamente (client_credentials, escopo = Publisher ID).
-    let accessToken = creds.access_token || null;
-    let tokenSource = accessToken ? 'salvo na tela' : null;
-    const canAutoToken = Boolean(creds.client_id && creds.client_secret);
-
-    async function refreshAutoToken() {
-      accessToken = await netshoesClient.getAccessToken(creds.client_id, creds.client_secret, publisherId);
-      tokenSource = 'automático';
+    // A busca de produtos da Rakuten exige DOIS tokens:
+    //  1) o token do Web Services (painel Rakuten > Links > Web Services), fixo;
+    //  2) um token OAuth, gerado a cada busca (vale ~4h) com Client ID/Secret.
+    const webServicesToken = creds.extra_credential_3;
+    if (!webServicesToken) {
+      res.status(400).json({
+        error: 'Falta o Web Services Token da Rakuten (painel Rakuten > Links > Web Services). Cole em /marketplaces.html.',
+      });
+      return;
     }
-
-    if (!accessToken) {
-      if (!canAutoToken) {
-        res.status(400).json({ error: 'Faltam o Client ID/Secret (ou um Access Token) da Rakuten em /marketplaces.html.' });
-        return;
-      }
-      await refreshAutoToken();
+    if (!creds.client_id || !creds.client_secret) {
+      res.status(400).json({ error: 'Faltam o Client ID e o Client Secret da Rakuten em /marketplaces.html.' });
+      return;
     }
-
-    function isTokenError(err) {
-      return /invalid_token|\(401\)|expired/i.test(err.message);
-    }
-
-    async function searchWithRetry(keyword) {
-      try {
-        return await netshoesClient.searchProducts(accessToken, mid, keyword);
-      } catch (err) {
-        if (tokenSource === 'salvo na tela' && canAutoToken && isTokenError(err)) {
-          await refreshAutoToken();
-          return netshoesClient.searchProducts(accessToken, mid, keyword);
-        }
-        throw err;
-      }
-    }
+    const accessToken = await netshoesClient.getAccessToken(creds.client_id, creds.client_secret, publisherId);
 
     const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
     const groupsParam = req.query.groups ? String(req.query.groups).split(',') : null;
@@ -230,7 +210,7 @@ async function scanNetshoes(req, res) {
     for (const group of groups || []) {
       try {
         const keyword = group.search_keyword || group.name;
-        const items = await searchWithRetry(keyword);
+        const items = await netshoesClient.searchProducts(accessToken, webServicesToken, mid, keyword);
         itemsSeen += items.length;
         for (const item of items) {
           found += await processNetshoesItem(item, marketplace.id, group, publisherId, mid);
@@ -240,7 +220,7 @@ async function scanNetshoes(req, res) {
         await supabaseAdmin.from('integration_logs').insert({
           marketplace_id: marketplace.id,
           level: 'error',
-          message: `Falha ao buscar produtos Netshoes para "${group.name}" [token ${tokenSource}, ${String(accessToken).length} caracteres]: ${err.message}`,
+          message: `Falha ao buscar produtos Netshoes para "${group.name}" [web services token ${String(webServicesToken).length} caracteres]: ${err.message}`,
         });
       }
     }
