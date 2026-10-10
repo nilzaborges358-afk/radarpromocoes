@@ -183,17 +183,40 @@ async function scanNetshoes(req, res) {
     const publisherId = creds.extra_credential;
     const mid = creds.extra_credential_2;
 
-    // Prefere o token gerado manualmente no painel da Rakuten (botão "Generate
-    // Token"). O login automático (client_credentials) devolveu "Invalid token"
-    // nos testes, então só é tentado se não houver token salvo.
-    let accessToken = creds.access_token;
-    const tokenSource = accessToken ? 'salvo na tela' : 'automático';
+    // Token: o colado na tela (Generate Token) vale só 4 horas na Rakuten. Então
+    // tentamos o salvo primeiro e, se a Rakuten disser que venceu/é inválido,
+    // geramos um novo automaticamente (client_credentials, escopo = Publisher ID).
+    let accessToken = creds.access_token || null;
+    let tokenSource = accessToken ? 'salvo na tela' : null;
+    const canAutoToken = Boolean(creds.client_id && creds.client_secret);
+
+    async function refreshAutoToken() {
+      accessToken = await netshoesClient.getAccessToken(creds.client_id, creds.client_secret, publisherId);
+      tokenSource = 'automático';
+    }
+
     if (!accessToken) {
-      if (!creds.client_id || !creds.client_secret) {
-        res.status(400).json({ error: 'Cole o Access Token da Rakuten em /marketplaces.html (botão Generate Token).' });
+      if (!canAutoToken) {
+        res.status(400).json({ error: 'Faltam o Client ID/Secret (ou um Access Token) da Rakuten em /marketplaces.html.' });
         return;
       }
-      accessToken = await netshoesClient.getAccessToken(creds.client_id, creds.client_secret);
+      await refreshAutoToken();
+    }
+
+    function isTokenError(err) {
+      return /invalid_token|\(401\)|expired/i.test(err.message);
+    }
+
+    async function searchWithRetry(keyword) {
+      try {
+        return await netshoesClient.searchProducts(accessToken, mid, keyword);
+      } catch (err) {
+        if (tokenSource === 'salvo na tela' && canAutoToken && isTokenError(err)) {
+          await refreshAutoToken();
+          return netshoesClient.searchProducts(accessToken, mid, keyword);
+        }
+        throw err;
+      }
     }
 
     const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
@@ -207,7 +230,7 @@ async function scanNetshoes(req, res) {
     for (const group of groups || []) {
       try {
         const keyword = group.search_keyword || group.name;
-        const items = await netshoesClient.searchProducts(accessToken, mid, keyword);
+        const items = await searchWithRetry(keyword);
         itemsSeen += items.length;
         for (const item of items) {
           found += await processNetshoesItem(item, marketplace.id, group, publisherId, mid);
@@ -222,7 +245,10 @@ async function scanNetshoes(req, res) {
       }
     }
 
-    const note = itemsSeen === 0
+    const allFailed = (groups || []).length > 0 && errors.length === (groups || []).length;
+    const note = allFailed
+      ? 'Todas as buscas da Netshoes falharam — veja a mensagem em integration_logs.'
+      : itemsSeen === 0
       ? 'A Netshoes não devolveu nenhum produto para essas palavras-chave (ou a leitura da resposta não bateu — veja integration_logs).'
       : found === 0
         ? `A Netshoes devolveu ${itemsSeen} produto(s), mas nenhum com preço promocional ${MIN_DISCOUNT_PCT}% abaixo do normal.`
