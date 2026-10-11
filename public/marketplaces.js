@@ -93,7 +93,7 @@ function renderForm(slug) {
         <input type="password" id="netshoes-secret" placeholder="Cole o Client Secret" />
       </div>
       <div class="field">
-        <label>Web Services Token (painel Rakuten: menu Links → Web Services)</label>
+        <label>Web Services Token (painel Rakuten: link "APIs" no rodapé da página)</label>
         <input type="password" id="netshoes-wstoken" placeholder="Cole o token — deixe vazio pra manter o que já está salvo" />
       </div>
       <div class="row-actions">
