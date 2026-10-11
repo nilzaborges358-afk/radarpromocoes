@@ -184,12 +184,12 @@ async function scanNetshoes(req, res) {
     const mid = creds.extra_credential_2;
 
     // A busca de produtos da Rakuten exige DOIS tokens:
-    //  1) o token do Web Services (painel Rakuten > Links > Web Services), fixo;
+    //  1) o token do Web Services (painel Rakuten: link "APIs" no rodapé da página), fixo;
     //  2) um token OAuth, gerado a cada busca (vale ~4h) com Client ID/Secret.
     const webServicesToken = creds.extra_credential_3;
     if (!webServicesToken) {
       res.status(400).json({
-        error: 'Falta o Web Services Token da Rakuten (painel Rakuten > Links > Web Services). Cole em /marketplaces.html.',
+        error: 'Falta o Web Services Token da Rakuten (painel Rakuten: link "APIs" no rodapé da página). Cole em /marketplaces.html.',
       });
       return;
     }
