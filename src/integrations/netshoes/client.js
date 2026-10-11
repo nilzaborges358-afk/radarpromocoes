@@ -122,7 +122,7 @@ async function fetchAndParse(url, headers) {
  * São DOIS tokens diferentes (descoberto pelos erros reais da Rakuten):
  *  - accessToken: o token OAuth que o sistema gera sozinho (vale ~4h). Vai no
  *    cabeçalho Authorization: Bearer — o portão da Rakuten exige.
- *  - webServicesToken: o token fixo da página "Links > Web Services" do painel
+ *  - webServicesToken: o token fixo da página "APIs" (rodapé) do painel
  *    da Rakuten. Vai na URL (?token=) — é o que a API de produtos valida
  *    ("No token specified" / "Invalid token specified").
  *
