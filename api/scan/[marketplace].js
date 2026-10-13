@@ -5,6 +5,11 @@ const { supabaseAdmin } = require('../../src/core/database/supabaseClient');
 
 const MIN_DISCOUNT_PCT = 10; // era 15 — baixei pra achar mais resultado em categorias mais de nicho
 
+// Variedade na Shopee: a cada busca, sorteia a ordenação (1 relevância, 2 mais
+// vendidos, 5 maior comissão) e a página (1 a 3). Sem isso, a mesma lista de
+// campeões de venda volta todos os dias.
+const SHOPEE_SORT_ROTATION = [1, 2, 5];
+
 // GET /api/scan/mercadolivre?groups=id1,id2,none
 // GET /api/scan/shopee?groups=id1,id2
 // Antes eram 2 functions separadas — juntei num arquivo dinâmico só.
@@ -95,7 +100,7 @@ async function checkMlProduct(product, marketplaceId) {
       .from('promotions')
       .update({
         watch_group_id: existing.watch_group_id || product.watch_group_id || null,
-        detected_at: new Date().toISOString(),
+        last_seen_at: new Date().toISOString(),
       })
       .eq('id', existing.id);
     return 0;
@@ -291,7 +296,7 @@ async function processNetshoesItem(item, marketplaceId, group, publisherId, mid)
         current_price: price,
         discount_rate: discountRate,
         watch_group_id: existing.watch_group_id || group.id,
-        detected_at: new Date().toISOString(),
+        last_seen_at: new Date().toISOString(),
       })
       .eq('id', existing.id);
     return 0;
@@ -357,7 +362,9 @@ async function scanShopee(req, res) {
         const perKeywordLimit = Math.max(10, Math.floor(40 / keywords.length));
 
         for (const keyword of keywords) {
-          const offers = await searchProductOffers(creds.client_id, creds.client_secret, keyword, { limit: perKeywordLimit });
+          const sortType = SHOPEE_SORT_ROTATION[Math.floor(Math.random() * SHOPEE_SORT_ROTATION.length)];
+          const page = 1 + Math.floor(Math.random() * 3);
+          const offers = await searchProductOffers(creds.client_id, creds.client_secret, keyword, { limit: perKeywordLimit, sortType, page });
           for (const offer of offers) {
             found += await processShopeeOffer(offer, marketplace.id, group, creds);
           }
@@ -417,7 +424,7 @@ async function processShopeeOffer(offer, marketplaceId, group, creds) {
         current_price: offer.priceMin,
         discount_rate: discountRate,
         watch_group_id: existing.watch_group_id || group.id,
-        detected_at: new Date().toISOString(),
+        last_seen_at: new Date().toISOString(),
       })
       .eq('id', existing.id);
     return 0;
