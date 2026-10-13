@@ -28,15 +28,38 @@ module.exports = async function handler(req, res) {
         return;
       }
 
+      // Só bloqueia quando nome E palavra-chave são exatamente iguais (ignorando
+      // maiúsculas/minúsculas e espaços extras). Mesmo nome com palavra-chave
+      // diferente é permitido — vira um novo grupo.
+      const cleanName = normalizeText(name);
+      const cleanKeyword = normalizeText(search_keyword);
+
+      const { data: existing, error: listError } = await supabaseAdmin
+        .from('watch_groups')
+        .select('id, name, search_keyword');
+      if (listError) throw new Error(listError.message);
+
+      const duplicate = (existing || []).find(
+        (g) => normalizeKey(g.name) === normalizeKey(cleanName) && normalizeKey(g.search_keyword) === normalizeKey(cleanKeyword)
+      );
+      if (duplicate) {
+        res.status(400).json({ error: 'Já existe um grupo com esse mesmo nome e essa mesma palavra-chave.' });
+        return;
+      }
+
       const { data, error } = await supabaseAdmin
         .from('watch_groups')
-        .insert({ name: name.trim(), search_keyword: search_keyword.trim() })
+        .insert({ name: cleanName, search_keyword: cleanKeyword })
         .select()
         .single();
 
       if (error) {
         if (error.code === '23505') {
-          res.status(400).json({ error: 'Já existe um grupo com esse nome.' });
+          // Se cair aqui com nome+palavra-chave diferentes, o banco ainda tem a trava
+          // antiga (só pelo nome): rode supabase/migrations/0002_watch_groups_unique.sql.
+          res.status(400).json({
+            error: 'O banco ainda bloqueia grupos com o mesmo nome. Rode o arquivo 0002_watch_groups_unique.sql no SQL Editor do Supabase (ou o grupo já existe).',
+          });
           return;
         }
         throw new Error(error.message);
@@ -62,6 +85,14 @@ module.exports = async function handler(req, res) {
     res.status(500).json({ error: `Erro no servidor: ${err.message}` });
   }
 };
+
+function normalizeText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeKey(value) {
+  return normalizeText(value).toLowerCase();
+}
 
 async function testSearch(req, res, keyword) {
   if (!keyword) {
