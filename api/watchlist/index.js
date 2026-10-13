@@ -16,7 +16,7 @@ module.exports = async function handler(req, res) {
       const { data: groups } = await supabaseAdmin.from('watch_groups').select('*').order('name');
       const { data: products } = await supabaseAdmin
         .from('products')
-        .select('*, watch_groups(name)')
+        .select('*, watch_groups(name, search_keyword)')
         .eq('marketplace_id', marketplace.id)
         .order('created_at', { ascending: false });
       const { data: marketplaces } = await supabaseAdmin.from('marketplaces').select('slug, name').order('name');
