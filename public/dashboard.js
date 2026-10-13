@@ -13,6 +13,7 @@ let client = null;
 let currentStatus = 'ALL';
 let currentMarketplace = 'ALL';
 let currentGroup = 'ALL';
+let currentKeyword = 'ALL';
 let currentDateFilter = 'TODAY';
 let allPromotions = [];
 let knownGroups = [];
@@ -61,6 +62,12 @@ function init() {
   });
   document.getElementById('groupFilter').addEventListener('change', (e) => {
     currentGroup = e.target.value;
+    refreshGroupKeywordOptions();
+    render();
+  });
+  document.getElementById('keywordFilter').addEventListener('change', (e) => {
+    currentKeyword = e.target.value;
+    refreshGroupKeywordOptions();
     render();
   });
   document.getElementById('dateFilter').addEventListener('change', (e) => {
@@ -73,9 +80,10 @@ function init() {
   document.getElementById('clearFilters').addEventListener('click', () => {
     currentMarketplace = 'ALL';
     currentGroup = 'ALL';
+    currentKeyword = 'ALL';
     currentDateFilter = 'TODAY';
     document.getElementById('marketplaceFilter').value = 'ALL';
-    document.getElementById('groupFilter').value = 'ALL';
+    refreshGroupKeywordOptions();
     document.getElementById('dateFilter').value = 'TODAY';
     document.getElementById('customDateRange').classList.remove('show');
     render();
@@ -109,26 +117,76 @@ async function loadFilterOptions() {
   });
   if ([...mpSelect.options].some((o) => o.value === mpPrevValue)) mpSelect.value = mpPrevValue;
 
-  const { data: groups, error: groupError } = await client.from('watch_groups').select('id, name').order('name');
+  const { data: groups, error: groupError } = await client.from('watch_groups').select('id, name, search_keyword').order('name');
   if (groupError) { showFatalError(`Erro ao carregar grupos: ${groupError.message}`); return; }
 
   knownGroups = groups || [];
+  refreshGroupKeywordOptions();
+  render();
+}
+
+function normKey(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function displayKeyword(g) {
+  return (g.search_keyword || g.name || '').trim();
+}
+
+// Filtros em cascata: o que está selecionado num dropdown restringe as opções do outro.
+// - Escolheu um grupo  -> o filtro de palavra-chave só lista as palavras-chave daquele grupo.
+// - Escolheu uma palavra-chave -> o filtro de grupo só lista os grupos que usam essa palavra.
+// - Nada escolhido -> aparece tudo.
+function refreshGroupKeywordOptions() {
   const groupSelect = document.getElementById('groupFilter');
-  const groupPrevValue = groupSelect.value;
-  groupSelect.innerHTML = '<option value="ALL">Todos</option>';
-  knownGroups.forEach((g) => {
+  const keywordSelect = document.getElementById('keywordFilter');
+
+  const groupsForKeywordList = currentGroup === 'ALL'
+    ? knownGroups
+    : knownGroups.filter((g) => normKey(g.name) === currentGroup);
+  const groupsForGroupList = currentKeyword === 'ALL'
+    ? knownGroups
+    : knownGroups.filter((g) => normKey(displayKeyword(g)) === currentKeyword);
+
+  const groupOptions = new Map();
+  groupsForGroupList.forEach((g) => { if (!groupOptions.has(normKey(g.name))) groupOptions.set(normKey(g.name), g.name); });
+  const keywordOptions = new Map();
+  groupsForKeywordList.forEach((g) => { if (!keywordOptions.has(normKey(displayKeyword(g)))) keywordOptions.set(normKey(displayKeyword(g)), displayKeyword(g)); });
+
+  // Se a seleção atual deixou de existir (grupo apagado, etc.), volta para "Todos".
+  if (currentGroup !== 'ALL' && !knownGroups.some((g) => normKey(g.name) === currentGroup)) currentGroup = 'ALL';
+  if (currentKeyword !== 'ALL' && !knownGroups.some((g) => normKey(displayKeyword(g)) === currentKeyword)) currentKeyword = 'ALL';
+
+  fillSelect(groupSelect, groupOptions, currentGroup);
+  fillSelect(keywordSelect, keywordOptions, currentKeyword);
+}
+
+function fillSelect(select, optionsMap, selected) {
+  select.innerHTML = '<option value="ALL">Todos</option>';
+  [...optionsMap.entries()].sort((a, b) => a[1].localeCompare(b[1], 'pt-BR')).forEach(([value, label]) => {
     const opt = document.createElement('option');
-    opt.value = g.id;
-    opt.textContent = g.name;
-    groupSelect.appendChild(opt);
+    opt.value = value;
+    opt.textContent = label;
+    select.appendChild(opt);
   });
-  if ([...groupSelect.options].some((o) => o.value === groupPrevValue)) groupSelect.value = groupPrevValue;
+  select.value = optionsMap.has(selected) ? selected : 'ALL';
+}
+
+// IDs dos grupos que combinam com o grupo e/ou palavra-chave escolhidos.
+function matchingGroupIds() {
+  if (currentGroup === 'ALL' && currentKeyword === 'ALL') return null;
+  return new Set(
+    knownGroups
+      .filter((g) => (currentGroup === 'ALL' || normKey(g.name) === currentGroup)
+        && (currentKeyword === 'ALL' || normKey(displayKeyword(g)) === currentKeyword))
+      .map((g) => g.id)
+  );
 }
 
 async function loadPromotions() {
   const { data, error } = await client
     .from('promotions')
-    .select('*, marketplaces(slug, name, logo_url), watch_groups(name)')
+    .select('*, marketplaces(slug, name, logo_url), watch_groups(name, search_keyword)')
     .order('detected_at', { ascending: false })
     .limit(300);
 
@@ -154,15 +212,21 @@ function render() {
   const grid = document.getElementById('grid');
   const empty = document.getElementById('empty');
 
-  document.getElementById('countAll').textContent = allPromotions.length;
-  document.getElementById('countPending').textContent = allPromotions.filter((p) => p.status === 'PENDING').length;
-  document.getElementById('countAffiliated').textContent = allPromotions.filter((p) => p.status === 'AFFILIATED').length;
+  // Base = tudo que passa nos filtros (marketplace, grupo, palavra-chave, data), ainda sem a aba de status.
+  let base = allPromotions;
+  if (currentMarketplace !== 'ALL') base = base.filter((p) => p.marketplaces?.slug === currentMarketplace);
+  const groupIds = matchingGroupIds();
+  if (groupIds) base = base.filter((p) => p.watch_group_id && groupIds.has(p.watch_group_id));
+  base = applyDateFilter(base);
 
-  let list = allPromotions;
+  // Contadores só mostram número quando há promoção de fato na tela; acompanham os filtros em tempo real.
+  const hasResults = base.length > 0;
+  document.getElementById('countAll').textContent = hasResults ? base.length : '–';
+  document.getElementById('countPending').textContent = hasResults ? base.filter((p) => p.status === 'PENDING').length : '–';
+  document.getElementById('countAffiliated').textContent = hasResults ? base.filter((p) => p.status === 'AFFILIATED').length : '–';
+
+  let list = base;
   if (currentStatus !== 'ALL') list = list.filter((p) => p.status === currentStatus);
-  if (currentMarketplace !== 'ALL') list = list.filter((p) => p.marketplaces?.slug === currentMarketplace);
-  if (currentGroup !== 'ALL') list = list.filter((p) => p.watch_group_id === currentGroup);
-  list = applyDateFilter(list);
 
   if (list.length === 0) {
     grid.innerHTML = '';
@@ -306,7 +370,13 @@ async function markStatus(id, status) {
 function openScanModal() {
   // Monta as checkboxes de grupo (+ "Sem grupo"), todas marcadas por padrão.
   const container = document.getElementById('scanGroupsCheckboxes');
-  const groupOptions = [...knownGroups.map((g) => ({ id: g.id, name: g.name })), { id: 'none', name: 'Sem grupo' }];
+  const groupOptions = [
+    ...knownGroups.map((g) => {
+      const kw = displayKeyword(g);
+      return { id: g.id, name: normKey(kw) && normKey(kw) !== normKey(g.name) ? `${g.name} — ${kw}` : g.name };
+    }),
+    { id: 'none', name: 'Sem grupo' },
+  ];
 
   container.innerHTML = groupOptions.map((g) => `
     <label class="check-row">
