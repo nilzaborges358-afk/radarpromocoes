@@ -19,11 +19,18 @@ async function load() {
   }
 }
 
+// Pode haver vários grupos com o mesmo nome (palavras-chave diferentes),
+// então o rótulo mostra os dois: "Corrida — tênis de corrida".
+function groupLabel(g) {
+  const kw = (g.search_keyword || '').trim();
+  return kw && kw.toLowerCase() !== (g.name || '').trim().toLowerCase() ? `${g.name} — ${kw}` : g.name;
+}
+
 function renderGroupSelect() {
   const select = document.getElementById('groupSelect');
   select.innerHTML =
     `<option value="">Sem grupo</option>` +
-    groups.map((g) => `<option value="${g.id}">${escapeHtml(g.name)}</option>`).join('');
+    groups.map((g) => `<option value="${g.id}">${escapeHtml(groupLabel(g))}</option>`).join('');
 }
 
 function renderGroupsList() {
@@ -62,15 +69,14 @@ function renderList() {
   const noGroup = [];
 
   products.forEach((p) => {
-    const groupName = p.watch_groups?.name;
-    if (!groupName) { noGroup.push(p); return; }
-    if (!byGroup.has(groupName)) byGroup.set(groupName, []);
-    byGroup.get(groupName).push(p);
+    if (!p.watch_group_id || !p.watch_groups?.name) { noGroup.push(p); return; }
+    if (!byGroup.has(p.watch_group_id)) byGroup.set(p.watch_group_id, { label: groupLabel({ name: p.watch_groups.name, search_keyword: p.watch_groups.search_keyword }), items: [] });
+    byGroup.get(p.watch_group_id).items.push(p);
   });
 
   let html = '';
-  for (const [groupName, items] of byGroup.entries()) {
-    html += renderGroupBlock(groupName, items);
+  for (const { label, items } of byGroup.values()) {
+    html += renderGroupBlock(label, items);
   }
   if (noGroup.length) html += renderGroupBlock('Sem grupo', noGroup);
 
@@ -151,7 +157,7 @@ function renderManualFormOptions() {
   const groupSelect = document.getElementById('manual-group');
   groupSelect.innerHTML =
     `<option value="">Sem grupo</option>` +
-    groups.map((g) => `<option value="${g.id}">${escapeHtml(g.name)}</option>`).join('');
+    groups.map((g) => `<option value="${g.id}">${escapeHtml(groupLabel(g))}</option>`).join('');
 }
 
 async function submitManualPromotion() {
