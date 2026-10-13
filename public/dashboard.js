@@ -218,7 +218,13 @@ function applyDateFilter(list) {
   const todayKey = toLocalDateKey(today);
 
   if (currentDateFilter === 'TODAY') {
+    // Só o que foi encontrado pela PRIMEIRA vez hoje (produto reencontrado não conta como novo).
     return list.filter((p) => toLocalDateKey(p.detected_at) === todayKey);
+  }
+
+  if (currentDateFilter === 'TODAY_SEEN') {
+    // Tudo que a busca viu hoje, inclusive produtos antigos que apareceram de novo.
+    return list.filter((p) => toLocalDateKey(p.last_seen_at || p.detected_at) === todayKey);
   }
 
   if (currentDateFilter === 'YESTERDAY') {
@@ -243,6 +249,11 @@ function applyDateFilter(list) {
 }
 
 function renderCard(promo) {
+  const firstKey = toLocalDateKey(promo.detected_at);
+  const lastKey = promo.last_seen_at ? toLocalDateKey(promo.last_seen_at) : firstKey;
+  const revisto = lastKey !== firstKey
+    ? ` · visto de novo em ${new Date(promo.last_seen_at).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })}`
+    : '';
   const slug = promo.marketplaces?.slug;
   const label = MARKETPLACE_LABELS[slug] || { name: promo.marketplaces?.name || 'Marketplace', color: '#444', textColor: '#fff' };
   const groupName = promo.watch_groups?.name;
@@ -267,7 +278,7 @@ function renderCard(promo) {
         </div>
         <div class="meta-row status-${promo.status}">
           <span class="status-dot"></span>
-          Buscada em ${detectedAt} · ${STATUS_LABEL[promo.status] || promo.status}
+          Achada em ${detectedAt}${revisto} · ${STATUS_LABEL[promo.status] || promo.status}
         </div>
         <div class="actions">
           <a href="${promo.original_url}" target="_blank" rel="noopener">Abrir original</a>
