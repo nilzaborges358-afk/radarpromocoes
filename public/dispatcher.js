@@ -44,25 +44,45 @@ function log(text, kind) {
 
 // ---------- carregar dados ----------
 
-async function loadAll() {
-  try {
-    const [d, g] = await Promise.all([
-      fetch('/api/dispatch').then((r) => r.json()),
-      fetch('/api/groups').then((r) => r.json()),
-    ]);
-    if (d.error) throw new Error(d.error);
-    destinations = d.destinations || [];
-    groups = g.groups || [];
-    renderDestinations();
-    renderGroups();
-    restoreSettings();
-    updateModeUI();
-  } catch (err) {
-    $('destMsg').textContent = `Erro ao carregar: ${err.message} (já rodou o SQL v30 no Supabase?)`;
-  }
+async function fetchJson(url) {
+  const res = await fetch(url);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || `Erro ${res.status}`);
+  return data;
 }
 
-function renderDestinations() {
+// Destinos e grupos carregam de forma independente: se um falhar, o outro continua aparecendo.
+async function loadAll() {
+  const [d, g] = await Promise.allSettled([fetchJson('/api/dispatch'), fetchJson('/api/groups')]);
+
+  if (d.status === 'fulfilled') {
+    destinations = d.value.destinations || [];
+    $('destMsg').textContent = '';
+  } else {
+    destinations = [];
+    $('destMsg').textContent = `Erro ao carregar destinos: ${d.reason.message} (já rodou o SQL v30 no Supabase? Está logado?)`;
+  }
+
+  if (g.status === 'fulfilled') groups = g.value.groups || [];
+  else { groups = []; $('queueInfo').textContent = `Erro ao carregar grupos: ${g.reason.message}`; }
+
+  renderDestinations(d.status === 'rejected' ? d.reason.message : null);
+  renderGroups();
+  restoreSettings();
+  updateModeUI();
+}
+
+function renderDestinations(loadError) {
+  // O seletor da etapa 2 é montado primeiro, independente da lista da etapa 1.
+  const sel = $('destSelect');
+  const prev = sel.value;
+  if (destinations.length) {
+    sel.innerHTML = destinations.map((d) => `<option value="${d.id}">${escapeHtml(d.name)}${d.platform === 'whatsapp_manual' ? ' (WhatsApp)' : ' (Telegram)'}</option>`).join('');
+    if (destinations.some((d) => d.id === prev)) sel.value = prev;
+  } else {
+    sel.innerHTML = `<option value="">${loadError ? 'Erro ao carregar destinos' : 'Nenhum destino — adicione na etapa 1'}</option>`;
+  }
+
   const list = $('destList');
   if (!destinations.length) {
     list.innerHTML = '<div class="dest-row"><span class="dest-meta">Nenhum destino ainda. Adicione um abaixo.</span></div>';
@@ -82,14 +102,14 @@ function renderDestinations() {
     list.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', () => removeDestination(b.dataset.del)));
   }
 
-  const sel = $('destSelect');
-  const prev = sel.value;
-  sel.innerHTML = destinations.map((d) => `<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
-  if (destinations.some((d) => d.id === prev)) sel.value = prev;
 }
 
 function renderGroups() {
-  const options = [...groups.map((g) => ({ id: g.id, name: g.name })), { id: 'none', name: 'Sem grupo' }];
+  const label = (g) => {
+    const kw = (g.search_keyword || '').trim();
+    return kw && kw.toLowerCase() !== (g.name || '').trim().toLowerCase() ? `${g.name} — ${kw}` : g.name;
+  };
+  const options = [...groups.map((g) => ({ id: g.id, name: label(g) })), { id: 'none', name: 'Sem grupo' }];
   $('groupBox').innerHTML = options.map((g) => `
     <label class="check"><input type="checkbox" class="grp" value="${g.id}" checked /> ${escapeHtml(g.name)}</label>`).join('');
 }
