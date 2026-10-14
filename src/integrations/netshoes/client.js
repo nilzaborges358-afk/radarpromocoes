@@ -1,5 +1,9 @@
 const API_BASE = 'https://api.linksynergy.com';
 
+// Cada chamada à Rakuten tem prazo. Sem isso, uma chamada travada segurava a busca inteira
+// até a Vercel cortar a função (e a tela ficava sem resposta nenhuma).
+const REQUEST_TIMEOUT_MS = 8000;
+
 /**
  * Login automático (OAuth2 client_credentials) em api.linksynergy.com/token.
  * A Rakuten informa que esses tokens expiram em 4 horas, então não dá pra
@@ -20,6 +24,7 @@ async function getAccessToken(clientId, clientSecret, scope) {
       Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`,
     },
     body: new URLSearchParams(body),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 
   const rawText = await res.text();
@@ -101,7 +106,15 @@ function parseProductSearchXml(xml) {
 }
 
 async function fetchAndParse(url, headers) {
-  const res = await fetch(url, { headers });
+  let res;
+  try {
+    res = await fetch(url, { headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+  } catch (err) {
+    if (err && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+      throw new Error(`a Rakuten não respondeu em ${REQUEST_TIMEOUT_MS / 1000}s`);
+    }
+    throw new Error(`falha de rede: ${err.message}`);
+  }
   const rawText = (await res.text()).trim();
 
   if (!rawText.startsWith('<')) {
@@ -113,39 +126,72 @@ async function fetchAndParse(url, headers) {
   if (!res.ok) {
     throw new Error(`Rakuten respondeu com status ${res.status}: ${rawText.slice(0, 400)}`);
   }
+
+  // Informações para diagnóstico (não atrapalham quem só usa a lista).
+  items.totalMatches = Number(xmlTag(rawText, 'TotalMatches')) || 0;
+  items.rawSample = items.length ? null : rawText.replace(/\s+/g, ' ').slice(0, 300);
   return items;
 }
 
 /**
+ * Formas de falar com a Rakuten, da mais provável para a menos provável.
+ * Na primeira busca o sistema testa uma por uma; a que funcionar fica "travada"
+ * em `auth.strategy` e as próximas palavras-chave usam direto essa.
+ */
+const STRATEGIES = [
+  {
+    id: 'novo (OAuth + token)',
+    ready: (a) => Boolean(a.accessToken),
+    build: (a, q) => ({ url: `${API_BASE}/productsearch/1.0?${q}`, headers: { Authorization: `Bearer ${a.accessToken}`, Accept: 'application/xml' } }),
+  },
+  {
+    id: 'novo (Web Services Token)',
+    ready: (a) => Boolean(a.webServicesToken),
+    build: (a, q) => ({ url: `${API_BASE}/productsearch/1.0?${q}`, headers: { Authorization: `Bearer ${a.webServicesToken}`, Accept: 'application/xml' } }),
+  },
+  {
+    id: 'antigo',
+    ready: (a) => Boolean(a.webServicesToken),
+    build: (a, q) => ({ url: `http://productsearch.linksynergy.com/productsearch?${q}`, headers: { Accept: 'application/xml' } }),
+  },
+];
+
+/**
  * Busca produtos por palavra-chave, filtrando pelo MID (Netshoes).
  *
- * São DOIS tokens diferentes (descoberto pelos erros reais da Rakuten):
- *  - accessToken: o token OAuth que o sistema gera sozinho (vale ~4h). Vai no
- *    cabeçalho Authorization: Bearer — o portão da Rakuten exige.
- *  - webServicesToken: o token fixo da página "APIs" (rodapé) do painel
- *    da Rakuten. Vai na URL (?token=) — é o que a API de produtos valida
- *    ("No token specified" / "Invalid token specified").
+ * `auth` = { accessToken, webServicesToken, strategy } — objeto compartilhado entre
+ * todas as buscas de uma varredura (por isso a estratégia que funcionou fica guardada).
  *
- * Tenta primeiro o endereço novo (api.linksynergy.com) e, se falhar, o
- * endereço antigo da Product Search; se os dois falharem, o erro mostra os dois.
+ * São DOIS tokens diferentes (descoberto pelos erros reais da Rakuten):
+ *  - accessToken: o token OAuth que o sistema gera sozinho (vale ~4h).
+ *  - webServicesToken: o token fixo da página "APIs" (rodapé) do painel da Rakuten.
  */
-async function searchProducts(accessToken, webServicesToken, mid, keyword, { max = 30 } = {}) {
-  const query = `token=${encodeURIComponent(webServicesToken)}&mid=${encodeURIComponent(mid)}&keyword=${encodeURIComponent(keyword)}&max=${max}`;
+async function searchProducts(auth, mid, keyword, { max = 30 } = {}) {
+  const query = `token=${encodeURIComponent(auth.webServicesToken || '')}&mid=${encodeURIComponent(mid)}&keyword=${encodeURIComponent(keyword)}&max=${max}`;
 
-  try {
-    return await fetchAndParse(`${API_BASE}/productsearch/1.0?${query}`, {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: 'application/xml',
-    });
-  } catch (errNew) {
+  // Já sabemos qual forma funciona: usa só ela.
+  if (auth.strategy) {
+    const strategy = STRATEGIES.find((s) => s.id === auth.strategy);
+    const req = strategy.build(auth, query);
+    const items = await fetchAndParse(req.url, req.headers);
+    items.strategy = strategy.id;
+    return items;
+  }
+
+  const failures = [];
+  for (const strategy of STRATEGIES) {
+    if (!strategy.ready(auth)) continue;
     try {
-      return await fetchAndParse(`http://productsearch.linksynergy.com/productsearch?${query}`, {
-        Accept: 'application/xml',
-      });
-    } catch (errOld) {
-      throw new Error(`endereço novo: ${errNew.message} | endereço antigo: ${errOld.message}`);
+      const req = strategy.build(auth, query);
+      const items = await fetchAndParse(req.url, req.headers);
+      auth.strategy = strategy.id;
+      items.strategy = strategy.id;
+      return items;
+    } catch (err) {
+      failures.push(`[${strategy.id}] ${err.message}`);
     }
   }
+  throw new Error(failures.length ? failures.join(' | ') : 'nenhum token da Rakuten disponível para fazer a busca');
 }
 
 /**
