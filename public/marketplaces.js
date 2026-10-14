@@ -5,6 +5,7 @@ const MARKETPLACES = [
   { slug: 'magalu', name: 'Magalu', color: '#0086ff', implemented: true, manualOnly: true },
   { slug: 'tiktokshop', name: 'TikTok Shop', color: '#ffffff', implemented: false },
   { slug: 'netshoes', name: 'Netshoes', color: '#f5761a', implemented: true },
+  { slug: 'riachuelo', name: 'Riachuelo (Awin)', color: '#e2231a', implemented: true },
 ];
 
 const list = document.getElementById('list');
@@ -34,6 +35,7 @@ function render() {
   loadStatus('shopee');
   loadStatus('amazon');
   loadStatus('netshoes');
+  loadStatus('riachuelo');
 }
 
 function renderForm(slug) {
@@ -71,6 +73,36 @@ function renderForm(slug) {
       </div>
       <div class="save-msg" id="shopee-save-msg"></div>
       <p class="soon-note" style="margin-top:10px;">Não precisa de "conectar" — assim que salvar, o botão "Buscar promoções agora" do painel geral já passa a buscar na Shopee também, usando os grupos da Lista de vigilância como palavra-chave.</p>
+    `;
+  }
+
+  if (slug === 'riachuelo') {
+    return `
+      <div class="field">
+        <label>Publisher ID da Awin</label>
+        <input type="text" id="riachuelo-id" placeholder="Ex: 1234567 (número no canto do painel da Awin)" />
+      </div>
+      <div class="field">
+        <label>Token da API da Awin (OAuth2)</label>
+        <input type="password" id="riachuelo-secret" placeholder="Awin > API Credentials > Create API Token" />
+      </div>
+      <div class="field">
+        <label>Chave do Feed de produtos (Create-a-Feed)</label>
+        <input type="password" id="riachuelo-feedkey" placeholder="Cole a chave — deixe vazio pra manter a que já está salva" />
+      </div>
+      <div class="field">
+        <label>Advertiser ID da Riachuelo (opcional — o sistema descobre sozinho)</label>
+        <input type="text" id="riachuelo-tag" placeholder="Deixe vazio para detectar automaticamente" />
+      </div>
+      <div class="field">
+        <label>Feed ID (opcional — só se a Riachuelo tiver mais de um feed)</label>
+        <input type="text" id="riachuelo-mid" placeholder="Deixe vazio para escolher automaticamente" />
+      </div>
+      <div class="row-actions">
+        <button class="primary" onclick="saveCredentials('riachuelo')">Salvar credenciais</button>
+      </div>
+      <div class="save-msg" id="riachuelo-save-msg"></div>
+      <p class="soon-note" style="margin-top:10px;">Precisa estar aprovado no programa da Riachuelo na Awin. Publisher ID: número da sua conta (aparece no topo do painel). Token: Awin &gt; Account &gt; API Credentials. Chave do feed: Awin &gt; Toolbox &gt; Create-a-Feed (copie o trecho depois de <b>apikey/</b> no link de download). Esta chave é DIFERENTE do token da API.</p>
     `;
   }
 
@@ -145,7 +177,12 @@ async function loadStatus(slug) {
     const dot = document.getElementById(`dot-${slug}`);
     const statusText = document.getElementById(`status-${slug}`);
 
-    if (slug === 'netshoes' && data.hasCredentials) {
+    if (slug === 'riachuelo' && data.hasCredentials) {
+      dot.className = data.hasExtraCredential3 ? 'dot on' : 'dot off';
+      statusText.textContent = data.hasExtraCredential3
+        ? 'Credenciais salvas'
+        : 'Credenciais salvas — falta a Chave do Feed';
+    } else if (slug === 'netshoes' && data.hasCredentials) {
       dot.className = data.hasExtraCredential3 ? 'dot on' : 'dot off';
       statusText.textContent = data.hasExtraCredential3
         ? 'Credenciais salvas'
@@ -154,7 +191,7 @@ async function loadStatus(slug) {
       dot.className = 'dot on';
       statusText.textContent = `Conectado${data.sellerId ? ` (seller ${data.sellerId})` : ''}`;
     } else if (data.hasCredentials) {
-      if (slug === 'shopee' || slug === 'netshoes') {
+      if (slug === 'shopee' || slug === 'netshoes' || slug === 'riachuelo') {
         dot.className = 'dot on';
         statusText.textContent = 'Credenciais salvas';
       } else if (slug === 'amazon') {
@@ -207,6 +244,14 @@ async function saveCredentials(slug) {
         access_key: id,
         secret_key: secret,
         associate_tag: document.getElementById('amazon-tag').value.trim(),
+      };
+    } else if (slug === 'riachuelo') {
+      body = {
+        awin_publisher_id: id,
+        awin_token: secret,
+        feed_key: document.getElementById('riachuelo-feedkey').value.trim(),
+        advertiser_id: document.getElementById('riachuelo-tag').value.trim(),
+        feed_id: document.getElementById('riachuelo-mid').value.trim(),
       };
     } else if (slug === 'netshoes') {
       body = {
