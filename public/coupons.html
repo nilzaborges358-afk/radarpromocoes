@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8" />
+<title>Radar — Cupons</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #101114; --panel: #17181c; --line: #2b2d33; --ink: #f3f2ee;
+    --muted: #8b8d94; --accent: #e7b24a; --good: #5fcb8f; --bad: #e2604a;
+    --font-display: 'Space Grotesk', sans-serif; --font-body: 'Inter', sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background: var(--bg); color: var(--ink); font-family: var(--font-body); -webkit-font-smoothing: antialiased; }
+
+  nav { display:flex; justify-content:space-between; align-items:center; padding:18px 32px; border-bottom:1px solid var(--line); }
+  nav .nav-links { display:flex; gap:24px; }
+  nav .logout-link { cursor:pointer; }
+  nav a { color: var(--muted); text-decoration:none; font-size:13px; font-weight:500; padding-bottom:4px; border-bottom:2px solid transparent; }
+  nav a.active { color: var(--ink); border-bottom-color: var(--accent); }
+
+  .masthead { padding: 28px 32px 8px; }
+  .wordmark { font-family: var(--font-display); font-weight:700; font-size:24px; margin:0; letter-spacing:-0.02em; }
+  .wordmark span { color: var(--accent); }
+  .tagline { font-size:13px; color: var(--muted); margin:4px 0 0; }
+
+  .card-block { margin: 20px 32px; padding: 20px 22px; background: var(--panel); border: 1px solid var(--line); }
+  .card-title { display:flex; align-items:center; gap:10px; font-family: var(--font-display); font-weight:600; font-size:15px; margin-bottom:4px; }
+  .mp-dot { width:9px; height:9px; border-radius:50%; }
+  .card-sub { font-size:12px; color: var(--muted); margin:0 0 16px; }
+
+  .row { display:flex; gap:10px; flex-wrap:wrap; }
+  .row input {
+    flex:1; min-width:260px; background:#0d0e10; border:1px solid var(--line); color: var(--ink);
+    padding:10px 12px; font-family: var(--font-body); font-size:13.5px;
+  }
+  .row button {
+    background: var(--accent); color:#1a1204; border:none; font-weight:600; font-size:13px;
+    padding:10px 18px; cursor:pointer; white-space:nowrap;
+  }
+  .row button.secondary { background:transparent; color: var(--ink); border:1px solid var(--line); }
+  button:disabled { opacity:0.6; cursor:wait; }
+
+  .result-box {
+    margin-top:14px; padding:12px 14px; background:#0d0e10; border:1px solid var(--line);
+    display:none; align-items:center; gap:10px; flex-wrap:wrap;
+  }
+  .result-box.show { display:flex; }
+  .result-box .link-text { flex:1; min-width:200px; font-size:12.5px; color: var(--good); word-break:break-all; }
+  .result-box button { font-size:12px; padding:7px 12px; background: transparent; border:1px solid var(--line); color: var(--ink); cursor:pointer; }
+
+  .msg { font-size:12px; color: var(--muted); margin-top:8px; min-height:16px; }
+  .msg.error { color: var(--bad); }
+
+  /* ---- Cupons do produto ---- */
+  .cp-product { display:flex; gap:14px; align-items:center; margin-top:14px; padding:12px 14px; background:#0d0e10; border:1px solid var(--line); }
+  .cp-product img { width:64px; height:64px; object-fit:contain; background:#fff; }
+  .cp-product .t { font-size:13.5px; line-height:1.35; }
+  .cp-product .m { font-size:12px; color: var(--muted); margin-top:4px; }
+  .cp-list { display:flex; flex-direction:column; gap:1px; background: var(--line); margin-top:12px; }
+  .cp-item { background:#0d0e10; padding:12px 14px; display:flex; gap:12px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+  .cp-item.best { border-left:3px solid var(--good); }
+  .cp-name { font-size:13.5px; font-weight:600; }
+  .cp-meta { font-size:12px; color: var(--muted); margin-top:3px; line-height:1.5; }
+  .cp-code { font-family: var(--font-display); font-size:14px; color: var(--accent); border:1px dashed var(--accent); padding:3px 8px; }
+  .cp-final { font-family: var(--font-display); font-size:16px; font-weight:600; color: var(--good); }
+  .cp-badge { font-size:11px; padding:2px 7px; border:1px solid var(--line); color: var(--muted); }
+  .cp-badge.ok { color: var(--good); border-color: var(--good); }
+  .cp-badge.warn { color: var(--accent); border-color: var(--accent); }
+  .cp-actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .cp-actions button, .cp-form button.small { font-size:12px; padding:6px 10px; background:transparent; border:1px solid var(--line); color: var(--ink); cursor:pointer; }
+  .cp-actions button.danger { color: var(--bad); border-color: var(--bad); }
+  .cp-note { margin-top:12px; font-size:12px; color: var(--muted); line-height:1.6; }
+  details.cp-excluded { margin-top:12px; font-size:12.5px; color: var(--muted); }
+  details.cp-excluded summary { cursor:pointer; color: var(--accent); }
+  .cp-form { display:grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap:10px; margin-top:6px; }
+  .cp-form label { display:block; font-size:11.5px; color: var(--muted); margin-bottom:5px; }
+  .cp-form input, .cp-form select { width:100%; background:#0d0e10; border:1px solid var(--line); color: var(--ink); padding:9px 10px; font-family: var(--font-body); font-size:13px; }
+  .cp-form .full { grid-column: 1 / -1; }
+  .cp-form button.primary { background: var(--accent); color:#1a1204; border:none; font-weight:600; font-size:13px; padding:10px 18px; cursor:pointer; }
+</style>
+</head>
+<body>
+
+  <nav>
+    <div class="nav-links">
+      <a href="index.html">Painel geral</a>
+      <a href="marketplaces.html">Marketplaces</a>
+      <a href="watchlist.html">Lista de vigilância</a>
+      <a href="generator.html">Gerador de Link</a>
+      <a href="coupons.html" class="active">Cupons</a>
+      <a href="dispatcher.html">Disparador</a>
+    </div>
+    <a class="logout-link" id="logoutLink">Sair</a>
+  </nav>
+
+  <div class="masthead">
+    <h1 class="wordmark">Cupons<span>.</span></h1>
+    <p class="tagline">Cole o link de um produto e veja qual cupom funciona nele — ou veja todos os cupons ativos</p>
+  </div>
+
+
+  <!-- Cupons do produto -->
+  <div class="card-block">
+    <div class="card-title"><span class="mp-dot" style="background:#5fcb8f;"></span> Cupom para um produto</div>
+    <p class="card-sub">Cole o link de um produto da <b>Netshoes</b> e eu procuro, entre os cupons ativos da Rakuten, qual deles funciona nesse produto (com o preço final). Para o <b>Mercado Livre</b>, uso os cupons que você cadastrou em "Cupons que posso divulgar". Se o produto não for lido automaticamente, digite o preço.</p>
+    <div class="row">
+      <input type="text" id="cp-url" placeholder="Cole o link do produto (Netshoes ou Mercado Livre)" />
+      <input type="text" id="cp-price" placeholder="Preço (opcional)" style="max-width:170px; min-width:120px;" />
+      <button id="cp-btn">Ver cupons</button>
+    </div>
+    <div class="msg" id="cp-msg"></div>
+    <div id="cp-result"></div>
+  </div>
+
+  <!-- Cupons da Netshoes (Rakuten) -->
+  <div class="card-block">
+    <div class="card-title"><span class="mp-dot" style="background:#f5761a;"></span> Cupons da Netshoes (automático)</div>
+    <p class="card-sub">Busca na Rakuten os cupons e ofertas que a Netshoes está divulgando para afiliados, já com o link rastreado com o seu ID. Em cada cupom, &quot;Ver produtos&quot; lista produtos da Netshoes e calcula o preço final com o desconto. <b>Sempre leia a restrição do cupom</b> antes de passar para o cliente: a Rakuten só informa o desconto em texto livre.</p>
+    <div class="row">
+      <button id="ns-btn">Buscar cupons da Netshoes</button>
+    </div>
+    <div class="msg" id="ns-msg"></div>
+    <div id="ns-result"></div>
+  </div>
+
+  <!-- Meus cupons -->
+  <div class="card-block">
+    <div class="card-title"><span class="mp-dot" style="background:#e7b24a;"></span> Cupons que posso divulgar</div>
+    <p class="card-sub">Cadastre os cupons que você encontra e pode passar adiante (campanhas do Mercado Livre, cupons de divulgação etc.). Nada aqui é sobre vender produto seu: é só a sua lista de cupons de comprador, porque o Mercado Livre não tem nenhuma API que liste ou teste esses cupons. Use "Confirmei hoje" depois de testar um cupom no site.</p>
+    <div class="cp-form" id="cp-form">
+      <div><label>Nome do cupom *</label><input type="text" id="f-title" placeholder="Ex: R$30 acima de R$200" /></div>
+      <div><label>Código (vazio = automático)</label><input type="text" id="f-code" placeholder="Ex: ECONOMIZE30" /></div>
+      <div><label>Tipo</label><select id="f-type"><option value="percent">% de desconto</option><option value="fixed">Valor fixo (R$)</option></select></div>
+      <div><label>Valor do desconto *</label><input type="text" id="f-value" placeholder="Ex: 10 ou 30" /></div>
+      <div><label>Desconto máximo (R$)</label><input type="text" id="f-max" placeholder="Ex: 50" /></div>
+      <div><label>Compra mínima (R$)</label><input type="text" id="f-min" placeholder="Ex: 200" /></div>
+      <div><label>Válido até</label><input type="date" id="f-until" /></div>
+      <details class="full" style="margin:0;"><summary style="cursor:pointer; color:var(--accent); font-size:12px;">Restrições avançadas (opcional)</summary>
+        <div class="cp-form" style="margin-top:10px;">
+          <div><label>Categorias (ids MLB..., vírgula)</label><input type="text" id="f-cats" placeholder="Vazio = todas. Ex: MLB1051" /></div>
+          <div><label>Vendedores (ids, vírgula)</label><input type="text" id="f-sellers" placeholder="Vazio = todos" /></div>
+        </div>
+      </details>
+      <div class="full"><label>Observações</label><input type="text" id="f-notes" placeholder="Ex: só no app, 1ª compra, vale 1x por CPF" /></div>
+      <div class="full"><button class="primary" id="f-save">Salvar cupom</button> <button class="small" id="f-cancel" style="display:none;">Cancelar edição</button></div>
+    </div>
+    <div class="msg" id="f-msg"></div>
+    <div class="cp-list" id="cp-all"></div>
+  </div>
+
+  <script src="coupons-page.js"></script>
+  <script>
+    document.getElementById('logoutLink').addEventListener('click', async () => {
+      await fetch('/api/auth/session', { method: 'DELETE' });
+      window.location.href = '/login.html';
+    });
+  </script>
+</body>
+</html>
