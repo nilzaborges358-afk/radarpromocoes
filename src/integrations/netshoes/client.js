@@ -177,12 +177,19 @@ function sanitizeKeyword(keyword) {
 }
 
 async function searchProducts(auth, mid, rawKeyword, { max = 100, page = 1 } = {}) {
-  const items = await searchProductsPage(auth, mid, rawKeyword, { max, page });
-  // Página além do fim dos resultados (palavra-chave com poucos produtos): volta pra página 1.
-  if (page > 1 && items.length === 0) {
-    return searchProductsPage(auth, mid, rawKeyword, { max, page: 1 });
+  try {
+    const items = await searchProductsPage(auth, mid, rawKeyword, { max, page });
+    // Página sem resultado: volta pra página 1.
+    if (page > 1 && items.length === 0) return searchProductsPage(auth, mid, rawKeyword, { max, page: 1 });
+    return items;
+  } catch (err) {
+    // Palavra-chave com poucos produtos: a Rakuten responde erro 999995 ("pagenumber exceeded
+    // the maximum number of results") em vez de lista vazia. Nesse caso, tenta a página 1.
+    if (page > 1 && (String(err.code) === '999995' || /pagenumber|999995/i.test(err.message))) {
+      return searchProductsPage(auth, mid, rawKeyword, { max, page: 1 });
+    }
+    throw err;
   }
-  return items;
 }
 
 async function searchProductsPage(auth, mid, rawKeyword, { max, page }) {
