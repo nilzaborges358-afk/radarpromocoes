@@ -1,4 +1,5 @@
 const ml = require('../integrations/mercadolivre/client');
+const netshoesClient = require('../integrations/netshoes/client');
 
 // ---------- utilidades ----------
 
@@ -266,6 +267,151 @@ function matchCoupons(coupons, ctx) {
   return { applicable, excluded };
 }
 
+
+// ---------- Netshoes (cupons e produtos via Rakuten) ----------
+
+// Lê "R$ 1.299,90", "199,90" ou "200" como número.
+function brNum(value) {
+  if (value === null || value === undefined) return null;
+  const s = String(value).replace(/\.(?=\d{3}(\D|$))/g, '').replace(',', '.');
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+// A Rakuten não manda o desconto em campos separados: só texto livre ("10% OFF acima de R$ 200").
+// Isto tenta ler o valor do texto — por isso a tela sempre mostra o texto original ao lado.
+function parseDiscountText(...texts) {
+  const t = texts.filter(Boolean).join(' . ');
+  const pct = t.match(/(\d{1,2}(?:,\d+)?)\s*%/);
+  const fixed = t.match(/R\$\s*([\d.]+(?:,\d{1,2})?)\s*(?:de\s+)?(?:desconto|off)\b/i)
+    || t.match(/(?:desconto|off)\b[^.\d%]{0,20}R\$\s*([\d.]+(?:,\d{1,2})?)/i);
+  const min = t.match(/(?:acima de|a partir de|compras? (?:de|acima de)|m[ií]nimo de|m[ií]nima de)\s*R\$\s*([\d.]+(?:,\d{1,2})?)/i);
+  const out = { type: null, value: null, min: min ? brNum(min[1]) : null, approx: /\bat[eé]\b|\bup to\b/i.test(t) };
+  if (pct) { out.type = 'percent'; out.value = brNum(pct[1]); }
+  else if (fixed) { out.type = 'fixed'; out.value = brNum(fixed[1]); }
+  return out;
+}
+
+async function getNetshoesContext(supabase) {
+  const { data: mp } = await supabase.from('marketplaces').select('id').eq('slug', 'netshoes').maybeSingle();
+  if (!mp) return { error: 'Marketplace Netshoes não encontrado no banco.' };
+  const { data: creds } = await supabase
+    .from('marketplace_credentials')
+    .select('client_id, client_secret, extra_credential, extra_credential_2, extra_credential_3')
+    .eq('marketplace_id', mp.id)
+    .maybeSingle();
+  if (!creds?.extra_credential || !creds?.extra_credential_2) return { error: 'Credenciais da Netshoes/Rakuten incompletas. Vá em /marketplaces.html.' };
+  if (!creds.extra_credential_3) return { error: 'Falta o Web Services Token da Rakuten. Cole em /marketplaces.html.' };
+
+  const auth = { accessToken: null, webServicesToken: creds.extra_credential_3, strategy: null, couponStrategy: null };
+  let tokenError = null;
+  if (creds.client_id && creds.client_secret) {
+    try { auth.accessToken = await netshoesClient.getAccessToken(creds.client_id, creds.client_secret, creds.extra_credential); }
+    catch (err) { tokenError = err.message; }
+  }
+  return { publisherId: creds.extra_credential, mid: creds.extra_credential_2, auth, tokenError };
+}
+
+function isExpired(endsAt) {
+  if (!endsAt) return false;
+  const day = String(endsAt).slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(day) && day < todayBR();
+}
+
+async function netshoesFetchCoupons(supabase) {
+  const ctx = await getNetshoesContext(supabase);
+  if (ctx.error) return { status: 400, json: { error: ctx.error } };
+
+  const all = [];
+  let strategy = null;
+  let rawSample = null;
+  let totalMatches = 0;
+  for (let page = 1; page <= 2; page += 1) {
+    let items;
+    try {
+      items = await netshoesClient.fetchCoupons(ctx.auth, ctx.mid, { page, perPage: 100 });
+    } catch (err) {
+      if (page === 1) return { status: 502, json: { error: `Não consegui buscar os cupons na Rakuten: ${err.message}${ctx.tokenError ? ` (login automático: ${ctx.tokenError})` : ''}` } };
+      break; // falha na 2ª página: segue com o que já veio
+    }
+    strategy = items.strategy;
+    totalMatches = items.totalMatches || totalMatches;
+    if (page === 1) rawSample = items.rawSample;
+    all.push(...items);
+    if (!items.totalPages || page >= items.totalPages) break;
+  }
+
+  const seen = new Set();
+  const coupons = [];
+  let expired = 0;
+  for (const c of all) {
+    if (isExpired(c.endsAt)) { expired += 1; continue; }
+    const key = `${c.code || ''}|${c.description || ''}|${c.clickUrl || ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    coupons.push({ ...c, parsed: parseDiscountText(c.description, c.restriction) });
+  }
+  // Com código primeiro; depois os que vencem antes.
+  coupons.sort((a, b) => (b.code ? 1 : 0) - (a.code ? 1 : 0) || String(a.endsAt || '9999').localeCompare(String(b.endsAt || '9999')));
+
+  return {
+    status: 200,
+    json: { ok: true, strategy, total: coupons.length, withCode: coupons.filter((c) => c.code).length, expired, totalMatches, coupons, rawSample: coupons.length ? null : rawSample },
+  };
+}
+
+// Produtos da Netshoes (busca por palavra-chave) com o preço final já aplicando o cupom.
+async function netshoesProducts(supabase, body) {
+  const keyword = String(body.keyword || '').trim();
+  if (!keyword) return { status: 400, json: { error: 'Digite o que buscar (ex: tênis corrida, camisa nike).' } };
+
+  const ctx = await getNetshoesContext(supabase);
+  if (ctx.error) return { status: 400, json: { error: ctx.error } };
+
+  let items;
+  try {
+    items = await netshoesClient.searchProducts(ctx.auth, ctx.mid, keyword, { max: 40, page: 1 });
+  } catch (err) {
+    return { status: 502, json: { error: `Não consegui buscar produtos na Rakuten: ${err.message}` } };
+  }
+
+  const type = body.discount_type === 'fixed' ? 'fixed' : body.discount_type === 'percent' ? 'percent' : null;
+  const value = num(body.discount_value);
+  const min = num(body.min_purchase);
+  const cap = num(body.max_discount);
+
+  const products = [];
+  for (const it of items) {
+    const regular = num(it.price);
+    const price = num(it.salePrice) || regular;
+    const url = it.productUrl || it.linkUrl;
+    if (!it.itemName || !url || !price) continue;
+
+    let discount = null; let finalPrice = null; let applies = null; let note = null;
+    if (type && value) {
+      if (min && price < min) { applies = false; note = `abaixo da compra mínima de R$ ${money(min)}`; }
+      else {
+        applies = true;
+        discount = type === 'percent' ? (price * value) / 100 : value;
+        if (cap && discount > cap) discount = cap;
+        discount = Math.min(discount, price);
+        finalPrice = Math.max(price - discount, 0);
+      }
+    }
+    products.push({
+      title: it.itemName,
+      price,
+      regularPrice: regular && regular > price ? regular : null,
+      imageUrl: it.imageUrl || null,
+      url,
+      affiliateUrl: netshoesClient.buildAffiliateLink(ctx.publisherId, ctx.mid, url),
+      applies, discount, finalPrice, note,
+    });
+  }
+  products.sort((a, b) => (b.applies ? 1 : 0) - (a.applies ? 1 : 0));
+  return { status: 200, json: { ok: true, total: products.length, products: products.slice(0, 30) } };
+}
+
 // ---------- ações da API (chamadas por api/quicklink.js) ----------
 
 function cleanCoupon(body) {
@@ -296,6 +442,9 @@ function cleanCoupon(body) {
 
 async function handleAction(supabase, body) {
   const action = body.action;
+
+  if (action === 'coupons_netshoes_fetch') return netshoesFetchCoupons(supabase);
+  if (action === 'coupons_netshoes_products') return netshoesProducts(supabase, body);
 
   if (action === 'coupons_list') {
     const { data, error } = await supabase.from('coupons').select('*').order('created_at', { ascending: false });
@@ -374,4 +523,4 @@ async function handleAction(supabase, body) {
   return { status: 400, json: { error: 'Ação desconhecida.' } };
 }
 
-module.exports = { handleAction, matchCoupons, detectMarketplace, pickMlId, num };
+module.exports = { handleAction, matchCoupons, detectMarketplace, pickMlId, num, parseDiscountText };
