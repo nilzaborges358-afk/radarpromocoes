@@ -85,10 +85,19 @@
 
   .modal-overlay {
     display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6);
-    align-items:center; justify-content:center; z-index:50;
+    align-items:center; justify-content:center; z-index:50; padding:16px;
   }
   .modal-overlay.show { display:flex; }
-  .modal-box { width:100%; max-width:420px; background: var(--panel); border:1px solid var(--line); padding:24px; }
+  /* A caixa nunca passa da altura da tela: só o miolo rola, e o botão "Buscar" fica sempre visível. */
+  .modal-box {
+    width:100%; max-width:420px; background: var(--panel); border:1px solid var(--line); padding:24px;
+    display:flex; flex-direction:column;
+    max-height:calc(100vh - 32px); max-height:calc(100dvh - 32px);
+  }
+  .modal-scroll { flex:1 1 auto; min-height:0; overflow-y:auto; margin-right:-10px; padding-right:10px; }
+  .modal-footer { flex:0 0 auto; padding-top:14px; }
+  .select-links { display:flex; gap:14px; margin-bottom:6px; }
+  .select-links button { background:none; border:none; padding:0; color: var(--accent); font-size:12px; cursor:pointer; text-decoration:underline; font-family: var(--font-body); }
   .modal-box h3 { font-family: var(--font-display); font-size:16px; margin:0 0 4px; }
   .modal-box .modal-sub { font-size:12px; color: var(--muted); margin:0 0 18px; }
   .modal-section { margin-bottom:16px; }
@@ -98,7 +107,9 @@
   .modal-actions button { flex:1; padding:10px; font-size:13px; font-weight:600; cursor:pointer; border:1px solid var(--line); background:transparent; color: var(--ink); }
   .modal-actions button.confirm { background: var(--accent); color:#1a1204; border:none; }
   .modal-actions button.confirm:disabled { opacity:0.5; cursor:not-allowed; }
-  .modal-note { font-size:11px; color: var(--muted); margin-top:4px; }
+  .modal-note { font-size:12px; color: var(--muted); margin-bottom:10px; line-height:1.45; }
+  .modal-note.error { color: var(--bad); }
+  #scanResult.error { color: var(--bad); }
 </style>
 </head>
 <body>
@@ -179,24 +190,32 @@
       <h3>Buscar promoções</h3>
       <p class="modal-sub">Escolha um marketplace por vez — isso evita sobrecarregar o sistema buscando tudo de uma vez.</p>
 
-      <div class="modal-section">
-        <label class="section-label">Marketplace (escolha um)</label>
-        <label class="radio-row"><input type="radio" name="scanMarketplace" value="mercadolivre" /> Mercado Livre</label>
-        <label class="radio-row"><input type="radio" name="scanMarketplace" value="shopee" /> Shopee</label>
-        <label class="radio-row"><input type="radio" name="scanMarketplace" value="amazon" /> Amazon</label>
-        <label class="radio-row"><input type="radio" name="scanMarketplace" value="netshoes" /> Netshoes</label>
+      <div class="modal-scroll">
+        <div class="modal-section">
+          <label class="section-label">Marketplace (escolha um)</label>
+          <label class="radio-row"><input type="radio" name="scanMarketplace" value="mercadolivre" /> Mercado Livre</label>
+          <label class="radio-row"><input type="radio" name="scanMarketplace" value="shopee" /> Shopee</label>
+          <label class="radio-row"><input type="radio" name="scanMarketplace" value="amazon" /> Amazon</label>
+          <label class="radio-row"><input type="radio" name="scanMarketplace" value="netshoes" /> Netshoes</label>
+        </div>
+
+        <div class="modal-section">
+          <label class="section-label">Grupos a considerar (pode marcar vários)</label>
+          <div class="select-links">
+            <button type="button" id="scanSelectAll">Marcar todos</button>
+            <button type="button" id="scanSelectNone">Desmarcar todos</button>
+          </div>
+          <div id="scanGroupsCheckboxes"></div>
+        </div>
       </div>
 
-      <div class="modal-section">
-        <label class="section-label">Grupos a considerar (pode marcar vários)</label>
-        <div id="scanGroupsCheckboxes"></div>
+      <div class="modal-footer">
+        <div class="modal-note" id="scanModalMsg"></div>
+        <div class="modal-actions">
+          <button id="scanModalCancel">Cancelar</button>
+          <button class="confirm" id="scanModalConfirm" disabled>Buscar</button>
+        </div>
       </div>
-
-      <div class="modal-actions">
-        <button id="scanModalCancel">Cancelar</button>
-        <button class="confirm" id="scanModalConfirm" disabled>Buscar</button>
-      </div>
-      <div class="modal-note" id="scanModalMsg"></div>
     </div>
   </div>
 
