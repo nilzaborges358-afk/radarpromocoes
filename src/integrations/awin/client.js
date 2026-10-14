@@ -140,22 +140,38 @@ function normHeader(h) {
 // ---------- Feed de produtos ----------
 // Acha, na lista de feeds da sua conta, o feed do anunciante (já com a URL de download completa).
 async function resolveFeed(feedKey, { advertiserId, feedId, nameHint } = {}) {
-  const res = await fetch(`${FEED_LIST_URL}/${encodeURIComponent(String(feedKey).trim())}`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+  // Aceita as duas formas: o endereço inteiro do quadro "Feed List Download" (formato novo da Awin,
+  // ex: https://ui.awin.com/productdata-darwin-download/publisher/123/CHAVE/57/feedList)
+  // ou só a chave do formato antigo (productdata.awin.com/datafeed/list/apikey/CHAVE).
+  const keyOrUrl = String(feedKey).trim();
+  const listUrl = /^https?:\/\//i.test(keyOrUrl) ? keyOrUrl : `${FEED_LIST_URL}/${encodeURIComponent(keyOrUrl)}`;
+  const res = await fetch(listUrl, { redirect: 'follow', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   const text = await res.text();
   if (!res.ok || /^\s*</.test(text)) {
-    throw new Error(`A Awin não aceitou a chave do feed (${res.status}): ${text.slice(0, 200)}. A chave do feed é DIFERENTE do token da API: pegue em Awin > Toolbox > Create-a-Feed.`);
+    throw new Error(`A Awin não aceitou o endereço/chave do feed (${res.status}): ${text.slice(0, 200)}. Cole o endereço inteiro do quadro "Feed List Download" em Awin > Toolbox > Create-a-Feed (não é o token da API).`);
   }
-  const rows = [];
-  const parser = createCsvParser((r) => rows.push(r));
-  parser.write(text); parser.end();
-  if (rows.length < 2) throw new Error('A lista de feeds da Awin veio vazia (você já foi aprovado na Riachuelo?).');
+  let rows = [];
+  if (/^\s*[\[{]/.test(text)) {
+    // Algumas versões devolvem JSON em vez de CSV.
+    let json;
+    try { json = JSON.parse(text); } catch { json = null; }
+    const list = Array.isArray(json) ? json : (json && (json.feeds || json.data || json.items)) || [];
+    if (list.length) {
+      const keys = Object.keys(list[0]);
+      rows = [keys, ...list.map((o) => keys.map((k) => (o[k] == null ? '' : String(o[k]))))];
+    }
+  } else {
+    const parser = createCsvParser((r) => rows.push(r));
+    parser.write(text); parser.end();
+  }
+  if (rows.length < 2) throw new Error(`A lista de feeds da Awin veio vazia (você já foi aprovado na Riachuelo?). Resposta: ${text.slice(0, 200)}`);
 
   const header = rows[0].map(normHeader);
   const col = (name) => header.indexOf(name);
   const iAdv = col('advertiserid'); const iName = col('advertisername'); const iFeed = col('feedid');
   const iMember = col('membershipstatus'); const iLang = col('language'); const iUrl = col('url');
   const iImported = col('lastimported'); const iRegion = col('primaryregion');
-  if (iUrl < 0 || iAdv < 0) throw new Error(`Formato inesperado da lista de feeds da Awin (colunas: ${rows[0].join(', ').slice(0, 200)}).`);
+  if (iUrl < 0 || iAdv < 0) throw new Error(`Formato inesperado da lista de feeds da Awin (colunas recebidas: ${rows[0].join(', ').slice(0, 300)}). Me mande essa mensagem que eu ajusto.`);
 
   const hint = String(nameHint || '').toLowerCase();
   let cand = rows.slice(1).filter((r) => {
@@ -163,7 +179,10 @@ async function resolveFeed(feedKey, { advertiserId, feedId, nameHint } = {}) {
     return hint && String(r[iName] || '').toLowerCase().includes(hint);
   });
   if (feedId) cand = cand.filter((r) => String(r[iFeed]).trim() === String(feedId).trim());
-  if (!cand.length) throw new Error(`Não achei feed da Riachuelo na sua conta da Awin${advertiserId ? ` (Advertiser ID ${advertiserId})` : ''}. Confira se você foi aprovado no programa e se o feed aparece em Create-a-Feed.`);
+  if (!cand.length) {
+    const names = [...new Set(rows.slice(1).map((r) => r[iName]).filter(Boolean))].slice(0, 8).join(', ');
+    throw new Error(`Não achei feed da Riachuelo na lista da sua conta da Awin${advertiserId ? ` (Advertiser ID ${advertiserId})` : ''}. Anunciantes com feed na sua conta: ${names || 'nenhum'}. Se a Riachuelo não está aí, ela não oferece feed de produtos para você (ou a afiliação não foi aprovada).`);
+  }
 
   const score = (r) => (/joined|active/i.test(r[iMember] || '') ? 4 : 0) + (/^pt/i.test(r[iLang] || '') ? 2 : 0) + (/BR/i.test(r[iRegion] || '') ? 1 : 0);
   cand.sort((a, b) => score(b) - score(a));
