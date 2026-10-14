@@ -166,7 +166,17 @@ const STRATEGIES = [
  *  - accessToken: o token OAuth que o sistema gera sozinho (vale ~4h).
  *  - webServicesToken: o token fixo da página "APIs" (rodapé) do painel da Rakuten.
  */
-async function searchProducts(auth, mid, keyword, { max = 30 } = {}) {
+// A busca da Rakuten trata alguns símbolos como comandos (ex: o hífen de "USB-C" dava
+// INVALID_CONTEXT_VALUE). Troca por espaço e deixa só letras, números e acentos.
+function sanitizeKeyword(keyword) {
+  return String(keyword || '')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function searchProducts(auth, mid, rawKeyword, { max = 30 } = {}) {
+  const keyword = sanitizeKeyword(rawKeyword) || String(rawKeyword || '').trim();
   const query = `token=${encodeURIComponent(auth.webServicesToken || '')}&mid=${encodeURIComponent(mid)}&keyword=${encodeURIComponent(keyword)}&max=${max}`;
 
   // Já sabemos qual forma funciona: usa só ela.
@@ -202,4 +212,4 @@ function buildAffiliateLink(publisherId, mid, targetUrl) {
   return `https://click.linksynergy.com/deeplink?id=${encodeURIComponent(publisherId)}&mid=${encodeURIComponent(mid)}&murl=${encodeURIComponent(targetUrl)}`;
 }
 
-module.exports = { getAccessToken, searchProducts, buildAffiliateLink, parseProductSearchXml };
+module.exports = { getAccessToken, searchProducts, buildAffiliateLink, parseProductSearchXml, sanitizeKeyword };
