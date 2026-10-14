@@ -105,7 +105,7 @@
   <!-- Cupons do produto -->
   <div class="card-block">
     <div class="card-title"><span class="mp-dot" style="background:#5fcb8f;"></span> Cupons do produto</div>
-    <p class="card-sub">Cole o link que o cliente mandou (Mercado Livre) e veja quais dos <b>seus cupons cadastrados</b> valem para esse produto, com o preço final de cada um.</p>
+    <p class="card-sub">Cole o link que o cliente mandou (Mercado Livre) e veja quais dos <b>cupons que você cadastrou</b> valem para esse produto, com o preço final de cada um. Se o Mercado Livre bloquear a leitura do produto, digite o preço.</p>
     <div class="row">
       <input type="text" id="cp-url" placeholder="Cole o link do produto (ex: https://www.mercadolivre.com.br/...)" />
       <input type="text" id="cp-price" placeholder="Preço (opcional)" style="max-width:170px; min-width:120px;" />
@@ -117,8 +117,8 @@
 
   <!-- Meus cupons -->
   <div class="card-block">
-    <div class="card-title"><span class="mp-dot" style="background:#e7b24a;"></span> Meus cupons</div>
-    <p class="card-sub">Cadastre aqui os cupons que você tem. O Mercado Livre não oferece nenhuma API pública que liste ou teste cupons de comprador, então a lista é sua — use "Confirmei hoje" depois de testar um cupom no site para saber quais estão em dia.</p>
+    <div class="card-title"><span class="mp-dot" style="background:#e7b24a;"></span> Cupons que posso divulgar</div>
+    <p class="card-sub">Cadastre os cupons que você encontra e pode passar adiante (campanhas do Mercado Livre, cupons de divulgação etc.). Nada aqui é sobre vender produto seu: é só a sua lista de cupons de comprador, porque o Mercado Livre não tem nenhuma API que liste ou teste esses cupons. Use "Confirmei hoje" depois de testar um cupom no site.</p>
     <div class="cp-form" id="cp-form">
       <div><label>Nome do cupom *</label><input type="text" id="f-title" placeholder="Ex: R$30 acima de R$200" /></div>
       <div><label>Código (vazio = automático)</label><input type="text" id="f-code" placeholder="Ex: ECONOMIZE30" /></div>
@@ -127,8 +127,12 @@
       <div><label>Desconto máximo (R$)</label><input type="text" id="f-max" placeholder="Ex: 50" /></div>
       <div><label>Compra mínima (R$)</label><input type="text" id="f-min" placeholder="Ex: 200" /></div>
       <div><label>Válido até</label><input type="date" id="f-until" /></div>
-      <div><label>Categorias (ids MLB..., vírgula)</label><input type="text" id="f-cats" placeholder="Vazio = todas. Ex: MLB1051" /></div>
-      <div><label>Vendedores (ids, vírgula)</label><input type="text" id="f-sellers" placeholder="Vazio = todos" /></div>
+      <details class="full" style="margin:0;"><summary style="cursor:pointer; color:var(--accent); font-size:12px;">Restrições avançadas (opcional)</summary>
+        <div class="cp-form" style="margin-top:10px;">
+          <div><label>Categorias (ids MLB..., vírgula)</label><input type="text" id="f-cats" placeholder="Vazio = todas. Ex: MLB1051" /></div>
+          <div><label>Vendedores (ids, vírgula)</label><input type="text" id="f-sellers" placeholder="Vazio = todos" /></div>
+        </div>
+      </details>
       <div class="full"><label>Observações</label><input type="text" id="f-notes" placeholder="Ex: só no app, 1ª compra, vale 1x por CPF" /></div>
       <div class="full"><button class="primary" id="f-save">Salvar cupom</button> <button class="small" id="f-cancel" style="display:none;">Cancelar edição</button></div>
     </div>
