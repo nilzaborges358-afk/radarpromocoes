@@ -57,10 +57,92 @@ function pickMlId(url) {
 }
 
 async function mlGet(path, token) {
+  const problems = [];
   if (token) {
-    try { return await ml.authenticatedGet(path, token); } catch { /* tenta público */ }
+    try { return await ml.authenticatedGet(path, token); } catch (err) { problems.push(`com token: ${err.message.slice(0, 140)}`); }
+  } else {
+    problems.push('sem token da sua conta salvo');
   }
-  return ml.publicGet(path);
+  try { return await ml.publicGet(path); } catch (err) { problems.push(`sem token: ${err.message.slice(0, 140)}`); }
+  throw new Error(problems.join(' | '));
+}
+
+// Token da sua conta do ML, renovado automaticamente quando vencido.
+async function getMlToken(supabase) {
+  const { data: mp } = await supabase.from('marketplaces').select('id').eq('slug', 'mercadolivre').maybeSingle();
+  if (!mp) return null;
+  const { data: creds } = await supabase
+    .from('marketplace_credentials')
+    .select('client_id, client_secret, access_token, refresh_token, token_expires_at')
+    .eq('marketplace_id', mp.id)
+    .maybeSingle();
+  if (!creds || !creds.access_token) return null;
+
+  const expired = creds.token_expires_at && new Date(creds.token_expires_at).getTime() < Date.now() + 60000;
+  if (!expired) return creds.access_token;
+  if (!creds.refresh_token || !creds.client_id || !creds.client_secret) return null;
+  try {
+    const t = await ml.refreshAccessToken({ clientId: creds.client_id, clientSecret: creds.client_secret, refreshToken: creds.refresh_token });
+    await supabase.from('marketplace_credentials').update({
+      access_token: t.access_token,
+      refresh_token: t.refresh_token || creds.refresh_token,
+      token_expires_at: new Date(Date.now() + t.expires_in * 1000).toISOString(),
+    }).eq('marketplace_id', mp.id);
+    return t.access_token;
+  } catch {
+    return null; // precisa reconectar a conta em /api/auth/mercadolivre
+  }
+}
+
+// Plano B: o ML bloqueia a API para itens de outros vendedores (403 PolicyAgent).
+// Lê o que a própria página pública do produto mostra (título, preço, imagem e,
+// quando aparecem no código da página, categoria e vendedor).
+async function fetchMlFromPage(url) {
+  const res = await fetch(url, {
+    redirect: 'follow',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      'Accept-Language': 'pt-BR,pt;q=0.9',
+    },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`a página do produto respondeu ${res.status}`);
+  const html = await res.text();
+
+  let title = null; let price = null; let image = null; let originalPrice = null;
+  for (const m of html.matchAll(/<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi)) {
+    try {
+      const parsed = JSON.parse(m[1]);
+      const nodes = Array.isArray(parsed) ? parsed : [parsed, ...(parsed['@graph'] || [])];
+      const prod = nodes.find((n) => n && String(n['@type']).toLowerCase() === 'product');
+      if (!prod) continue;
+      title = prod.name || title;
+      image = (Array.isArray(prod.image) ? prod.image[0] : prod.image) || image;
+      const offer = Array.isArray(prod.offers) ? prod.offers[0] : prod.offers;
+      if (offer) price = num(offer.price || offer.lowPrice) || price;
+      break;
+    } catch { /* tenta o próximo bloco */ }
+  }
+  if (!title) { const t = html.match(/<meta[^>]+property="og:title"[^>]+content="([^"]+)"/i); if (t) title = t[1]; }
+  if (!image) { const i = html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/i); if (i) image = i[1]; }
+  if (!price) { const pm = html.match(/"price"\s*:\s*"?(\d+(?:\.\d+)?)"?/); if (pm) price = num(pm[1]); }
+  if (!price) throw new Error('não consegui ler o preço na página do produto');
+
+  const cat = html.match(/"category_id"\s*:\s*"(MLB\d+)"/i);
+  const seller = html.match(/"seller_id"\s*:\s*"?(\d{4,})"?/i);
+  return { title: title || 'Produto do Mercado Livre', price, originalPrice, image, categoryId: cat ? cat[1].toUpperCase() : null, sellerId: seller ? seller[1] : null };
+}
+
+async function categoryPathFor(categoryId, token) {
+  let path = categoryId ? [String(categoryId).toUpperCase()] : [];
+  if (categoryId) {
+    try {
+      const cat = await mlGet(`/categories/${categoryId}`, token);
+      const full = (cat.path_from_root || []).map((c) => String(c.id).toUpperCase());
+      if (full.length) path = full;
+    } catch { /* fica só com a categoria do item */ }
+  }
+  return path;
 }
 
 async function fetchMercadoLivreItem(rawUrl, token) {
@@ -71,15 +153,40 @@ async function fetchMercadoLivreItem(rawUrl, token) {
   }
 
   let item;
+  let apiError = null;
   try {
     item = await mlGet(`/items/${id}`, token);
   } catch (err) {
-    if (!catalog) throw new Error(`O Mercado Livre não devolveu esse produto (${err.message.slice(0, 160)}).`);
-    // Link de catálogo: pega o anúncio vencedor do produto
-    const product = await mlGet(`/products/${id}`, token).catch(() => null);
-    const winner = product && product.buy_box_winner && product.buy_box_winner.item_id;
-    if (!winner) throw new Error('Esse é um link de catálogo e não consegui descobrir o anúncio vencedor. Abra o produto, clique em um vendedor e cole esse link.');
-    item = await mlGet(`/items/${winner}`, token);
+    apiError = err.message;
+    if (catalog) {
+      try {
+        const product = await mlGet(`/products/${id}`, token);
+        const winner = product && product.buy_box_winner && product.buy_box_winner.item_id;
+        if (winner) { item = await mlGet(`/items/${winner}`, token); apiError = null; }
+      } catch { /* cai no plano B */ }
+    }
+  }
+
+  if (!item) {
+    // Plano B: ler a página pública do produto
+    try {
+      const page = await fetchMlFromPage(url);
+      return {
+        marketplace: 'mercadolivre',
+        source: 'page',
+        id,
+        title: page.title,
+        price: page.price,
+        originalPrice: null,
+        promotionType: null,
+        thumbnail: page.image ? String(page.image).replace(/^http:/, 'https:') : null,
+        permalink: url,
+        categoryPath: await categoryPathFor(page.categoryId, token),
+        sellerId: page.sellerId,
+      };
+    } catch (pageErr) {
+      throw new Error(`a API do Mercado Livre bloqueou a leitura (${apiError}) e a leitura da página também falhou (${pageErr.message}).`);
+    }
   }
 
   // Preço realmente cobrado agora (já com promoção do próprio ML, se houver)
@@ -93,18 +200,9 @@ async function fetchMercadoLivreItem(rawUrl, token) {
     promotionType = sale.metadata && sale.metadata.promotion_type ? sale.metadata.promotion_type : null;
   } catch { /* segue com o preço do anúncio */ }
 
-  // Caminho de categorias (de geral para específica) — cupom costuma valer para categoria "mãe"
-  let categoryPath = item.category_id ? [String(item.category_id).toUpperCase()] : [];
-  if (item.category_id) {
-    try {
-      const cat = await mlGet(`/categories/${item.category_id}`, token);
-      const path = (cat.path_from_root || []).map((c) => String(c.id).toUpperCase());
-      if (path.length) categoryPath = path;
-    } catch { /* fica só com a categoria do item */ }
-  }
-
   return {
     marketplace: 'mercadolivre',
+    source: 'api',
     id: item.id,
     title: item.title,
     price,
@@ -112,7 +210,7 @@ async function fetchMercadoLivreItem(rawUrl, token) {
     promotionType,
     thumbnail: item.thumbnail ? String(item.thumbnail).replace(/^http:/, 'https:') : null,
     permalink: item.permalink || url,
-    categoryPath,
+    categoryPath: await categoryPathFor(item.category_id, token),
     sellerId: item.seller_id ? String(item.seller_id) : null,
   };
 }
@@ -126,24 +224,24 @@ function matchCoupons(coupons, ctx) {
 
   for (const c of coupons) {
     const reasons = [];
+    const warnings = [];
     if (!c.active) reasons.push('cupom desativado');
     if (c.valid_until && String(c.valid_until).slice(0, 10) < today) reasons.push(`venceu em ${String(c.valid_until).slice(8, 10)}/${String(c.valid_until).slice(5, 7)}`);
 
     const cats = listFrom(c.category_ids);
     if (cats.length) {
-      if (!ctx.categoryPath || !ctx.categoryPath.length) reasons.push('não consegui ler a categoria do produto');
+      if (!ctx.categoryPath || !ctx.categoryPath.length) warnings.push(`confira: vale só para as categorias ${cats.join(', ')} (não consegui ler a categoria do produto)`);
       else if (!cats.some((id) => ctx.categoryPath.includes(id))) reasons.push('vale só para outras categorias');
     }
 
     const sellers = listFrom(c.seller_ids);
     if (sellers.length) {
-      if (!ctx.sellerId) reasons.push('não consegui ler o vendedor do produto');
+      if (!ctx.sellerId) warnings.push(`confira: vale só para o(s) vendedor(es) ${sellers.join(', ')} (não consegui ler o vendedor do produto)`);
       else if (!sellers.includes(String(ctx.sellerId).toUpperCase())) reasons.push('vale só para outros vendedores');
     }
 
     const price = ctx.price;
     const min = num(c.min_purchase);
-    const warnings = [];
     if (min) {
       if (price && price < min) reasons.push(`exige compra mínima de R$ ${money(min)} (produto custa R$ ${money(price)})`);
       else if (!price) warnings.push(`confira: exige compra mínima de R$ ${money(min)}`);
@@ -244,12 +342,7 @@ async function handleAction(supabase, body) {
     let product = null;
     let productError = null;
     if (marketplace === 'mercadolivre') {
-      const { data: mp } = await supabase.from('marketplaces').select('id').eq('slug', 'mercadolivre').maybeSingle();
-      let token = null;
-      if (mp) {
-        const { data: creds } = await supabase.from('marketplace_credentials').select('access_token').eq('marketplace_id', mp.id).maybeSingle();
-        token = creds && creds.access_token;
-      }
+      const token = await getMlToken(supabase);
       try { product = await fetchMercadoLivreItem(url, token); } catch (err) { productError = err.message; }
     }
 
