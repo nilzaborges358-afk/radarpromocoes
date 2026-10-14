@@ -282,3 +282,163 @@ F('cp-url').addEventListener('keydown', (e) => { if (e.key === 'Enter') checkCou
 F('f-save').addEventListener('click', saveCoupon);
 F('f-cancel').addEventListener('click', resetForm);
 loadCoupons();
+
+// =====================================================================
+// Cupons da Netshoes (Rakuten) + produtos com o cupom aplicado
+// =====================================================================
+let nsCoupons = [];
+
+function nsDate(d) {
+  const day = String(d || '').slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(day) ? `${day.slice(8, 10)}/${day.slice(5, 7)}` : null;
+}
+
+function nsParsedLabel(c) {
+  const p = c.parsed || {};
+  if (!p.type || !p.value) return '';
+  const val = p.type === 'percent' ? `${p.value}% OFF` : `R$ ${brl(p.value)} OFF`;
+  return `lido do texto: ${p.approx ? 'até ' : ''}${val}${p.min ? ` · compra mín. R$ ${brl(p.min)}` : ''}`;
+}
+
+function nsCouponMessage(c) {
+  const until = nsDate(c.endsAt);
+  return [
+    '🏷️ CUPOM NETSHOES',
+    c.description || '',
+    c.code ? `✅ Código: ${c.code}` : '',
+    c.restriction ? `⚠️ ${c.restriction}` : '',
+    until ? `⏰ Válido até ${until}` : '',
+    c.clickUrl ? `👉 ${c.clickUrl}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+function nsProductMessage(p, c) {
+  const price = p.finalPrice != null ? p.finalPrice : p.price;
+  return [
+    `🔥 ${p.title}`,
+    p.regularPrice ? `De R$ ${brl(p.regularPrice)} por R$ ${brl(p.price)}` : `R$ ${brl(p.price)}`,
+    p.finalPrice != null && c.code ? `🏷️ Com o cupom ${c.code}: R$ ${brl(price)}` : (c.code ? `🏷️ Cupom: ${c.code}` : ''),
+    `👉 ${p.affiliateUrl}`,
+  ].filter(Boolean).join('\n');
+}
+
+async function nsCopy(btn, text) {
+  await navigator.clipboard.writeText(text);
+  const t = btn.textContent; btn.textContent = 'Copiado!'; setTimeout(() => { btn.textContent = t; }, 1500);
+}
+
+function nsRender(r) {
+  const box = F('ns-result');
+  nsCoupons = r.coupons || [];
+  let html = '';
+  if (!nsCoupons.length) {
+    html += `<div class="cp-note"><b>A Rakuten não devolveu nenhum cupom ativo para a Netshoes.</b> ${r.expired ? `(${r.expired} já vencido(s) foram ignorados.) ` : ''}Pode ser que a Netshoes não tenha cupom para afiliados agora, ou que sua conta ainda não tenha acesso a esse serviço.${r.rawSample ? `<details class="cp-excluded"><summary>resposta recebida da Rakuten</summary><div style="margin-top:6px; word-break:break-all;">${esc(r.rawSample)}</div></details>` : ''}</div>`;
+    box.innerHTML = html;
+    return;
+  }
+  html += `<div class="cp-note" style="margin-top:4px;">${r.total} cupom(ns)/oferta(s) ativo(s), ${r.withCode} com código.${r.expired ? ` ${r.expired} vencido(s) ocultado(s).` : ''}</div>`;
+  html += `<div class="cp-list">` + nsCoupons.map((c, i) => {
+    const until = nsDate(c.endsAt);
+    const parsed = nsParsedLabel(c);
+    return `<div class="cp-item" data-i="${i}" style="flex-direction:column; align-items:stretch;">
+      <div style="display:flex; gap:12px; align-items:center; justify-content:space-between; flex-wrap:wrap;">
+        <div style="flex:1; min-width:220px;">
+          <div class="cp-name">${esc(c.description || '(sem descrição)')} ${c.code ? `<span class="cp-code">${esc(c.code)}</span>` : '<span class="cp-badge">sem código (oferta)</span>'}</div>
+          <div class="cp-meta">${until ? `válido até ${until}` : 'sem data de validade informada'}${parsed ? ` · <span style="color:var(--accent)">${esc(parsed)}</span>` : ''}${c.categories && c.categories.length ? ` · ${esc(c.categories.slice(0, 3).join(', '))}` : ''}</div>
+          ${c.restriction ? `<div class="cp-meta"><b>Restrição:</b> ${esc(c.restriction)}</div>` : ''}
+        </div>
+        <div class="cp-actions">
+          ${c.code ? `<button data-ns-code="${i}">Copiar código</button>` : ''}
+          <button data-ns-msg="${i}">Copiar mensagem</button>
+          <button data-ns-wa="${i}">WhatsApp</button>
+          <button data-ns-products="${i}">Ver produtos</button>
+        </div>
+      </div>
+      <div class="ns-products" id="ns-p-${i}" style="display:none; margin-top:12px;"></div>
+    </div>`;
+  }).join('') + `</div>`;
+  box.innerHTML = html;
+}
+
+function nsOpenProducts(i) {
+  const c = nsCoupons[i];
+  const panel = F(`ns-p-${i}`);
+  if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
+  const guess = (c.categories && c.categories[0]) || '';
+  panel.style.display = '';
+  panel.innerHTML = `<div class="row">
+      <input type="text" id="ns-kw-${i}" value="${esc(guess)}" placeholder="O que buscar? (ex: tênis corrida, camisa nike)" />
+      <button data-ns-search="${i}">Buscar produtos</button>
+    </div>
+    <div class="cp-note" style="margin-top:6px;">Os produtos vêm da busca da Netshoes por palavra-chave. A Rakuten <b>não diz</b> em quais produtos o cupom vale: confira a restrição acima (marcas, categorias, exceções) antes de divulgar.</div>
+    <div class="msg" id="ns-pm-${i}"></div>
+    <div id="ns-pr-${i}"></div>`;
+  F(`ns-kw-${i}`).addEventListener('keydown', (e) => { if (e.key === 'Enter') nsSearchProducts(i); });
+}
+
+async function nsSearchProducts(i) {
+  const c = nsCoupons[i];
+  const kw = F(`ns-kw-${i}`).value.trim();
+  const msg = F(`ns-pm-${i}`);
+  const out = F(`ns-pr-${i}`);
+  if (!kw) { msg.textContent = 'Digite o que buscar.'; msg.className = 'msg error'; return; }
+  msg.textContent = 'Buscando...'; msg.className = 'msg'; out.innerHTML = '';
+  try {
+    const p = c.parsed || {};
+    const r = await couponApi({
+      action: 'coupons_netshoes_products', keyword: kw,
+      discount_type: p.type, discount_value: p.value, min_purchase: p.min,
+    });
+    msg.textContent = r.total ? `${r.total} produto(s).` : 'Nenhum produto encontrado para essa busca.';
+    out.innerHTML = `<div class="cp-list">` + r.products.map((x, k) => `
+      <div class="cp-item">
+        <div style="display:flex; gap:12px; align-items:center; flex:1; min-width:220px;">
+          ${x.imageUrl ? `<img src="${esc(x.imageUrl)}" alt="" style="width:56px; height:56px; object-fit:contain; background:#fff;" />` : ''}
+          <div>
+            <div class="cp-name">${esc(x.title)}</div>
+            <div class="cp-meta">R$ ${brl(x.price)}${x.regularPrice ? ` <s>R$ ${brl(x.regularPrice)}</s>` : ''}${x.note ? ` · <span style="color:var(--accent)">${esc(x.note)}</span>` : ''}${x.applies === null ? ' · não consegui ler o valor do desconto: calcule com a restrição' : ''}</div>
+          </div>
+        </div>
+        <div class="cp-actions">
+          ${x.finalPrice != null ? `<div><div class="cp-final">R$ ${brl(x.finalPrice)}</div><div class="cp-meta">com o cupom</div></div>` : ''}
+          <button data-ns-pmsg="${i}:${k}">Copiar mensagem</button>
+          <button data-ns-pwa="${i}:${k}">WhatsApp</button>
+        </div>
+      </div>`).join('') + `</div>`;
+    out._products = r.products;
+  } catch (err) {
+    msg.textContent = `Erro: ${err.message}`; msg.className = 'msg error';
+  }
+}
+
+async function nsFetch() {
+  const btn = F('ns-btn'); const msg = F('ns-msg');
+  btn.disabled = true; btn.textContent = 'Buscando...';
+  msg.textContent = ''; msg.className = 'msg'; F('ns-result').innerHTML = '';
+  try {
+    nsRender(await couponApi({ action: 'coupons_netshoes_fetch' }));
+  } catch (err) {
+    msg.textContent = `Erro: ${err.message}`; msg.className = 'msg error';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Buscar cupons da Netshoes';
+  }
+}
+
+F('ns-btn').addEventListener('click', nsFetch);
+F('ns-result').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  const d = b.dataset;
+  if (d.nsCode !== undefined) nsCopy(b, nsCoupons[d.nsCode].code);
+  else if (d.nsMsg !== undefined) nsCopy(b, nsCouponMessage(nsCoupons[d.nsMsg]));
+  else if (d.nsWa !== undefined) window.open(`https://wa.me/?text=${encodeURIComponent(nsCouponMessage(nsCoupons[d.nsWa]))}`, '_blank');
+  else if (d.nsProducts !== undefined) nsOpenProducts(d.nsProducts);
+  else if (d.nsSearch !== undefined) nsSearchProducts(d.nsSearch);
+  else if (d.nsPmsg !== undefined || d.nsPwa !== undefined) {
+    const [i, k] = String(d.nsPmsg !== undefined ? d.nsPmsg : d.nsPwa).split(':');
+    const prod = F(`ns-pr-${i}`)._products[Number(k)];
+    const text = nsProductMessage(prod, nsCoupons[i]);
+    if (d.nsPmsg !== undefined) nsCopy(b, text);
+    else window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank');
+  }
+});
