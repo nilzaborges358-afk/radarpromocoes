@@ -302,6 +302,7 @@ async function scanNetshoes(req, res) {
     let skipped = 0;
     let loggedErrors = 0;
     let nextTask = 0;
+    const totals = { withSale: 0, maxDiscount: 0, sample: null };
 
     async function worker() {
       while (nextTask < tasks.length) {
@@ -315,6 +316,9 @@ async function scanNetshoes(req, res) {
           const result = await processNetshoesItems(items, marketplace.id, task.group, publisherId, mid, seenUrls);
           found += result.found;
           withDiscount += result.withDiscount;
+          totals.withSale += result.stats.withSale;
+          totals.maxDiscount = Math.max(totals.maxDiscount, result.stats.maxDiscount);
+          if (!totals.sample) totals.sample = result.stats.sample;
         } catch (err) {
           errors.push(`${task.group.name} / "${task.keyword}": ${err.message}`);
           if (loggedErrors < 5) {
@@ -338,7 +342,7 @@ async function scanNetshoes(req, res) {
     } else if (itemsSeen === 0) {
       parts.push(`A Netshoes não devolveu nenhum produto para ${done} palavra(s)-chave.${emptySamples.length ? ` Exemplo da resposta recebida — ${emptySamples[0]}` : ''}`);
     } else if (found === 0) {
-      parts.push(`A Netshoes devolveu ${itemsSeen} produto(s), ${withDiscount ? `${withDiscount} com desconto, mas todos já estavam salvos` : `mas nenhum com preço promocional ${MIN_DISCOUNT_PCT}% abaixo do normal`}.`);
+      parts.push(`A Netshoes devolveu ${itemsSeen} produto(s), ${withDiscount ? `${withDiscount} com desconto, mas todos já estavam salvos` : `mas nenhum com preço promocional ${MIN_DISCOUNT_PCT}% abaixo do normal`}. Produtos com preço promocional: ${totals.withSale}; maior desconto visto: ${Math.round(totals.maxDiscount)}%.${totals.sample ? ` Exemplo recebido — ${totals.sample}` : ''}`);
     }
     if (skipped) parts.push(`${skipped} palavra(s)-chave ficaram para a próxima busca (limite de tempo). Clique em buscar de novo para continuar.`);
     if (!allFailed && errors.length) parts.push(`${errors.length} palavra(s)-chave falharam: ${errors[0]}`);
@@ -379,8 +383,10 @@ function chunk(list, size) {
 async function processNetshoesItems(items, marketplaceId, group, publisherId, mid, seenUrls) {
   const candidates = [];
   let withDiscount = 0;
+  const stats = { withSale: 0, maxDiscount: 0, sample: null };
 
   for (const item of items) {
+    if (!stats.sample) stats.sample = `${String(item.itemName || '').slice(0, 50)} (price: ${item.price}, saleprice: ${item.salePrice})`;
     const title = item.itemName;
     const productUrl = item.productUrl || item.linkUrl;
     const salePrice = parsePrice(item.salePrice);
@@ -392,6 +398,10 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
     const discountRate = regularPrice && regularPrice > price
       ? Number((((regularPrice - price) / regularPrice) * 100).toFixed(2))
       : null;
+    if (discountRate) {
+      stats.withSale += 1;
+      stats.maxDiscount = Math.max(stats.maxDiscount, discountRate);
+    }
     if (!discountRate || discountRate < MIN_DISCOUNT_PCT) continue;
 
     withDiscount += 1;
@@ -400,7 +410,7 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
     candidates.push({ title, productUrl, price, regularPrice, discountRate, imageUrl: item.imageUrl || item.image || null });
   }
 
-  if (!candidates.length) return { found: 0, withDiscount };
+  if (!candidates.length) return { found: 0, withDiscount, stats };
 
   // Quais desses links já estão salvos? (em blocos de 10 para não estourar o tamanho da consulta)
   const existingByUrl = new Map();
@@ -457,7 +467,7 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
       .eq('id', existing.id)));
   }
 
-  return { found: toInsert.length, withDiscount };
+  return { found: toInsert.length, withDiscount, stats };
 }
 
 // ---------------- Shopee ----------------
