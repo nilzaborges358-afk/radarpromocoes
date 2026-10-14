@@ -490,6 +490,20 @@ function matchNetshoesCoupon(c, product) {
   return { coupon: c, status, reasons, warnings, notes, discount, finalPrice };
 }
 
+
+// Melhor cupom (COM código, desconto lido do texto e sem conflito de restrição) para um produto.
+// Usado pela busca (para montar ofertas por cupom) e pelo disparador (cupom validado na hora do envio).
+function bestNetshoesCoupon(coupons, product) {
+  let best = null;
+  for (const c of coupons || []) {
+    if (!c.code) continue;
+    const r = matchNetshoesCoupon(c, product);
+    if (r.status !== 'ok' || r.finalPrice == null || !(r.discount > 0)) continue;
+    if (!best || r.discount > best.discount) best = r;
+  }
+  return best;
+}
+
 async function netshoesCheck(supabase, url, manualPrice) {
   const ctx = await getNetshoesContext(supabase);
   if (ctx.error) return { status: 400, json: { error: ctx.error } };
@@ -695,4 +709,4 @@ async function handleAction(supabase, body) {
   return { status: 400, json: { error: 'Ação desconhecida.' } };
 }
 
-module.exports = { handleAction, matchCoupons, detectMarketplace, pickMlId, num, parseDiscountText };
+module.exports = { handleAction, matchCoupons, detectMarketplace, pickMlId, num, parseDiscountText, getNetshoesContext, loadNetshoesCoupons, matchNetshoesCoupon, bestNetshoesCoupon };
