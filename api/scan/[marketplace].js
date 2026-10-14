@@ -10,7 +10,13 @@ const MIN_DISCOUNT_PCT = 10; // era 15 — baixei pra achar mais resultado em ca
 // campeões de venda volta todos os dias.
 const SHOPEE_SORT_ROTATION = [1, 2, 5];
 
-// GET /api/scan/mercadolivre?groups=id1,id2,none
+// Tempo máximo gasto buscando (a função da Vercel é configurada para 60s no vercel.json).
+// Passou disso, a busca para de abrir novas consultas e avisa quantas ficaram pra próxima.
+const SCAN_BUDGET_MS = 48000;
+const NETSHOES_CONCURRENCY = 3;
+
+// GET  /api/scan/mercadolivre?groups=id1,id2,none
+// POST /api/scan/mercadolivre   { groups: ['id1','id2','none'] }   (usado pelo painel — não tem limite de tamanho de URL)
 // GET /api/scan/shopee?groups=id1,id2
 // Antes eram 2 functions separadas — juntei num arquivo dinâmico só.
 module.exports = async function handler(req, res) {
@@ -21,6 +27,49 @@ module.exports = async function handler(req, res) {
   if (slug === 'netshoes') return scanNetshoes(req, res);
   res.status(404).json({ error: `Marketplace "${slug}" não suportado.` });
 };
+
+// ---------------- Utilitários de grupos ----------------
+
+function cleanText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function normKey(value) {
+  return cleanText(value).toLowerCase();
+}
+
+function splitKeywords(value) {
+  return String(value || '').split(',').map(cleanText).filter(Boolean);
+}
+
+// Lista de ids de grupos escolhidos no painel (null = sem filtro, vale tudo).
+function getGroupsParam(req) {
+  if (req.method === 'POST') {
+    const list = req.body && req.body.groups;
+    if (Array.isArray(list)) return list.map(String).filter(Boolean);
+    if (typeof list === 'string' && list) return list.split(',').filter(Boolean);
+    return null;
+  }
+  return req.query.groups ? String(req.query.groups).split(',').filter(Boolean) : null;
+}
+
+// Tudo que tem o MESMO nome vira UM grupo só, com todas as palavras-chave somadas
+// (sem repetir). Assim 30 linhas "Beleza" viram 1 grupo "Beleza" — e a mesma palavra
+// nunca é buscada duas vezes.
+function mergeGroupsByName(rows) {
+  const sorted = [...(rows || [])].sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
+  const map = new Map();
+  for (const g of sorted) {
+    const key = normKey(g.name);
+    if (!map.has(key)) map.set(key, { id: g.id, ids: [], name: cleanText(g.name), keywords: [] });
+    const merged = map.get(key);
+    merged.ids.push(g.id);
+    for (const kw of splitKeywords(g.search_keyword || g.name)) {
+      if (!merged.keywords.some((k) => normKey(k) === normKey(kw))) merged.keywords.push(kw);
+    }
+  }
+  return [...map.values()].map((m) => ({ ...m, search_keyword: m.keywords.join(', ') }));
+}
 
 // ---------------- Mercado Livre ----------------
 
@@ -37,7 +86,7 @@ async function scanMercadoLivre(req, res) {
       .select('*')
       .eq('marketplace_id', marketplace.id);
 
-    const groupsParam = req.query.groups ? String(req.query.groups).split(',') : null;
+    const groupsParam = getGroupsParam(req);
     const products = groupsParam
       ? (allProducts || []).filter((p) => groupsParam.includes(p.watch_group_id || 'none'))
       : allProducts;
@@ -188,7 +237,7 @@ async function scanNetshoes(req, res) {
     const publisherId = creds.extra_credential;
     const mid = creds.extra_credential_2;
 
-    // A busca de produtos da Rakuten exige DOIS tokens:
+    // A busca de produtos da Rakuten usa até DOIS tokens:
     //  1) o token do Web Services (painel Rakuten: link "APIs" no rodapé da página), fixo;
     //  2) um token OAuth, gerado a cada busca (vale ~4h) com Client ID/Secret.
     const webServicesToken = creds.extra_credential_3;
@@ -202,50 +251,106 @@ async function scanNetshoes(req, res) {
       res.status(400).json({ error: 'Faltam o Client ID e o Client Secret da Rakuten em /marketplaces.html.' });
       return;
     }
-    const accessToken = await netshoesClient.getAccessToken(creds.client_id, creds.client_secret, publisherId);
+
+    // Se o login automático falhar, ainda dá pra tentar as outras formas (só com o Web Services Token).
+    // O motivo da falha entra no relatório final em vez de derrubar a busca inteira.
+    const auth = { accessToken: null, webServicesToken, strategy: null };
+    let tokenError = null;
+    try {
+      auth.accessToken = await netshoesClient.getAccessToken(creds.client_id, creds.client_secret, publisherId);
+    } catch (err) {
+      tokenError = err.message;
+    }
 
     const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
-    const groupsParam = req.query.groups ? String(req.query.groups).split(',') : null;
-    const groups = groupsParam ? (allGroups || []).filter((g) => groupsParam.includes(g.id)) : allGroups;
+    const groupsParam = getGroupsParam(req);
+    const selectedRows = groupsParam ? (allGroups || []).filter((g) => groupsParam.includes(g.id)) : allGroups;
+    const groups = mergeGroupsByName(selectedRows);
 
-    let found = 0;
-    let itemsSeen = 0;
-    const errors = [];
+    if (groups.length === 0) {
+      res.status(200).json({
+        ok: true,
+        groupsSearched: 0,
+        productsChecked: 0,
+        promotionsFound: 0,
+        errors: [],
+        note: 'Nenhum grupo selecionado — a Netshoes busca por palavra-chave, então marque pelo menos um grupo (não vale só "Sem grupo").',
+      });
+      return;
+    }
 
-    for (const group of groups || []) {
-      try {
-        const keyword = group.search_keyword || group.name;
-        const items = await netshoesClient.searchProducts(accessToken, webServicesToken, mid, keyword);
-        itemsSeen += items.length;
-        for (const item of items) {
-          found += await processNetshoesItem(item, marketplace.id, group, publisherId, mid);
-        }
-      } catch (err) {
-        errors.push(`${group.name}: ${err.message}`);
-        await supabaseAdmin.from('integration_logs').insert({
-          marketplace_id: marketplace.id,
-          level: 'error',
-          message: `Falha ao buscar produtos Netshoes para "${group.name}" [web services token ${String(webServicesToken).length} caracteres]: ${err.message}`,
-        });
+    // Uma tarefa por palavra-chave (cada palavra só é buscada uma vez, mesmo que apareça em dois grupos).
+    const tasks = [];
+    const seenKeywords = new Set();
+    for (const group of groups) {
+      for (const keyword of group.keywords) {
+        const key = normKey(keyword);
+        if (seenKeywords.has(key)) continue;
+        seenKeywords.add(key);
+        tasks.push({ group, keyword });
       }
     }
 
-    const allFailed = (groups || []).length > 0 && errors.length === (groups || []).length;
-    const note = allFailed
-      ? 'Todas as buscas da Netshoes falharam — veja a mensagem em integration_logs.'
-      : itemsSeen === 0
-      ? 'A Netshoes não devolveu nenhum produto para essas palavras-chave (ou a leitura da resposta não bateu — veja integration_logs).'
-      : found === 0
-        ? `A Netshoes devolveu ${itemsSeen} produto(s), mas nenhum com preço promocional ${MIN_DISCOUNT_PCT}% abaixo do normal.`
-        : undefined;
+    const startedAt = Date.now();
+    const seenUrls = new Set();
+    const errors = [];
+    const emptySamples = [];
+    let found = 0;
+    let itemsSeen = 0;
+    let withDiscount = 0;
+    let done = 0;
+    let skipped = 0;
+    let loggedErrors = 0;
+    let nextTask = 0;
+
+    async function worker() {
+      while (nextTask < tasks.length) {
+        const task = tasks[nextTask++];
+        if (Date.now() - startedAt > SCAN_BUDGET_MS) { skipped += 1; continue; }
+        try {
+          const items = await netshoesClient.searchProducts(auth, mid, task.keyword);
+          done += 1;
+          itemsSeen += items.length;
+          if (!items.length && items.rawSample && emptySamples.length < 1) emptySamples.push(`"${task.keyword}": ${items.rawSample}`);
+          const result = await processNetshoesItems(items, marketplace.id, task.group, publisherId, mid, seenUrls);
+          found += result.found;
+          withDiscount += result.withDiscount;
+        } catch (err) {
+          errors.push(`${task.group.name} / "${task.keyword}": ${err.message}`);
+          if (loggedErrors < 5) {
+            loggedErrors += 1;
+            await supabaseAdmin.from('integration_logs').insert({
+              marketplace_id: marketplace.id,
+              level: 'error',
+              message: `Falha ao buscar produtos Netshoes para "${task.keyword}" (grupo ${task.group.name}) [web services token ${String(webServicesToken).length} caracteres]${tokenError ? ` [login automático falhou: ${tokenError}]` : ''}: ${err.message}`,
+            });
+          }
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(NETSHOES_CONCURRENCY, tasks.length) }, worker));
+
+    const attempted = done + errors.length;
+    const allFailed = attempted > 0 && errors.length === attempted;
+    const parts = [];
+    if (allFailed) {
+      parts.push(`Todas as buscas da Netshoes falharam. ${errors[0]}${tokenError ? ` (login automático: ${tokenError})` : ''}`);
+    } else if (itemsSeen === 0) {
+      parts.push(`A Netshoes não devolveu nenhum produto para ${done} palavra(s)-chave.${emptySamples.length ? ` Exemplo da resposta recebida — ${emptySamples[0]}` : ''}`);
+    } else if (found === 0) {
+      parts.push(`A Netshoes devolveu ${itemsSeen} produto(s), ${withDiscount ? `${withDiscount} com desconto, mas todos já estavam salvos` : `mas nenhum com preço promocional ${MIN_DISCOUNT_PCT}% abaixo do normal`}.`);
+    }
+    if (skipped) parts.push(`${skipped} palavra(s)-chave ficaram para a próxima busca (limite de tempo). Clique em buscar de novo para continuar.`);
+    if (!allFailed && errors.length) parts.push(`${errors.length} palavra(s)-chave falharam: ${errors[0]}`);
 
     res.status(200).json({
       ok: true,
-      groupsSearched: (groups || []).length,
+      groupsSearched: groups.length,
+      keywordsSearched: done,
       productsChecked: itemsSeen,
       promotionsFound: found,
       errors,
-      note,
+      note: parts.length ? parts.join(' ') : undefined,
     });
   } catch (err) {
     res.status(500).json({ error: `Erro no servidor: ${err.message}` });
@@ -262,62 +367,97 @@ function parsePrice(value) {
   return Number.isFinite(n) ? n : null;
 }
 
-// Os campos vêm da leitura do XML da Rakuten (ver parseProductSearchXml no
-// client.js). Os nomes das tags ainda não foram confirmados contra uma resposta
-// real da sua conta.
-async function processNetshoesItem(item, marketplaceId, group, publisherId, mid) {
-  const title = item.itemName;
-  const productUrl = item.productUrl || item.linkUrl;
-  const salePrice = parsePrice(item.salePrice);
-  const regularPrice = parsePrice(item.price);
-  const price = salePrice || regularPrice;
+function chunk(list, size) {
+  const out = [];
+  for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
+  return out;
+}
 
-  if (!title || !productUrl || !price) return 0; // resposta em formato inesperado — pula sem quebrar o resto
+// Os campos vêm da leitura do XML da Rakuten (ver parseProductSearchXml no client.js).
+// Grava em LOTE (poucas idas ao banco por palavra-chave, em vez de 2-3 por produto) —
+// era isso que deixava a busca lenta a ponto de estourar o tempo da Vercel.
+async function processNetshoesItems(items, marketplaceId, group, publisherId, mid, seenUrls) {
+  const candidates = [];
+  let withDiscount = 0;
 
-  const discountRate = regularPrice && regularPrice > price
-    ? Number((((regularPrice - price) / regularPrice) * 100).toFixed(2))
-    : null;
+  for (const item of items) {
+    const title = item.itemName;
+    const productUrl = item.productUrl || item.linkUrl;
+    const salePrice = parsePrice(item.salePrice);
+    const regularPrice = parsePrice(item.price);
+    const price = salePrice || regularPrice;
 
-  if (!discountRate || discountRate < MIN_DISCOUNT_PCT) return 0;
+    if (!title || !productUrl || !price) continue; // resposta em formato inesperado — pula sem quebrar o resto
 
-  const { data: existing } = await supabaseAdmin
-    .from('promotions')
-    .select('id, watch_group_id')
-    .eq('marketplace_id', marketplaceId)
-    .eq('original_url', productUrl)
-    .maybeSingle();
+    const discountRate = regularPrice && regularPrice > price
+      ? Number((((regularPrice - price) / regularPrice) * 100).toFixed(2))
+      : null;
+    if (!discountRate || discountRate < MIN_DISCOUNT_PCT) continue;
 
-  const affiliateUrl = netshoesClient.buildAffiliateLink(publisherId, mid, productUrl);
-
-  if (existing) {
-    await supabaseAdmin
-      .from('promotions')
-      .update({
-        current_price: price,
-        discount_rate: discountRate,
-        watch_group_id: existing.watch_group_id || group.id,
-        last_seen_at: new Date().toISOString(),
-      })
-      .eq('id', existing.id);
-    return 0;
+    withDiscount += 1;
+    if (seenUrls.has(productUrl)) continue; // mesmo produto já tratado em outra palavra-chave
+    seenUrls.add(productUrl);
+    candidates.push({ title, productUrl, price, regularPrice, discountRate, imageUrl: item.imageUrl || item.image || null });
   }
 
-  await supabaseAdmin.from('promotions').insert({
-    marketplace_id: marketplaceId,
-    watch_group_id: group.id,
-    title,
-    image_url: item.imageUrl || item.image || null,
-    original_url: productUrl,
-    current_price: price,
-    previous_price: regularPrice,
-    discount_rate: discountRate,
-    source: 'netshoes_rakuten_api',
-    status: 'PENDING',
-    affiliate_url: affiliateUrl,
-    affiliate_url_added_at: new Date().toISOString(),
-  });
+  if (!candidates.length) return { found: 0, withDiscount };
 
-  return 1;
+  // Quais desses links já estão salvos? (em blocos de 10 para não estourar o tamanho da consulta)
+  const existingByUrl = new Map();
+  for (const part of chunk(candidates.map((c) => c.productUrl), 10)) {
+    const { data, error } = await supabaseAdmin
+      .from('promotions')
+      .select('id, original_url, watch_group_id, current_price')
+      .eq('marketplace_id', marketplaceId)
+      .in('original_url', part);
+    if (error) throw new Error(`banco de dados: ${error.message}`);
+    (data || []).forEach((row) => existingByUrl.set(row.original_url, row));
+  }
+
+  const now = new Date().toISOString();
+  const toInsert = [];
+  const updates = [];
+
+  for (const c of candidates) {
+    const existing = existingByUrl.get(c.productUrl);
+    if (existing) {
+      updates.push({ existing, c });
+    } else {
+      toInsert.push({
+        marketplace_id: marketplaceId,
+        watch_group_id: group.id,
+        title: c.title,
+        image_url: c.imageUrl,
+        original_url: c.productUrl,
+        current_price: c.price,
+        previous_price: c.regularPrice,
+        discount_rate: c.discountRate,
+        source: 'netshoes_rakuten_api',
+        status: 'PENDING',
+        affiliate_url: netshoesClient.buildAffiliateLink(publisherId, mid, c.productUrl),
+        affiliate_url_added_at: now,
+      });
+    }
+  }
+
+  if (toInsert.length) {
+    const { error } = await supabaseAdmin.from('promotions').insert(toInsert);
+    if (error) throw new Error(`banco de dados: ${error.message}`);
+  }
+
+  for (const part of chunk(updates, 10)) {
+    await Promise.all(part.map(({ existing, c }) => supabaseAdmin
+      .from('promotions')
+      .update({
+        current_price: c.price,
+        discount_rate: c.discountRate,
+        watch_group_id: existing.watch_group_id || group.id,
+        last_seen_at: now,
+      })
+      .eq('id', existing.id)));
+  }
+
+  return { found: toInsert.length, withDiscount };
 }
 
 // ---------------- Shopee ----------------
@@ -342,8 +482,9 @@ async function scanShopee(req, res) {
     }
 
     const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
-    const groupsParam = req.query.groups ? String(req.query.groups).split(',') : null;
-    const groups = groupsParam ? (allGroups || []).filter((g) => groupsParam.includes(g.id)) : allGroups;
+    const groupsParam = getGroupsParam(req);
+    const selectedRows = groupsParam ? (allGroups || []).filter((g) => groupsParam.includes(g.id)) : allGroups;
+    const groups = mergeGroupsByName(selectedRows);
 
     let found = 0;
     const errors = [];
@@ -394,7 +535,7 @@ function titleMatchesKeyword(title, keyword) {
   const stopWords = new Set(['de', 'da', 'do', 'das', 'dos', 'e', 'com', 'para', 'em', 'a', 'o']);
   const words = keyword
     .toLowerCase()
-    .split(/\s+/)
+    .split(/[\s,]+/)
     .filter((w) => w.length > 2 && !stopWords.has(w));
   if (words.length === 0) return true; // palavra-chave só com termos curtos — não filtra
   const titleLower = title.toLowerCase();
