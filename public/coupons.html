@@ -106,9 +106,9 @@
   <!-- Cupons do produto -->
   <div class="card-block">
     <div class="card-title"><span class="mp-dot" style="background:#5fcb8f;"></span> Cupom para um produto</div>
-    <p class="card-sub">Cole o link de um produto da <b>Netshoes</b> e eu procuro, entre os cupons ativos da Rakuten, qual deles funciona nesse produto (com o preço final). Para o <b>Mercado Livre</b>, uso os cupons que você cadastrou em "Cupons que posso divulgar". Se o produto não for lido automaticamente, digite o preço.</p>
+    <p class="card-sub">Cole o link de um produto da <b>Netshoes</b> (cupons da Rakuten) ou da <b>Riachuelo</b> (cupons da Awin) e eu procuro qual cupom ativo funciona nesse produto (com o preço final). Para o <b>Mercado Livre</b>, uso os cupons que você cadastrou em "Cupons que posso divulgar". Se o produto não for lido automaticamente, digite o preço.</p>
     <div class="row">
-      <input type="text" id="cp-url" placeholder="Cole o link do produto (Netshoes ou Mercado Livre)" />
+      <input type="text" id="cp-url" placeholder="Cole o link do produto (Netshoes, Riachuelo ou Mercado Livre)" />
       <input type="text" id="cp-price" placeholder="Preço (opcional)" style="max-width:170px; min-width:120px;" />
       <button id="cp-btn">Ver cupons</button>
     </div>
@@ -125,6 +125,17 @@
     </div>
     <div class="msg" id="ns-msg"></div>
     <div id="ns-result"></div>
+  </div>
+
+  <!-- Cupons da Riachuelo (Awin) -->
+  <div class="card-block">
+    <div class="card-title"><span class="mp-dot" style="background:#e2231a;"></span> Cupons da Riachuelo (automático)</div>
+    <p class="card-sub">Busca na Awin os cupons e ofertas ativos da Riachuelo para afiliados, já com o link rastreado com o seu ID. <b>Sempre leia a restrição do cupom</b> antes de passar para o cliente: a Awin só informa o desconto em texto livre.</p>
+    <div class="row">
+      <button id="aw-btn">Buscar cupons da Riachuelo</button>
+    </div>
+    <div class="msg" id="aw-msg"></div>
+    <div id="aw-result"></div>
   </div>
 
   <!-- Meus cupons -->
