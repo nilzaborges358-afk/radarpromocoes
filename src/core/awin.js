@@ -37,11 +37,17 @@ async function getAwinContext(supabase, { needFeed = false } = {}) {
   if (!advertiserId) {
     try {
       const found = await awinClient.findAdvertiserId(creds.client_id, creds.client_secret, 'riachuelo');
-      if (found) {
+      if (found && found.id) {
         advertiserId = found.id;
         await supabase.from('marketplace_credentials').update({ extra_credential: advertiserId }).eq('marketplace_id', mp.id);
       } else {
-        return { error: 'Não achei a Riachuelo entre os programas em que você foi aprovado na Awin. Confira se a afiliação foi aprovada ou preencha o Advertiser ID em /marketplaces.html.' };
+        const joined = found && found.joinedCount
+          ? `A Awin lista ${found.joinedCount} programa(s) aprovado(s) na conta ${creds.client_id}: ${found.joinedNames.join(', ')}.`
+          : `A Awin não lista nenhum programa aprovado para o Publisher ID ${creds.client_id} (confira se o Publisher ID e o token são da mesma conta).`;
+        const elsewhere = found && found.elsewhere
+          ? ` A Riachuelo (ID ${found.elsewhere.id}) existe na sua conta, mas não como aprovada${found.elsewhere.status ? ` (situação: ${found.elsewhere.status})` : ''} — se já foi aprovada, copie esse ID para o campo Advertiser ID em /marketplaces.html.`
+          : ' Se a afiliação já foi aprovada, preencha o Advertiser ID em /marketplaces.html (veja no Link Builder da Awin: o número depois de awinmid= no link gerado).';
+        return { error: `Não achei a Riachuelo entre os programas aprovados. ${joined}${elsewhere}` };
       }
     } catch (err) {
       return { error: `Não consegui descobrir o Advertiser ID da Riachuelo (${err.message}). Preencha o Advertiser ID em /marketplaces.html.` };
