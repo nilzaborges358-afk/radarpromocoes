@@ -104,14 +104,23 @@ function renderDestinations(loadError) {
 
 }
 
+// Nomes iguais viram UM grupo só. O valor da caixinha guarda todos os ids do grupo (separados por vírgula).
+function mergedGroups() {
+  const map = new Map();
+  groups.forEach((g) => {
+    const key = String(g.name || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!map.has(key)) map.set(key, { name: String(g.name || '').replace(/\s+/g, ' ').trim(), ids: [] });
+    map.get(key).ids.push(g.id);
+    const cleaned = String(g.name || '').replace(/\s+/g, ' ').trim();
+    if (!/[A-ZÀ-Þ]/.test(map.get(key).name) && /[A-ZÀ-Þ]/.test(cleaned)) map.get(key).name = cleaned;
+  });
+  return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+}
+
 function renderGroups() {
-  const label = (g) => {
-    const kw = (g.search_keyword || '').trim();
-    return kw && kw.toLowerCase() !== (g.name || '').trim().toLowerCase() ? `${g.name} — ${kw}` : g.name;
-  };
-  const options = [...groups.map((g) => ({ id: g.id, name: label(g) })), { id: 'none', name: 'Sem grupo' }];
+  const options = [...mergedGroups().map((g) => ({ id: g.ids.join(','), name: g.name })), { id: 'none', name: 'Sem grupo' }];
   $('groupBox').innerHTML = options.map((g) => `
-    <label class="check"><input type="checkbox" class="grp" value="${g.id}" checked /> ${escapeHtml(g.name)}</label>`).join('');
+    <label class="check"><input type="checkbox" class="grp" value="${escapeHtml(g.id)}" checked /> ${escapeHtml(g.name)}</label>`).join('');
 }
 
 // ---------- configurações lembradas no navegador (nada sensível) ----------
@@ -150,7 +159,7 @@ function updateModeUI() {
 }
 
 function filters() {
-  const group_ids = [...document.querySelectorAll('.grp:checked')].map((c) => c.value);
+  const group_ids = [...document.querySelectorAll('.grp:checked')].flatMap((c) => c.value.split(',')).filter(Boolean);
   return { group_ids, marketplace: $('mpSelect').value || null, footer: $('footer').value.trim() };
 }
 
