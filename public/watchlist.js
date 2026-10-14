@@ -1,4 +1,5 @@
-let groups = [];
+let groups = [];        // linhas cruas do banco (podem ter nomes repetidos)
+let mergedGroups = []; // grupos já unificados por nome — é isso que aparece na tela
 let products = [];
 let marketplaces = [];
 
@@ -8,6 +9,7 @@ async function load() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Falha ao carregar');
     groups = data.groups;
+    mergedGroups = mergeGroupsByName(groups);
     products = data.products;
     marketplaces = data.marketplaces || [];
     renderGroupSelect();
@@ -19,38 +21,65 @@ async function load() {
   }
 }
 
-// Pode haver vários grupos com o mesmo nome (palavras-chave diferentes),
-// então o rótulo mostra os dois: "Corrida — tênis de corrida".
-function groupLabel(g) {
-  const kw = (g.search_keyword || '').trim();
-  return kw && kw.toLowerCase() !== (g.name || '').trim().toLowerCase() ? `${g.name} — ${kw}` : g.name;
+function cleanText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function normKey(value) {
+  return cleanText(value).toLowerCase();
+}
+
+// Tudo que tem o MESMO nome vira UM grupo só, com todas as palavras-chave somadas (sem repetir).
+// Devolve [{ key, name, ids: [ids do banco], keywords: [...] }].
+function mergeGroupsByName(rows) {
+  const map = new Map();
+  (rows || []).forEach((g) => {
+    const key = normKey(g.name);
+    if (!map.has(key)) map.set(key, { key, name: cleanText(g.name), ids: [], keywords: [] });
+    const merged = map.get(key);
+    merged.ids.push(g.id);
+    // Se as linhas diferem só em maiúscula/minúscula, mostra a variante com inicial maiúscula.
+    if (!/[A-ZÀ-Þ]/.test(merged.name) && /[A-ZÀ-Þ]/.test(cleanText(g.name))) merged.name = cleanText(g.name);
+    String(g.search_keyword || g.name || '').split(',').map(cleanText).filter(Boolean).forEach((kw) => {
+      if (!merged.keywords.some((k) => normKey(k) === normKey(kw))) merged.keywords.push(kw);
+    });
+  });
+  return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
 }
 
 function renderGroupSelect() {
   const select = document.getElementById('groupSelect');
   select.innerHTML =
     `<option value="">Sem grupo</option>` +
-    groups.map((g) => `<option value="${g.id}">${escapeHtml(groupLabel(g))}</option>`).join('');
+    mergedGroups.map((g) => `<option value="${g.ids[0]}">${escapeHtml(g.name)}</option>`).join('');
 }
 
 function renderGroupsList() {
   const container = document.getElementById('groupsList');
-  if (groups.length === 0) {
+  if (mergedGroups.length === 0) {
     container.innerHTML = `<p style="color:var(--muted); font-size:12px;">Nenhum grupo criado ainda.</p>`;
     return;
   }
-  container.innerHTML = groups.map((g) => `
+  container.innerHTML = mergedGroups.map((g) => `
     <div class="group-row">
-      <div>
-        <div class="g-name">${escapeHtml(g.name)}</div>
-        <div class="g-keyword">busca por: "${escapeHtml(g.search_keyword || g.name)}"</div>
+      <div class="g-info">
+        <div class="g-name">${escapeHtml(g.name)} <span class="g-count">${g.keywords.length} palavra${g.keywords.length === 1 ? '' : 's'}-chave</span></div>
+        <div class="g-keywords">
+          ${g.keywords.map((kw, i) => `
+            <span class="kw-chip">${escapeHtml(kw)}${g.keywords.length > 1
+              ? `<button class="kw-remove" title="Tirar essa palavra-chave" data-remove-kw="${escapeHtml(g.key)}" data-kw-index="${i}">×</button>`
+              : ''}</span>`).join('')}
+        </div>
       </div>
-      <button class="remove" data-remove-group="${g.id}">Remover</button>
+      <button class="remove" data-remove-group="${escapeHtml(g.key)}">Remover grupo</button>
     </div>
   `).join('');
 
   container.querySelectorAll('[data-remove-group]').forEach((btn) => {
     btn.addEventListener('click', () => removeGroup(btn.dataset.removeGroup));
+  });
+  container.querySelectorAll('[data-remove-kw]').forEach((btn) => {
+    btn.addEventListener('click', () => removeKeyword(btn.dataset.removeKw, Number(btn.dataset.kwIndex)));
   });
 }
 
@@ -70,8 +99,10 @@ function renderList() {
 
   products.forEach((p) => {
     if (!p.watch_group_id || !p.watch_groups?.name) { noGroup.push(p); return; }
-    if (!byGroup.has(p.watch_group_id)) byGroup.set(p.watch_group_id, { label: groupLabel({ name: p.watch_groups.name, search_keyword: p.watch_groups.search_keyword }), items: [] });
-    byGroup.get(p.watch_group_id).items.push(p);
+    const key = normKey(p.watch_groups.name);
+    const known = mergedGroups.find((g) => g.key === key);
+    if (!byGroup.has(key)) byGroup.set(key, { label: known ? known.name : cleanText(p.watch_groups.name), items: [] });
+    byGroup.get(key).items.push(p);
   });
 
   let html = '';
@@ -157,7 +188,7 @@ function renderManualFormOptions() {
   const groupSelect = document.getElementById('manual-group');
   groupSelect.innerHTML =
     `<option value="">Sem grupo</option>` +
-    groups.map((g) => `<option value="${g.id}">${escapeHtml(groupLabel(g))}</option>`).join('');
+    mergedGroups.map((g) => `<option value="${g.ids[0]}">${escapeHtml(g.name)}</option>`).join('');
 }
 
 async function submitManualPromotion() {
@@ -271,7 +302,7 @@ async function createGroup() {
     document.getElementById('newGroupName').value = '';
     document.getElementById('newGroupKeyword').value = '';
     document.getElementById('testPreview').innerHTML = '';
-    msg.textContent = 'Grupo criado!';
+    msg.textContent = data.message || 'Grupo criado!';
     await load();
   } catch (err) {
     msg.textContent = `Erro: ${err.message}`;
@@ -281,9 +312,40 @@ async function createGroup() {
   }
 }
 
-async function removeGroup(id) {
-  if (!confirm('Remover esse grupo? Produtos e promoções ligados a ele ficam "sem grupo", mas não são apagados.')) return;
-  await fetch(`/api/groups?id=${id}`, { method: 'DELETE' });
+async function removeGroup(key) {
+  const group = mergedGroups.find((g) => g.key === key);
+  if (!group) return;
+  if (!confirm(`Remover o grupo "${group.name}" (${group.keywords.length} palavra(s)-chave)? Produtos e promoções ligados a ele ficam "sem grupo", mas não são apagados.`)) return;
+  const msg = document.getElementById('groupMsg');
+  try {
+    const res = await fetch(`/api/groups?id=${encodeURIComponent(group.ids.join(','))}`, { method: 'DELETE' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Falha ao remover');
+  } catch (err) {
+    msg.textContent = `Erro: ${err.message}`;
+    return;
+  }
+  await load();
+}
+
+async function removeKeyword(key, index) {
+  const group = mergedGroups.find((g) => g.key === key);
+  const keyword = group && group.keywords[index];
+  if (!keyword) return;
+  const msg = document.getElementById('groupMsg');
+  try {
+    const res = await fetch('/api/groups', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'remove_keyword', ids: group.ids, keyword }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Falha ao remover a palavra-chave');
+    msg.textContent = `Palavra-chave "${keyword}" removida de "${group.name}".`;
+  } catch (err) {
+    msg.textContent = `Erro: ${err.message}`;
+    return;
+  }
   await load();
 }
 
