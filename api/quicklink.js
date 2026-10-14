@@ -1,6 +1,7 @@
 const { generateShortLink } = require('../src/integrations/shopee/client');
 const { buildAffiliateLink } = require('../src/integrations/netshoes/client');
 const { supabaseAdmin } = require('../src/core/database/supabaseClient');
+const { handleAction: handleCouponAction } = require('../src/core/coupons');
 
 // POST /api/quicklink  -> { marketplace: 'shopee' | 'netshoes', url }
 // Gera o link de afiliado na hora, sem precisar que o produto apareça numa
@@ -13,6 +14,13 @@ module.exports = async function handler(req, res) {
   }
 
   try {
+    // Ações do cofre de cupons (ficam aqui para não criar mais uma function na Vercel).
+    if (req.body && typeof req.body.action === 'string' && req.body.action.startsWith('coupons_')) {
+      const out = await handleCouponAction(supabaseAdmin, req.body);
+      res.status(out.status).json(out.json);
+      return;
+    }
+
     const { marketplace: slug, url } = req.body || {};
     if (!slug || !url) {
       res.status(400).json({ error: 'Informe o marketplace e o link.' });
