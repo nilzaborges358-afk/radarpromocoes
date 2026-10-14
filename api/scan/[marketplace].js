@@ -15,6 +15,16 @@ const SHOPEE_SORT_ROTATION = [1, 2, 5];
 const SCAN_BUDGET_MS = 48000;
 const NETSHOES_CONCURRENCY = 3;
 
+// Netshoes: não existe mais um "10% fixo". O produto entra como promoção quando o preço atual
+// está abaixo do preço "normal" dele, qualquer que seja o tamanho da queda (5%, 8%, 23%...).
+// - Preço normal = mediana dos preços que o sistema registrou nos últimos 7 dias.
+// - Produto visto pela primeira vez (sem histórico ainda): usa o preço "de" informado pela Netshoes.
+// NETSHOES_MIN_DROP_PCT é só um piso para ignorar variação de centavos (ponha 0 se quiser tudo).
+const NETSHOES_MIN_DROP_PCT = 2;
+const NETSHOES_HISTORY_DAYS = 7;       // janela de comparação
+const NETSHOES_HISTORY_KEEP_DAYS = 30; // histórico mais velho que isso é apagado
+const NETSHOES_HISTORY_MIN_GAP_HOURS = 6; // não grava o mesmo produto de novo em menos de 6h
+
 // GET  /api/scan/mercadolivre?groups=id1,id2,none
 // POST /api/scan/mercadolivre   { groups: ['id1','id2','none'] }   (usado pelo painel — não tem limite de tamanho de URL)
 // GET /api/scan/shopee?groups=id1,id2
@@ -302,7 +312,7 @@ async function scanNetshoes(req, res) {
     let skipped = 0;
     let loggedErrors = 0;
     let nextTask = 0;
-    const totals = { withSale: 0, maxDiscount: 0, sample: null };
+    const totals = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null };
 
     async function worker() {
       while (nextTask < tasks.length) {
@@ -319,6 +329,8 @@ async function scanNetshoes(req, res) {
           totals.withSale += result.stats.withSale;
           totals.maxDiscount = Math.max(totals.maxDiscount, result.stats.maxDiscount);
           if (!totals.sample) totals.sample = result.stats.sample;
+          totals.withHistory += result.stats.withHistory;
+          if (!totals.historyError && result.stats.historyError) totals.historyError = result.stats.historyError;
         } catch (err) {
           errors.push(`${task.group.name} / "${task.keyword}": ${err.message}`);
           if (loggedErrors < 5) {
@@ -334,6 +346,12 @@ async function scanNetshoes(req, res) {
     }
     await Promise.all(Array.from({ length: Math.min(NETSHOES_CONCURRENCY, tasks.length) }, worker));
 
+    // Limpeza: histórico com mais de 30 dias não serve para nada (a comparação usa 7).
+    if (!totals.historyError) {
+      const keepSince = new Date(Date.now() - NETSHOES_HISTORY_KEEP_DAYS * 864e5).toISOString();
+      await supabaseAdmin.from('promotion_price_history').delete().eq('marketplace_id', marketplace.id).lt('checked_at', keepSince);
+    }
+
     const attempted = done + errors.length;
     const allFailed = attempted > 0 && errors.length === attempted;
     const parts = [];
@@ -342,8 +360,9 @@ async function scanNetshoes(req, res) {
     } else if (itemsSeen === 0) {
       parts.push(`A Netshoes não devolveu nenhum produto para ${done} palavra(s)-chave.${emptySamples.length ? ` Exemplo da resposta recebida — ${emptySamples[0]}` : ''}`);
     } else if (found === 0) {
-      parts.push(`A Netshoes devolveu ${itemsSeen} produto(s), ${withDiscount ? `${withDiscount} com desconto, mas todos já estavam salvos` : `mas nenhum com preço promocional ${MIN_DISCOUNT_PCT}% abaixo do normal`}. Produtos com preço promocional: ${totals.withSale}; maior desconto visto: ${Math.round(totals.maxDiscount)}%.${totals.sample ? ` Exemplo recebido — ${totals.sample}` : ''}`);
+      parts.push(`A Netshoes devolveu ${itemsSeen} produto(s), ${withDiscount ? `${withDiscount} com desconto, mas todos já estavam salvos` : `mas nenhum com preço abaixo do normal (queda mínima de ${NETSHOES_MIN_DROP_PCT}%, comparando com os últimos ${NETSHOES_HISTORY_DAYS} dias)`}. Produtos com queda de preço: ${totals.withSale}; maior queda vista: ${Math.round(totals.maxDiscount)}%; ${totals.withHistory} já tinham histórico de preço.${totals.sample ? ` Exemplo recebido — ${totals.sample}` : ''}`);
     }
+    if (totals.historyError) parts.push(`Histórico de preços indisponível (${totals.historyError}). Rode o arquivo 0003_promotion_price_history.sql no Supabase; enquanto isso a comparação usa só o preço "de" da Netshoes.`);
     if (skipped) parts.push(`${skipped} palavra(s)-chave ficaram para a próxima busca (limite de tempo). Clique em buscar de novo para continuar.`);
     if (!allFailed && errors.length) parts.push(`${errors.length} palavra(s)-chave falharam: ${errors[0]}`);
 
@@ -377,42 +396,95 @@ function chunk(list, size) {
   return out;
 }
 
+function median(values) {
+  const sorted = [...values].sort((x, y) => x - y);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
 // Os campos vêm da leitura do XML da Rakuten (ver parseProductSearchXml no client.js).
 // Grava em LOTE (poucas idas ao banco por palavra-chave, em vez de 2-3 por produto) —
 // era isso que deixava a busca lenta a ponto de estourar o tempo da Vercel.
+//
+// Regra de promoção (sem porcentagem fixa):
+//   preço normal = mediana dos preços registrados nos últimos 7 dias
+//                  (se o produto ainda não tem histórico: o preço "de" da Netshoes)
+//   é promoção quando preço atual < preço normal em pelo menos NETSHOES_MIN_DROP_PCT.
 async function processNetshoesItems(items, marketplaceId, group, publisherId, mid, seenUrls) {
-  const candidates = [];
-  let withDiscount = 0;
-  const stats = { withSale: 0, maxDiscount: 0, sample: null };
+  const stats = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null };
 
+  // 1) Lê os itens (um por link, mesmo que apareça em mais de uma palavra-chave)
+  const parsed = [];
   for (const item of items) {
     if (!stats.sample) stats.sample = `${String(item.itemName || '').slice(0, 50)} (price: ${item.price}, saleprice: ${item.salePrice})`;
     const title = item.itemName;
     const productUrl = item.productUrl || item.linkUrl;
-    const salePrice = parsePrice(item.salePrice);
     const regularPrice = parsePrice(item.price);
-    const price = salePrice || regularPrice;
+    const price = parsePrice(item.salePrice) || regularPrice;
 
     if (!title || !productUrl || !price) continue; // resposta em formato inesperado — pula sem quebrar o resto
+    if (seenUrls.has(productUrl)) continue;        // mesmo produto já tratado em outra palavra-chave
+    seenUrls.add(productUrl);
+    parsed.push({ title, productUrl, price, regularPrice, imageUrl: item.imageUrl || item.image || null });
+  }
+  if (!parsed.length) return { found: 0, withDiscount: 0, stats };
 
-    const discountRate = regularPrice && regularPrice > price
-      ? Number((((regularPrice - price) / regularPrice) * 100).toFixed(2))
-      : null;
-    if (discountRate) {
-      stats.withSale += 1;
-      stats.maxDiscount = Math.max(stats.maxDiscount, discountRate);
+  // 2) Histórico de preços desses links nos últimos 7 dias
+  const historyByUrl = new Map(); // url -> { prices: [], lastAt: ms }
+  const windowStart = new Date(Date.now() - NETSHOES_HISTORY_DAYS * 864e5).toISOString();
+  let historyOk = true;
+  for (const part of chunk(parsed.map((c) => c.productUrl), 10)) {
+    const { data, error } = await supabaseAdmin
+      .from('promotion_price_history')
+      .select('product_url, price, checked_at')
+      .eq('marketplace_id', marketplaceId)
+      .in('product_url', part)
+      .gte('checked_at', windowStart);
+    if (error) { historyOk = false; stats.historyError = error.message; break; }
+    for (const row of data || []) {
+      if (!historyByUrl.has(row.product_url)) historyByUrl.set(row.product_url, { prices: [], lastAt: 0 });
+      const h = historyByUrl.get(row.product_url);
+      h.prices.push(Number(row.price));
+      h.lastAt = Math.max(h.lastAt, new Date(row.checked_at).getTime());
     }
-    if (!discountRate || discountRate < MIN_DISCOUNT_PCT) continue;
+  }
+
+  // 3) Decide quem está em promoção
+  const candidates = [];
+  let withDiscount = 0;
+  for (const c of parsed) {
+    const h = historyByUrl.get(c.productUrl);
+    let reference = null;
+    if (h && h.prices.length) { reference = median(h.prices); stats.withHistory += 1; }
+    else if (c.regularPrice && c.regularPrice > c.price) reference = c.regularPrice;
+
+    const drop = reference && reference > c.price ? ((reference - c.price) / reference) * 100 : 0;
+    if (drop > 0) {
+      stats.withSale += 1;
+      stats.maxDiscount = Math.max(stats.maxDiscount, drop);
+    }
+    if (drop <= 0 || drop < NETSHOES_MIN_DROP_PCT) continue;
 
     withDiscount += 1;
-    if (seenUrls.has(productUrl)) continue; // mesmo produto já tratado em outra palavra-chave
-    seenUrls.add(productUrl);
-    candidates.push({ title, productUrl, price, regularPrice, discountRate, imageUrl: item.imageUrl || item.image || null });
+    candidates.push({ ...c, regularPrice: reference, discountRate: Number(drop.toFixed(2)) });
+  }
+
+  // 4) Registra o preço de hoje no histórico (só quem não foi registrado nas últimas 6h)
+  if (historyOk) {
+    const gapMs = NETSHOES_HISTORY_MIN_GAP_HOURS * 36e5;
+    const nowMs = Date.now();
+    const rows = parsed
+      .filter((c) => { const h = historyByUrl.get(c.productUrl); return !h || nowMs - h.lastAt >= gapMs; })
+      .map((c) => ({ marketplace_id: marketplaceId, product_url: c.productUrl, price: c.price }));
+    if (rows.length) {
+      const { error } = await supabaseAdmin.from('promotion_price_history').insert(rows);
+      if (error) stats.historyError = error.message;
+    }
   }
 
   if (!candidates.length) return { found: 0, withDiscount, stats };
 
-  // Quais desses links já estão salvos? (em blocos de 10 para não estourar o tamanho da consulta)
+  // 5) Quais desses links já estão salvos? (em blocos de 10 para não estourar o tamanho da consulta)
   const existingByUrl = new Map();
   for (const part of chunk(candidates.map((c) => c.productUrl), 10)) {
     const { data, error } = await supabaseAdmin
@@ -460,6 +532,7 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
       .from('promotions')
       .update({
         current_price: c.price,
+        previous_price: c.regularPrice,
         discount_rate: c.discountRate,
         watch_group_id: existing.watch_group_id || group.id,
         last_seen_at: now,
