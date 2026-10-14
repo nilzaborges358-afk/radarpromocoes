@@ -29,6 +29,14 @@ const NETSHOES_HISTORY_DAYS = 7;       // janela de comparação
 const NETSHOES_HISTORY_KEEP_DAYS = 30; // histórico mais velho que isso é apagado
 const NETSHOES_HISTORY_MIN_GAP_HOURS = 6; // não grava o mesmo produto de novo em menos de 6h
 
+// Shopee: o campo priceDiscountRate da API é só "preço de tabela vs preço de venda" do anúncio —
+// muitos vendedores deixam um preço de tabela inflado PARA SEMPRE, então ele aparece como "desconto"
+// em toda busca, sem nunca ter havido queda real. Por isso a Shopee agora usa o mesmo método da
+// Netshoes: só é promoção quando o preço ATUAL está abaixo do que o sistema já viu nos últimos 7 dias.
+const SHOPEE_MIN_DROP_PCT = 5;              // queda real mínima contra o histórico
+const SHOPEE_ACCEPT_LISTED_DISCOUNT = false; // true = aceita também o "desconto de tabela" (sem prova de queda)
+const SHOPEE_LISTED_MIN_PCT = 30;           // usado só se a linha acima for true
+
 // GET  /api/scan/mercadolivre?groups=id1,id2,none
 // POST /api/scan/mercadolivre   { groups: ['id1','id2','none'] }   (usado pelo painel — não tem limite de tamanho de URL)
 // GET /api/scan/shopee?groups=id1,id2
@@ -316,7 +324,7 @@ async function scanNetshoes(req, res) {
     let skipped = 0;
     let loggedErrors = 0;
     let nextTask = 0;
-    const totals = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0 };
+    const totals = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0, changed: 0, rose: 0, oldestMs: 0 };
 
     async function worker() {
       while (nextTask < tasks.length) {
@@ -338,6 +346,9 @@ async function scanNetshoes(req, res) {
           totals.newlyTracked += result.stats.newlyTracked;
           totals.withFeedDiscount += result.stats.withFeedDiscount;
           totals.parsedItems += result.stats.parsedItems;
+          totals.changed += result.stats.changed;
+          totals.rose += result.stats.rose;
+          if (result.stats.oldestMs && (!totals.oldestMs || result.stats.oldestMs < totals.oldestMs)) totals.oldestMs = result.stats.oldestMs;
           if (!totals.historyError && result.stats.historyError) totals.historyError = result.stats.historyError;
         } catch (err) {
           errors.push(`${task.group.name} / "${task.keyword}": ${err.message}`);
@@ -368,7 +379,11 @@ async function scanNetshoes(req, res) {
     } else if (itemsSeen === 0) {
       parts.push(`A Netshoes não devolveu nenhum produto para ${done} palavra(s)-chave.${emptySamples.length ? ` Exemplo da resposta recebida — ${emptySamples[0]}` : ''}`);
     } else if (found === 0) {
-      const diag = `Diagnóstico: ${totals.parsedItems} produto(s) lidos, ${totals.withFeedDiscount} com preço "de" maior que o atual no feed da Netshoes, ${totals.withHistory} com histórico de preço (${totals.newlyTracked} registrados agora); maior queda vista: ${Math.round(totals.maxDiscount)}%.${totals.sample ? ` Exemplo da resposta: ${totals.sample}.` : ''}`;
+      const historyDays = totals.oldestMs ? Math.max(0, Math.floor((Date.now() - totals.oldestMs) / 864e5)) : 0;
+      const frozen = totals.withHistory >= 50 && totals.changed === 0
+        ? ' Nenhum dos produtos acompanhados mudou de preço desde que comecei a registrar: o feed da Rakuten parece não refletir as promoções da Netshoes.'
+        : '';
+      const diag = `Diagnóstico: ${totals.parsedItems} produto(s) lidos, ${totals.withFeedDiscount} com preço "de" maior que o atual no feed da Netshoes, ${totals.withHistory} com histórico de preço (${totals.newlyTracked} registrados agora; histórico mais antigo: ${historyDays} dia(s)); ${totals.changed} já tiveram o preço alterado (${totals.rose} subiram); maior queda vista: ${Math.round(totals.maxDiscount)}%.${frozen}${totals.sample ? ` Exemplo da resposta: ${totals.sample}.` : ''}`;
       if (withDiscount) {
         parts.push(`A Netshoes devolveu ${itemsSeen} produto(s); ${withDiscount} em promoção, mas todos já estavam salvos no painel. ${diag}`);
       } else {
@@ -432,7 +447,7 @@ function median(values) {
 //                  (se o produto ainda não tem histórico: o preço "de" da Netshoes)
 //   é promoção quando preço atual < preço normal em pelo menos NETSHOES_MIN_DROP_PCT.
 async function processNetshoesItems(items, marketplaceId, group, publisherId, mid, seenUrls) {
-  const stats = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0 };
+  const stats = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0, changed: 0, rose: 0, oldestMs: 0 };
 
   // 1) Lê os itens (um por link, mesmo que apareça em mais de uma palavra-chave)
   const parsed = [];
@@ -467,7 +482,9 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
       if (!historyByUrl.has(row.product_url)) historyByUrl.set(row.product_url, { prices: [], lastAt: 0 });
       const h = historyByUrl.get(row.product_url);
       h.prices.push(Number(row.price));
-      h.lastAt = Math.max(h.lastAt, new Date(row.checked_at).getTime());
+      const at = new Date(row.checked_at).getTime();
+      h.lastAt = Math.max(h.lastAt, at);
+      if (!stats.oldestMs || at < stats.oldestMs) stats.oldestMs = at;
     }
   }
 
@@ -488,6 +505,9 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
       stats.withHistory += 1;
       const med = median(h.prices);
       if (med > c.price) historyRef = med;
+      // diagnóstico: o preço desse produto já mudou alguma vez desde que começamos a registrar?
+      if (h.prices.some((p) => Math.abs(p - c.price) >= 0.01)) stats.changed += 1;
+      if (med < c.price - 0.01) stats.rose += 1;
     }
     const reference = Math.max(feedRef || 0, historyRef || 0) || null;
 
@@ -581,6 +601,7 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
 
 async function scanShopee(req, res) {
   try {
+    const startedAt = Date.now();
     const { data: marketplace } = await supabaseAdmin
       .from('marketplaces')
       .select('id')
@@ -604,7 +625,10 @@ async function scanShopee(req, res) {
     const groups = mergeGroupsByName(selectedRows);
 
     let found = 0;
+    let skipped = 0;
     const errors = [];
+    const seenUrls = new Set();
+    const totals = { checked: 0, listedOnly: 0, withHistory: 0, trackedNow: 0, maxDrop: 0, changed: 0, historyError: null };
 
     for (const group of groups || []) {
       try {
@@ -620,12 +644,19 @@ async function scanShopee(req, res) {
         const perKeywordLimit = Math.max(10, Math.floor(40 / keywords.length));
 
         for (const keyword of keywords) {
+          if (Date.now() - startedAt > SCAN_BUDGET_MS) { skipped += 1; continue; }
           const sortType = SHOPEE_SORT_ROTATION[Math.floor(Math.random() * SHOPEE_SORT_ROTATION.length)];
           const page = 1 + Math.floor(Math.random() * 3);
           const offers = await searchProductOffers(creds.client_id, creds.client_secret, keyword, { limit: perKeywordLimit, sortType, page });
-          for (const offer of offers) {
-            found += await processShopeeOffer(offer, marketplace.id, group, creds);
-          }
+          const r = await processShopeeOffers(offers, marketplace.id, group, keyword, creds, seenUrls);
+          found += r.found;
+          totals.checked += r.checked;
+          totals.listedOnly += r.listedOnly;
+          totals.withHistory += r.withHistory;
+          totals.trackedNow += r.trackedNow;
+          totals.changed += r.changed;
+          totals.maxDrop = Math.max(totals.maxDrop, r.maxDrop);
+          if (!totals.historyError && r.historyError) totals.historyError = r.historyError;
         }
       } catch (err) {
         errors.push(`${group.name}: ${err.message}`);
@@ -637,7 +668,27 @@ async function scanShopee(req, res) {
       }
     }
 
-    res.status(200).json({ ok: true, groupsSearched: (groups || []).length, promotionsFound: found, errors });
+    // Limpeza: histórico com mais de 30 dias não serve para nada (a comparação usa 7).
+    if (!totals.historyError) {
+      const keepSince = new Date(Date.now() - NETSHOES_HISTORY_KEEP_DAYS * 864e5).toISOString();
+      await supabaseAdmin.from('promotion_price_history').delete().eq('marketplace_id', marketplace.id).lt('checked_at', keepSince);
+    }
+
+    const parts = [];
+    if (found === 0 && totals.checked > 0) {
+      parts.push(`A Shopee devolveu ${totals.checked} produto(s), mas nenhum caiu de preço de verdade (queda mínima de ${SHOPEE_MIN_DROP_PCT}% contra o que já vi nos últimos ${NETSHOES_HISTORY_DAYS} dias). Em ${totals.listedOnly} havia só "desconto" de preço de tabela, que a Shopee informa sem prova de promoção, e por isso foram ignorados. ${totals.trackedNow} passaram a ser acompanhados agora e ${totals.withHistory} já tinham histórico (${totals.changed} com preço diferente do histórico). Rode a busca de novo nos próximos dias.`);
+    }
+    if (totals.historyError) parts.push(`Histórico de preços indisponível (${totals.historyError}): sem ele não dá para provar queda de preço, então nada foi salvo como promoção.`);
+    if (skipped) parts.push(`${skipped} palavra(s)-chave ficaram para a próxima busca (limite de tempo).`);
+
+    res.status(200).json({
+      ok: true,
+      groupsSearched: (groups || []).length,
+      productsChecked: totals.checked,
+      promotionsFound: found,
+      errors,
+      note: parts.length ? parts.join(' ') : undefined,
+    });
   } catch (err) {
     res.status(500).json({ error: `Erro no servidor: ${err.message}` });
   }
@@ -659,60 +710,153 @@ function titleMatchesKeyword(title, keyword) {
   return words.some((w) => titleLower.includes(w));
 }
 
-async function processShopeeOffer(offer, marketplaceId, group, creds) {
-  const discountRate = offer.priceDiscountRate || 0;
-  if (discountRate < MIN_DISCOUNT_PCT) return 0;
+// Processa as ofertas de uma palavra-chave em lote. Regra de promoção (igual à da Netshoes):
+//   preço normal = mediana dos preços que o sistema registrou nos últimos 7 dias
+//   é promoção quando o preço atual está abaixo dele em pelo menos SHOPEE_MIN_DROP_PCT.
+// O priceDiscountRate da Shopee (preço de tabela) NÃO conta como prova — ver comentário no topo do arquivo.
+async function processShopeeOffers(offers, marketplaceId, group, keyword, creds, seenUrls) {
+  const stats = { found: 0, checked: 0, listedOnly: 0, withHistory: 0, trackedNow: 0, maxDrop: 0, changed: 0, historyError: null };
 
-  const keyword = group.search_keyword || group.name;
-  if (!titleMatchesKeyword(offer.productName || '', keyword)) return 0;
-
-  const originalUrl = offer.productLink || offer.offerLink;
-
-  const { data: existing } = await supabaseAdmin
-    .from('promotions')
-    .select('id, watch_group_id')
-    .eq('marketplace_id', marketplaceId)
-    .eq('original_url', originalUrl)
-    .maybeSingle();
-
-  if (existing) {
-    await supabaseAdmin
-      .from('promotions')
-      .update({
-        current_price: offer.priceMin,
-        discount_rate: discountRate,
-        watch_group_id: existing.watch_group_id || group.id,
-        last_seen_at: new Date().toISOString(),
-      })
-      .eq('id', existing.id);
-    return 0;
-  }
-
-  let affiliateUrl = null;
-  try {
-    affiliateUrl = await generateShortLink(creds.client_id, creds.client_secret, originalUrl, group.name);
-  } catch (err) {
-    await supabaseAdmin.from('integration_logs').insert({
-      marketplace_id: marketplaceId,
-      level: 'warn',
-      message: `Oferta encontrada mas falhou ao gerar link de afiliado (${offer.itemId}): ${err.message}`,
+  // 1) Lê as ofertas (descarta título sem relação com a busca e links repetidos)
+  const parsed = [];
+  for (const offer of offers) {
+    if (!titleMatchesKeyword(offer.productName || '', keyword)) continue;
+    const productUrl = offer.productLink || offer.offerLink;
+    const price = parsePrice(offer.priceMin);
+    if (!productUrl || !price || !offer.productName) continue;
+    if (seenUrls.has(productUrl)) continue;
+    seenUrls.add(productUrl);
+    parsed.push({
+      title: offer.productName,
+      productUrl,
+      price,
+      listedRate: Number(offer.priceDiscountRate) || 0,
+      imageUrl: offer.imageUrl || null,
     });
   }
+  stats.checked = parsed.length;
+  if (!parsed.length) return stats;
 
-  await supabaseAdmin.from('promotions').insert({
-    marketplace_id: marketplaceId,
-    watch_group_id: group.id,
-    title: offer.productName,
-    image_url: offer.imageUrl,
-    original_url: originalUrl,
-    current_price: offer.priceMin,
-    previous_price: null,
-    discount_rate: discountRate,
-    source: 'shopee_affiliate_api',
-    status: 'PENDING',
-    affiliate_url: affiliateUrl,
-    affiliate_url_added_at: affiliateUrl ? new Date().toISOString() : null,
-  });
+  // 2) Histórico de preços desses links nos últimos 7 dias
+  const historyByUrl = new Map();
+  const windowStart = new Date(Date.now() - NETSHOES_HISTORY_DAYS * 864e5).toISOString();
+  let historyOk = true;
+  for (const part of chunk(parsed.map((c) => c.productUrl), 10)) {
+    const { data, error } = await supabaseAdmin
+      .from('promotion_price_history')
+      .select('product_url, price, checked_at')
+      .eq('marketplace_id', marketplaceId)
+      .in('product_url', part)
+      .gte('checked_at', windowStart);
+    if (error) { historyOk = false; stats.historyError = error.message; break; }
+    for (const row of data || []) {
+      if (!historyByUrl.has(row.product_url)) historyByUrl.set(row.product_url, { prices: [], lastAt: 0 });
+      const h = historyByUrl.get(row.product_url);
+      h.prices.push(Number(row.price));
+      h.lastAt = Math.max(h.lastAt, new Date(row.checked_at).getTime());
+    }
+  }
 
-  return 1;
+  // 3) Decide quem caiu de preço de verdade
+  const candidates = [];
+  for (const c of parsed) {
+    const h = historyByUrl.get(c.productUrl);
+    let reference = null;
+    let source = 'shopee_affiliate_api';
+    if (h && h.prices.length) {
+      stats.withHistory += 1;
+      const med = median(h.prices);
+      if (med > c.price) reference = med;
+      if (h.prices.some((p) => Math.abs(p - c.price) >= 0.01)) stats.changed += 1;
+    }
+    let drop = reference ? ((reference - c.price) / reference) * 100 : 0;
+
+    if (drop < SHOPEE_MIN_DROP_PCT) {
+      // Sem queda comprovada. Só aceita o "desconto de tabela" se o dono ligou essa opção.
+      if (c.listedRate >= MIN_DISCOUNT_PCT) stats.listedOnly += 1;
+      if (SHOPEE_ACCEPT_LISTED_DISCOUNT && !(h && h.prices.length) && c.listedRate >= SHOPEE_LISTED_MIN_PCT) {
+        reference = Number((c.price / (1 - c.listedRate / 100)).toFixed(2));
+        drop = c.listedRate;
+        source = 'shopee_listed_price';
+      } else {
+        continue;
+      }
+    }
+    stats.maxDrop = Math.max(stats.maxDrop, drop);
+    candidates.push({ ...c, previousPrice: reference, discountRate: Number(drop.toFixed(2)), source });
+  }
+
+  // 4) Registra o preço de hoje no histórico (só quem não foi registrado nas últimas 6h)
+  if (historyOk) {
+    const gapMs = NETSHOES_HISTORY_MIN_GAP_HOURS * 36e5;
+    const nowMs = Date.now();
+    const rows = parsed
+      .filter((c) => { const h = historyByUrl.get(c.productUrl); return !h || nowMs - h.lastAt >= gapMs; })
+      .map((c) => ({ marketplace_id: marketplaceId, product_url: c.productUrl, price: c.price }));
+    if (rows.length) {
+      const { error } = await supabaseAdmin.from('promotion_price_history').insert(rows);
+      if (error) stats.historyError = error.message;
+      else stats.trackedNow = rows.length;
+    }
+  }
+  if (!candidates.length) return stats;
+
+  // 5) Salva: atualiza os que já estão no painel e cria os novos
+  const existingByUrl = new Map();
+  for (const part of chunk(candidates.map((c) => c.productUrl), 10)) {
+    const { data, error } = await supabaseAdmin
+      .from('promotions')
+      .select('id, original_url, watch_group_id')
+      .eq('marketplace_id', marketplaceId)
+      .in('original_url', part);
+    if (error) throw new Error(`banco de dados: ${error.message}`);
+    (data || []).forEach((row) => existingByUrl.set(row.original_url, row));
+  }
+
+  const now = new Date().toISOString();
+  for (const c of candidates) {
+    const existing = existingByUrl.get(c.productUrl);
+    if (existing) {
+      await supabaseAdmin
+        .from('promotions')
+        .update({
+          current_price: c.price,
+          previous_price: c.previousPrice,
+          discount_rate: c.discountRate,
+          watch_group_id: existing.watch_group_id || group.id,
+          last_seen_at: now,
+        })
+        .eq('id', existing.id);
+      continue;
+    }
+
+    let affiliateUrl = null;
+    try {
+      affiliateUrl = await generateShortLink(creds.client_id, creds.client_secret, c.productUrl, group.name);
+    } catch (err) {
+      await supabaseAdmin.from('integration_logs').insert({
+        marketplace_id: marketplaceId,
+        level: 'warn',
+        message: `Oferta encontrada mas falhou ao gerar link de afiliado (${c.title.slice(0, 60)}): ${err.message}`,
+      });
+    }
+
+    const { error } = await supabaseAdmin.from('promotions').insert({
+      marketplace_id: marketplaceId,
+      watch_group_id: group.id,
+      title: c.title,
+      image_url: c.imageUrl,
+      original_url: c.productUrl,
+      current_price: c.price,
+      previous_price: c.previousPrice,
+      discount_rate: c.discountRate,
+      source: c.source,
+      status: 'PENDING',
+      affiliate_url: affiliateUrl,
+      affiliate_url_added_at: affiliateUrl ? now : null,
+    });
+    if (error) throw new Error(`banco de dados: ${error.message}`);
+    stats.found += 1;
+  }
+  return stats;
 }
