@@ -87,8 +87,8 @@ function renderForm(slug) {
         <input type="password" id="riachuelo-secret" placeholder="Awin > API Credentials > Create API Token" />
       </div>
       <div class="field">
-        <label>Chave do Feed de produtos (Create-a-Feed)</label>
-        <input type="password" id="riachuelo-feedkey" placeholder="Cole a chave — deixe vazio pra manter a que já está salva" />
+        <label>Endereço do "Feed List Download" (Awin &gt; Toolbox &gt; Create-a-Feed)</label>
+        <input type="password" id="riachuelo-feedkey" placeholder="Cole o endereço inteiro (https://ui.awin.com/...) — vazio mantém o salvo" />
       </div>
       <div class="field">
         <label>Advertiser ID da Riachuelo (opcional — o sistema descobre sozinho)</label>
@@ -102,7 +102,7 @@ function renderForm(slug) {
         <button class="primary" onclick="saveCredentials('riachuelo')">Salvar credenciais</button>
       </div>
       <div class="save-msg" id="riachuelo-save-msg"></div>
-      <p class="soon-note" style="margin-top:10px;">Precisa estar aprovado no programa da Riachuelo na Awin. Publisher ID: número da sua conta (aparece no topo do painel). Token: Awin &gt; Account &gt; API Credentials. Chave do feed: Awin &gt; Toolbox &gt; Create-a-Feed (copie o trecho depois de <b>apikey/</b> no link de download). Esta chave é DIFERENTE do token da API.</p>
+      <p class="soon-note" style="margin-top:10px;">Precisa estar aprovado no programa da Riachuelo na Awin. Publisher ID: número da sua conta (aparece no topo do painel). Token: Awin &gt; Account &gt; API Credentials. Feed: Awin &gt; Toolbox &gt; Create-a-Feed, quadro azul "Feed List Download": copie o endereço inteiro. Ele é DIFERENTE do token da API.</p>
     `;
   }
 
@@ -181,7 +181,7 @@ async function loadStatus(slug) {
       dot.className = data.hasExtraCredential3 ? 'dot on' : 'dot off';
       statusText.textContent = data.hasExtraCredential3
         ? 'Credenciais salvas'
-        : 'Credenciais salvas — falta a Chave do Feed';
+        : 'Credenciais salvas — falta o endereço do Feed';
     } else if (slug === 'netshoes' && data.hasCredentials) {
       dot.className = data.hasExtraCredential3 ? 'dot on' : 'dot off';
       statusText.textContent = data.hasExtraCredential3
