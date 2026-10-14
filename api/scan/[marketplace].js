@@ -312,7 +312,7 @@ async function scanNetshoes(req, res) {
     let skipped = 0;
     let loggedErrors = 0;
     let nextTask = 0;
-    const totals = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null };
+    const totals = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0 };
 
     async function worker() {
       while (nextTask < tasks.length) {
@@ -330,6 +330,7 @@ async function scanNetshoes(req, res) {
           totals.maxDiscount = Math.max(totals.maxDiscount, result.stats.maxDiscount);
           if (!totals.sample) totals.sample = result.stats.sample;
           totals.withHistory += result.stats.withHistory;
+          totals.newlyTracked += result.stats.newlyTracked;
           if (!totals.historyError && result.stats.historyError) totals.historyError = result.stats.historyError;
         } catch (err) {
           errors.push(`${task.group.name} / "${task.keyword}": ${err.message}`);
@@ -359,8 +360,10 @@ async function scanNetshoes(req, res) {
       parts.push(`Todas as buscas da Netshoes falharam. ${errors[0]}${tokenError ? ` (login automático: ${tokenError})` : ''}`);
     } else if (itemsSeen === 0) {
       parts.push(`A Netshoes não devolveu nenhum produto para ${done} palavra(s)-chave.${emptySamples.length ? ` Exemplo da resposta recebida — ${emptySamples[0]}` : ''}`);
+    } else if (found === 0 && totals.newlyTracked > 0 && totals.withHistory === 0) {
+      parts.push(`A Netshoes devolveu ${itemsSeen} produto(s) e a Netshoes só informa o preço atual (sem preço "de"). Registrei o preço de ${totals.newlyTracked} produto(s) agora: a comparação com os últimos ${NETSHOES_HISTORY_DAYS} dias começa nas próximas buscas, quando o preço de algum deles mudar. Busque de novo em algumas horas ou amanhã.`);
     } else if (found === 0) {
-      parts.push(`A Netshoes devolveu ${itemsSeen} produto(s), ${withDiscount ? `${withDiscount} com desconto, mas todos já estavam salvos` : `mas nenhum com preço abaixo do normal (queda mínima de ${NETSHOES_MIN_DROP_PCT}%, comparando com os últimos ${NETSHOES_HISTORY_DAYS} dias)`}. Produtos com queda de preço: ${totals.withSale}; maior queda vista: ${Math.round(totals.maxDiscount)}%; ${totals.withHistory} já tinham histórico de preço.${totals.sample ? ` Exemplo recebido — ${totals.sample}` : ''}`);
+      parts.push(`A Netshoes devolveu ${itemsSeen} produto(s), ${withDiscount ? `${withDiscount} com desconto, mas todos já estavam salvos` : `mas nenhum com preço abaixo do normal (queda mínima de ${NETSHOES_MIN_DROP_PCT}%, comparando com os últimos ${NETSHOES_HISTORY_DAYS} dias)`}. ${totals.withHistory} produto(s) já tinham histórico de preço; maior queda vista: ${Math.round(totals.maxDiscount)}%.`);
     }
     if (totals.historyError) parts.push(`Histórico de preços indisponível (${totals.historyError}). Rode o arquivo 0003_promotion_price_history.sql no Supabase; enquanto isso a comparação usa só o preço "de" da Netshoes.`);
     if (skipped) parts.push(`${skipped} palavra(s)-chave ficaram para a próxima busca (limite de tempo). Clique em buscar de novo para continuar.`);
@@ -411,7 +414,7 @@ function median(values) {
 //                  (se o produto ainda não tem histórico: o preço "de" da Netshoes)
 //   é promoção quando preço atual < preço normal em pelo menos NETSHOES_MIN_DROP_PCT.
 async function processNetshoesItems(items, marketplaceId, group, publisherId, mid, seenUrls) {
-  const stats = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null };
+  const stats = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0 };
 
   // 1) Lê os itens (um por link, mesmo que apareça em mais de uma palavra-chave)
   const parsed = [];
@@ -479,6 +482,7 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
     if (rows.length) {
       const { error } = await supabaseAdmin.from('promotion_price_history').insert(rows);
       if (error) stats.historyError = error.message;
+      else stats.newlyTracked = rows.length;
     }
   }
 
