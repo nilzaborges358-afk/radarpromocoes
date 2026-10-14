@@ -42,11 +42,22 @@ async function listJoinedProgrammes(publisherId, token) {
   return Array.isArray(data) ? data : [];
 }
 
+// Procura o programa pelo nome entre os que você foi aprovado. Se não achar, olha também a lista
+// completa (pendentes, recusados...) e devolve o que viu — para a mensagem de erro dizer o motivo real.
 async function findAdvertiserId(publisherId, token, nameHint) {
-  const list = await listJoinedProgrammes(publisherId, token);
   const hint = String(nameHint || '').toLowerCase();
-  const hit = list.find((p) => String(p.name || '').toLowerCase().includes(hint));
-  return hit ? { id: String(hit.id), name: hit.name } : null;
+  const match = (p) => String(p.name || '').toLowerCase().includes(hint);
+  const joined = await listJoinedProgrammes(publisherId, token);
+  const hit = joined.find(match);
+  if (hit) return { id: String(hit.id), name: hit.name };
+
+  const info = { id: null, joinedCount: joined.length, joinedNames: joined.map((p) => p.name).filter(Boolean).slice(0, 8), elsewhere: null };
+  try {
+    const all = await apiRequest('GET', `/publishers/${encodeURIComponent(publisherId)}/programmes?relationship=all`, token);
+    const other = (Array.isArray(all) ? all : []).find(match);
+    if (other) info.elsewhere = { id: String(other.id), name: other.name, status: other.membershipStatus || other.relationship || other.status || null };
+  } catch { /* só diagnóstico */ }
+  return info;
 }
 
 // ---------- Ofertas e cupons (Offers API) ----------
