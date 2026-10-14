@@ -99,6 +99,7 @@ function parseProductSearchXml(xml) {
       price: xmlTag(block, 'price'),
       salePrice: xmlTag(block, 'saleprice'),
       imageUrl: xmlTag(block, 'imageurl'),
+      category: [xmlTag(block, 'primary'), xmlTag(block, 'secondary')].filter(Boolean).join(' / ') || null,
       linkUrl,
       productUrl: extractProductUrl(linkUrl),
     };
