@@ -230,4 +230,115 @@ function buildAffiliateLink(publisherId, mid, targetUrl) {
   return `https://click.linksynergy.com/deeplink?id=${encodeURIComponent(publisherId)}&mid=${encodeURIComponent(mid)}&murl=${encodeURIComponent(targetUrl)}`;
 }
 
-module.exports = { getAccessToken, searchProducts, buildAffiliateLink, parseProductSearchXml, sanitizeKeyword };
+
+// ---------- Cupons (Rakuten Coupon Web Service) ----------
+
+function xmlTagList(block, tag) {
+  const out = [];
+  const re = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`, 'gi');
+  let m;
+  while ((m = re.exec(block))) {
+    const inner = m[1].trim().replace(/^<!\[CDATA\[([\s\S]*?)\]\]>$/, '$1').trim();
+    const text = decodeXml(inner);
+    if (text) out.push(text);
+  }
+  return out;
+}
+
+/**
+ * ATENÇÃO: os nomes das tags (offerdescription, couponcode, couponrestriction, offerstartdate,
+ * offerenddate, clickurl, advertisername, category, promotiontype) seguem o formato conhecido do
+ * Coupon Web Service da Rakuten, mas AINDA NÃO FORAM CONFIRMADOS contra uma resposta real da sua conta.
+ * Se vier vazio, a tela mostra um trecho da resposta real para eu ajustar.
+ */
+function parseCouponXml(xml) {
+  const errorId = xmlTag(xml, 'ErrorID');
+  if (errorId) {
+    const err = new Error(`Rakuten (erro ${errorId}): ${xmlTag(xml, 'ErrorText') || 'sem descrição'}`);
+    err.code = errorId;
+    throw err;
+  }
+  const blocks = xml.match(/<link(?:\s[^>]*)?>[\s\S]*?<\/link>/gi) || [];
+  return blocks.map((block) => ({
+    description: xmlTag(block, 'offerdescription'),
+    code: xmlTag(block, 'couponcode'),
+    restriction: xmlTag(block, 'couponrestriction'),
+    startsAt: xmlTag(block, 'offerstartdate'),
+    endsAt: xmlTag(block, 'offerenddate'),
+    clickUrl: xmlTag(block, 'clickurl'),
+    advertiser: xmlTag(block, 'advertisername'),
+    categories: xmlTagList(block, 'category'),
+    promotionTypes: xmlTagList(block, 'promotiontype'),
+  }));
+}
+
+const COUPON_STRATEGIES = [
+  {
+    id: 'novo (OAuth + token)',
+    ready: (a) => Boolean(a.accessToken),
+    build: (a, q) => ({ url: `${API_BASE}/coupon/1.0?${q}`, headers: { Authorization: `Bearer ${a.accessToken}`, Accept: 'application/xml' } }),
+  },
+  {
+    id: 'novo (Web Services Token)',
+    ready: (a) => Boolean(a.webServicesToken),
+    build: (a, q) => ({ url: `${API_BASE}/coupon/1.0?${q}`, headers: { Authorization: `Bearer ${a.webServicesToken}`, Accept: 'application/xml' } }),
+  },
+  {
+    id: 'antigo',
+    ready: (a) => Boolean(a.webServicesToken),
+    build: (a, q) => ({ url: `http://couponfeed.linksynergy.com/coupon?${q}`, headers: { Accept: 'application/xml' } }),
+  },
+];
+
+async function fetchCouponsPage(url, headers) {
+  let res;
+  try {
+    res = await fetch(url, { headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+  } catch (err) {
+    if (err && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+      throw new Error(`a Rakuten não respondeu em ${REQUEST_TIMEOUT_MS / 1000}s`);
+    }
+    throw new Error(`falha de rede: ${err.message}`);
+  }
+  const rawText = (await res.text()).trim();
+  if (!rawText.startsWith('<')) throw new Error(`Rakuten respondeu (${res.status}): ${rawText.slice(0, 400)}`);
+  const items = parseCouponXml(rawText);
+  if (!res.ok) throw new Error(`Rakuten respondeu com status ${res.status}: ${rawText.slice(0, 400)}`);
+  items.totalMatches = Number(xmlTag(rawText, 'TotalMatches')) || 0;
+  items.totalPages = Number(xmlTag(rawText, 'TotalPages')) || 0;
+  items.rawSample = items.length ? null : rawText.replace(/\s+/g, ' ').slice(0, 400);
+  return items;
+}
+
+/**
+ * Lista os cupons/ofertas do anunciante (MID da Netshoes). Mesma lógica da busca de produtos:
+ * testa as formas de autenticação e "trava" a que funcionar em `auth.couponStrategy`.
+ */
+async function fetchCoupons(auth, mid, { page = 1, perPage = 100 } = {}) {
+  const query = `token=${encodeURIComponent(auth.webServicesToken || '')}&mid=${encodeURIComponent(mid)}&resultsperpage=${perPage}&pagenumber=${page}`;
+
+  if (auth.couponStrategy) {
+    const strategy = COUPON_STRATEGIES.find((s) => s.id === auth.couponStrategy);
+    const req = strategy.build(auth, query);
+    const items = await fetchCouponsPage(req.url, req.headers);
+    items.strategy = strategy.id;
+    return items;
+  }
+
+  const failures = [];
+  for (const strategy of COUPON_STRATEGIES) {
+    if (!strategy.ready(auth)) continue;
+    try {
+      const req = strategy.build(auth, query);
+      const items = await fetchCouponsPage(req.url, req.headers);
+      auth.couponStrategy = strategy.id;
+      items.strategy = strategy.id;
+      return items;
+    } catch (err) {
+      failures.push(`[${strategy.id}] ${err.message}`);
+    }
+  }
+  throw new Error(failures.length ? failures.join(' | ') : 'nenhum token da Rakuten disponível para buscar cupons');
+}
+
+module.exports = { getAccessToken, searchProducts, buildAffiliateLink, parseProductSearchXml, sanitizeKeyword, fetchCoupons, parseCouponXml };
