@@ -92,6 +92,8 @@ function init() {
   document.getElementById('scanBtn').addEventListener('click', openScanModal);
   document.getElementById('scanModalCancel').addEventListener('click', closeScanModal);
   document.getElementById('scanModalConfirm').addEventListener('click', confirmScan);
+  document.getElementById('scanSelectAll').addEventListener('click', () => setAllScanGroups(true));
+  document.getElementById('scanSelectNone').addEventListener('click', () => setAllScanGroups(false));
   document.querySelectorAll('input[name="scanMarketplace"]').forEach((radio) => {
     radio.addEventListener('change', updateScanConfirmState);
   });
@@ -131,6 +133,24 @@ function normKey(value) {
 
 function displayKeyword(g) {
   return (g.search_keyword || g.name || '').trim();
+}
+
+// Tudo que tem o MESMO nome (ignorando maiúsculas e espaços extras) é UM grupo só.
+// Devolve [{ key, name, ids: [todos os ids do banco com esse nome], keywords: [...] }].
+function mergeGroupsByName(rows) {
+  const map = new Map();
+  (rows || []).forEach((g) => {
+    const key = normKey(g.name);
+    if (!map.has(key)) map.set(key, { key, name: String(g.name || '').replace(/\s+/g, ' ').trim(), ids: [], keywords: [] });
+    const merged = map.get(key);
+    merged.ids.push(g.id);
+    const cleaned = String(g.name || '').replace(/\s+/g, ' ').trim();
+    if (!/[A-ZÀ-Þ]/.test(merged.name) && /[A-ZÀ-Þ]/.test(cleaned)) merged.name = cleaned;
+    String(g.search_keyword || g.name || '').split(',').map((k) => k.trim()).filter(Boolean).forEach((kw) => {
+      if (!merged.keywords.some((k) => normKey(k) === normKey(kw))) merged.keywords.push(kw);
+    });
+  });
+  return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
 }
 
 // Filtros em cascata: o que está selecionado num dropdown restringe as opções do outro.
@@ -368,26 +388,30 @@ async function markStatus(id, status) {
 }
 
 function openScanModal() {
-  // Monta as checkboxes de grupo (+ "Sem grupo"), todas marcadas por padrão.
+  // Uma caixinha por GRUPO (nomes iguais viram um só) + "Sem grupo", todas marcadas por padrão.
+  // O valor de cada caixinha guarda todos os ids do grupo, separados por vírgula.
   const container = document.getElementById('scanGroupsCheckboxes');
   const groupOptions = [
-    ...knownGroups.map((g) => {
-      const kw = displayKeyword(g);
-      return { id: g.id, name: normKey(kw) && normKey(kw) !== normKey(g.name) ? `${g.name} — ${kw}` : g.name };
-    }),
-    { id: 'none', name: 'Sem grupo' },
+    ...mergeGroupsByName(knownGroups).map((g) => ({ value: g.ids.join(','), name: g.name })),
+    { value: 'none', name: 'Sem grupo' },
   ];
 
   container.innerHTML = groupOptions.map((g) => `
     <label class="check-row">
-      <input type="checkbox" class="scan-group-checkbox" value="${g.id}" checked /> ${escapeHtml(g.name)}
+      <input type="checkbox" class="scan-group-checkbox" value="${escapeHtml(g.value)}" checked /> ${escapeHtml(g.name)}
     </label>
   `).join('');
 
   document.querySelectorAll('input[name="scanMarketplace"]').forEach((r) => { r.checked = false; });
-  document.getElementById('scanModalMsg').textContent = '';
+  const msg = document.getElementById('scanModalMsg');
+  msg.textContent = '';
+  msg.classList.remove('error');
   updateScanConfirmState();
   document.getElementById('scanModalOverlay').classList.add('show');
+}
+
+function setAllScanGroups(checked) {
+  document.querySelectorAll('.scan-group-checkbox').forEach((cb) => { cb.checked = checked; });
 }
 
 function closeScanModal() {
@@ -403,26 +427,51 @@ async function confirmScan() {
   const marketplace = document.querySelector('input[name="scanMarketplace"]:checked')?.value;
   if (!marketplace) return;
 
-  const groupIds = [...document.querySelectorAll('.scan-group-checkbox:checked')].map((cb) => cb.value);
+  // Cada caixinha pode carregar vários ids ("id1,id2,id3") — junta tudo numa lista só.
+  const groupIds = [...document.querySelectorAll('.scan-group-checkbox:checked')]
+    .flatMap((cb) => cb.value.split(','))
+    .filter(Boolean);
   const msg = document.getElementById('scanModalMsg');
+  const scanResult = document.getElementById('scanResult');
   const confirmBtn = document.getElementById('scanModalConfirm');
+
+  msg.classList.remove('error');
+  scanResult.classList.remove('error');
 
   if (groupIds.length === 0) {
     msg.textContent = 'Marque pelo menos um grupo (ou "Sem grupo") antes de buscar.';
+    msg.classList.add('error');
     return;
   }
 
   confirmBtn.disabled = true;
   confirmBtn.textContent = 'Buscando...';
-  msg.textContent = '';
+  msg.textContent = 'Buscando… pode levar até 1 minuto, não feche a página.';
 
   const marketplaceNames = { mercadolivre: 'Mercado Livre', shopee: 'Shopee', amazon: 'Amazon', netshoes: 'Netshoes' };
   const marketplaceName = marketplaceNames[marketplace] || marketplace;
 
   try {
-    const res = await fetch(`/api/scan/${marketplace}?groups=${groupIds.join(',')}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Falha na busca');
+    // POST com a lista no corpo: não tem limite de tamanho de endereço, mesmo com muitos grupos.
+    const res = await fetch(`/api/scan/${marketplace}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ groups: groupIds }),
+    });
+
+    const rawText = await res.text();
+    let data = null;
+    try { data = JSON.parse(rawText); } catch { /* resposta não é JSON */ }
+
+    if (!data) {
+      // Acontece quando a Vercel corta a função por tempo (HTML/texto em vez de JSON).
+      throw new Error(
+        res.status === 504 || res.status === 408
+          ? 'A busca demorou mais que o limite do servidor (Vercel) e foi cortada. Clique em buscar de novo — o que já foi salvo não se perde.'
+          : `O servidor respondeu algo inesperado (HTTP ${res.status}). Se acabou de atualizar o sistema, confira se o deploy na Vercel terminou.`
+      );
+    }
+    if (!res.ok) throw new Error(data.error || `Falha na busca (HTTP ${res.status})`);
 
     const found = data.promotionsFound ?? 0;
     const scannedLabel = data.categoriesScanned !== undefined
@@ -430,13 +479,20 @@ async function confirmScan() {
       : `${data.groupsSearched ?? data.productsChecked ?? 0} grupo(s)/produto(s)`;
 
     const noteSuffix = data.note ? ` — ${data.note}` : '';
-    document.getElementById('scanResult').textContent = `${marketplaceName}: ${scannedLabel}, ${found} nova(s)${noteSuffix}` +
-      (data.errors?.length ? ` (${data.errors.length} erro(s) — veja integration_logs)` : '');
+    const errorSuffix = data.errors?.length
+      ? ` (${data.errors.length} erro(s): ${String(data.errors[0]).slice(0, 300)})`
+      : '';
+    scanResult.textContent = `${marketplaceName}: ${scannedLabel}, ${found} nova(s)${noteSuffix}${errorSuffix}`;
+    if (data.errors?.length && found === 0) scanResult.classList.add('error');
 
     closeScanModal();
     await loadPromotions();
   } catch (err) {
+    // O erro aparece no modal E na faixa de resultado do topo (que fica visível depois de fechar).
     msg.textContent = `Erro: ${err.message}`;
+    msg.classList.add('error');
+    scanResult.textContent = `${marketplaceName}: ${err.message}`;
+    scanResult.classList.add('error');
   } finally {
     confirmBtn.disabled = false;
     confirmBtn.textContent = 'Buscar';
