@@ -319,7 +319,7 @@ async function doSend() {
     }
     sentThisRun += 1;
     errorsInRow = 0;
-    log(`✅ ${r.sent.title.slice(0, 70)}${r.sent.marketplace ? ` (${r.sent.marketplace})` : ''} — restam ${r.remaining} na fila`, 'ok');
+    log(`✅ ${r.sent.title.slice(0, 70)}${r.sent.marketplace ? ` (${r.sent.marketplace})` : ''}${r.sent.coupon ? ` · cupom ${r.sent.coupon}` : ''} — restam ${r.remaining} na fila`, 'ok');
     if (sentThisRun >= maxSends) { stopRun(`Meta de ${maxSends} envios atingida.`); return; }
     nextAt = Date.now() + interval * 60000;
   } catch (err) {
@@ -350,7 +350,7 @@ async function openNextWhatsApp() {
       return;
     }
     fillWhatsAppTab(tab, r.message);
-    $('statusBox').innerHTML = `<b>Preparado:</b> ${escapeHtml(r.promotion.title.slice(0, 80))}<br>Restam ${r.remaining} na fila. Escolha o grupo no WhatsApp e toque em enviar.`;
+    $('statusBox').innerHTML = `<b>Preparado:</b> ${escapeHtml(r.promotion.title.slice(0, 80))}${r.promotion.coupon ? ` · cupom <b>${escapeHtml(r.promotion.coupon)}</b>` : ''}<br>Restam ${r.remaining} na fila. Escolha o grupo no WhatsApp e toque em enviar.`;
     log(`📱 Preparado para WhatsApp: ${r.promotion.title.slice(0, 70)}`, 'ok');
     loadAll();
   } catch (err) {
