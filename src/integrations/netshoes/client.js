@@ -129,6 +129,7 @@ async function fetchAndParse(url, headers) {
 
   // Informações para diagnóstico (não atrapalham quem só usa a lista).
   items.totalMatches = Number(xmlTag(rawText, 'TotalMatches')) || 0;
+  items.totalPages = Number(xmlTag(rawText, 'TotalPages')) || 0;
   items.rawSample = items.length ? null : rawText.replace(/\s+/g, ' ').slice(0, 300);
   return items;
 }
@@ -175,9 +176,19 @@ function sanitizeKeyword(keyword) {
     .trim();
 }
 
-async function searchProducts(auth, mid, rawKeyword, { max = 30 } = {}) {
+async function searchProducts(auth, mid, rawKeyword, { max = 100, page = 1 } = {}) {
+  const items = await searchProductsPage(auth, mid, rawKeyword, { max, page });
+  // Página além do fim dos resultados (palavra-chave com poucos produtos): volta pra página 1.
+  if (page > 1 && items.length === 0) {
+    return searchProductsPage(auth, mid, rawKeyword, { max, page: 1 });
+  }
+  return items;
+}
+
+async function searchProductsPage(auth, mid, rawKeyword, { max, page }) {
   const keyword = sanitizeKeyword(rawKeyword) || String(rawKeyword || '').trim();
-  const query = `token=${encodeURIComponent(auth.webServicesToken || '')}&mid=${encodeURIComponent(mid)}&keyword=${encodeURIComponent(keyword)}&max=${max}`;
+  // max = produtos por página (a Rakuten aceita até 100); pagenumber = qual página.
+  const query = `token=${encodeURIComponent(auth.webServicesToken || '')}&mid=${encodeURIComponent(mid)}&keyword=${encodeURIComponent(keyword)}&max=${max}&pagenumber=${page}`;
 
   // Já sabemos qual forma funciona: usa só ela.
   if (auth.strategy) {
