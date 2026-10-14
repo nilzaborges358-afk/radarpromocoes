@@ -91,6 +91,7 @@
       <a href="marketplaces.html">Marketplaces</a>
       <a href="watchlist.html">Lista de vigilância</a>
       <a href="generator.html" class="active">Gerador de Link</a>
+      <a href="coupons.html">Cupons</a>
       <a href="dispatcher.html">Disparador</a>
     </div>
     <a class="logout-link" id="logoutLink">Sair</a>
@@ -101,55 +102,6 @@
     <p class="tagline">Cole o link de qualquer produto e receba o link de afiliado na hora — sem precisar que ele apareça numa busca antes</p>
   </div>
 
-
-  <!-- Cupons do produto -->
-  <div class="card-block">
-    <div class="card-title"><span class="mp-dot" style="background:#5fcb8f;"></span> Cupons do produto</div>
-    <p class="card-sub">Cole o link que o cliente mandou (Mercado Livre) e veja quais dos <b>cupons que você cadastrou</b> valem para esse produto, com o preço final de cada um. Se o Mercado Livre bloquear a leitura do produto, digite o preço.</p>
-    <div class="row">
-      <input type="text" id="cp-url" placeholder="Cole o link do produto (ex: https://www.mercadolivre.com.br/...)" />
-      <input type="text" id="cp-price" placeholder="Preço (opcional)" style="max-width:170px; min-width:120px;" />
-      <button id="cp-btn">Ver cupons</button>
-    </div>
-    <div class="msg" id="cp-msg"></div>
-    <div id="cp-result"></div>
-  </div>
-
-  <!-- Cupons da Netshoes (Rakuten) -->
-  <div class="card-block">
-    <div class="card-title"><span class="mp-dot" style="background:#f5761a;"></span> Cupons da Netshoes (automático)</div>
-    <p class="card-sub">Busca na Rakuten os cupons e ofertas que a Netshoes está divulgando para afiliados, já com o link rastreado com o seu ID. Em cada cupom, &quot;Ver produtos&quot; lista produtos da Netshoes e calcula o preço final com o desconto. <b>Sempre leia a restrição do cupom</b> antes de passar para o cliente: a Rakuten só informa o desconto em texto livre.</p>
-    <div class="row">
-      <button id="ns-btn">Buscar cupons da Netshoes</button>
-    </div>
-    <div class="msg" id="ns-msg"></div>
-    <div id="ns-result"></div>
-  </div>
-
-  <!-- Meus cupons -->
-  <div class="card-block">
-    <div class="card-title"><span class="mp-dot" style="background:#e7b24a;"></span> Cupons que posso divulgar</div>
-    <p class="card-sub">Cadastre os cupons que você encontra e pode passar adiante (campanhas do Mercado Livre, cupons de divulgação etc.). Nada aqui é sobre vender produto seu: é só a sua lista de cupons de comprador, porque o Mercado Livre não tem nenhuma API que liste ou teste esses cupons. Use "Confirmei hoje" depois de testar um cupom no site.</p>
-    <div class="cp-form" id="cp-form">
-      <div><label>Nome do cupom *</label><input type="text" id="f-title" placeholder="Ex: R$30 acima de R$200" /></div>
-      <div><label>Código (vazio = automático)</label><input type="text" id="f-code" placeholder="Ex: ECONOMIZE30" /></div>
-      <div><label>Tipo</label><select id="f-type"><option value="percent">% de desconto</option><option value="fixed">Valor fixo (R$)</option></select></div>
-      <div><label>Valor do desconto *</label><input type="text" id="f-value" placeholder="Ex: 10 ou 30" /></div>
-      <div><label>Desconto máximo (R$)</label><input type="text" id="f-max" placeholder="Ex: 50" /></div>
-      <div><label>Compra mínima (R$)</label><input type="text" id="f-min" placeholder="Ex: 200" /></div>
-      <div><label>Válido até</label><input type="date" id="f-until" /></div>
-      <details class="full" style="margin:0;"><summary style="cursor:pointer; color:var(--accent); font-size:12px;">Restrições avançadas (opcional)</summary>
-        <div class="cp-form" style="margin-top:10px;">
-          <div><label>Categorias (ids MLB..., vírgula)</label><input type="text" id="f-cats" placeholder="Vazio = todas. Ex: MLB1051" /></div>
-          <div><label>Vendedores (ids, vírgula)</label><input type="text" id="f-sellers" placeholder="Vazio = todos" /></div>
-        </div>
-      </details>
-      <div class="full"><label>Observações</label><input type="text" id="f-notes" placeholder="Ex: só no app, 1ª compra, vale 1x por CPF" /></div>
-      <div class="full"><button class="primary" id="f-save">Salvar cupom</button> <button class="small" id="f-cancel" style="display:none;">Cancelar edição</button></div>
-    </div>
-    <div class="msg" id="f-msg"></div>
-    <div class="cp-list" id="cp-all"></div>
-  </div>
 
   <!-- Shopee -->
   <div class="card-block">
