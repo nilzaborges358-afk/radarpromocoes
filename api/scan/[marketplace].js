@@ -3,6 +3,7 @@ const { searchProductOffers, generateShortLink } = require('../../src/integratio
 const netshoesClient = require('../../src/integrations/netshoes/client');
 const { supabaseAdmin } = require('../../src/core/database/supabaseClient');
 const { loadNetshoesCoupons, bestNetshoesCoupon } = require('../../src/core/coupons');
+const { scanRiachuelo } = require('../../src/core/awinScan');
 
 const MIN_DISCOUNT_PCT = 10; // era 15 — baixei pra achar mais resultado em categorias mais de nicho
 
@@ -53,6 +54,7 @@ module.exports = async function handler(req, res) {
   if (slug === 'shopee') return scanShopee(req, res);
   if (slug === 'amazon') return scanAmazon(req, res);
   if (slug === 'netshoes') return scanNetshoes(req, res);
+  if (slug === 'riachuelo') return scanRiachuelo(req, res, { supabaseAdmin, getGroupsParam, mergeGroupsByName, parsePrice, chunk, median, normKey });
   res.status(404).json({ error: `Marketplace "${slug}" não suportado.` });
 };
 
