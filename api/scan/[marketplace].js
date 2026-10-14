@@ -14,6 +14,10 @@ const SHOPEE_SORT_ROTATION = [1, 2, 5];
 // Passou disso, a busca para de abrir novas consultas e avisa quantas ficaram pra próxima.
 const SCAN_BUDGET_MS = 48000;
 const NETSHOES_CONCURRENCY = 3;
+// Quantos produtos pedir por palavra-chave e de quantas páginas sortear. Antes eram só 30 por
+// palavra (sempre os mesmos 30 do topo) — por isso o total parecia "fixo" em ~120 produtos.
+const NETSHOES_PAGE_SIZE = 100;
+const NETSHOES_MAX_PAGE = 3;
 
 // Netshoes: não existe mais um "10% fixo". O produto entra como promoção quando o preço atual
 // está abaixo do preço "normal" dele, qualquer que seja o tamanho da queda (5%, 8%, 23%...).
@@ -312,14 +316,15 @@ async function scanNetshoes(req, res) {
     let skipped = 0;
     let loggedErrors = 0;
     let nextTask = 0;
-    const totals = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0 };
+    const totals = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0 };
 
     async function worker() {
       while (nextTask < tasks.length) {
         const task = tasks[nextTask++];
         if (Date.now() - startedAt > SCAN_BUDGET_MS) { skipped += 1; continue; }
         try {
-          const items = await netshoesClient.searchProducts(auth, mid, task.keyword);
+          const page = 1 + Math.floor(Math.random() * NETSHOES_MAX_PAGE);
+          const items = await netshoesClient.searchProducts(auth, mid, task.keyword, { max: NETSHOES_PAGE_SIZE, page });
           done += 1;
           itemsSeen += items.length;
           if (!items.length && items.rawSample && emptySamples.length < 1) emptySamples.push(`"${task.keyword}": ${items.rawSample}`);
@@ -331,6 +336,8 @@ async function scanNetshoes(req, res) {
           if (!totals.sample) totals.sample = result.stats.sample;
           totals.withHistory += result.stats.withHistory;
           totals.newlyTracked += result.stats.newlyTracked;
+          totals.withFeedDiscount += result.stats.withFeedDiscount;
+          totals.parsedItems += result.stats.parsedItems;
           if (!totals.historyError && result.stats.historyError) totals.historyError = result.stats.historyError;
         } catch (err) {
           errors.push(`${task.group.name} / "${task.keyword}": ${err.message}`);
@@ -360,10 +367,13 @@ async function scanNetshoes(req, res) {
       parts.push(`Todas as buscas da Netshoes falharam. ${errors[0]}${tokenError ? ` (login automático: ${tokenError})` : ''}`);
     } else if (itemsSeen === 0) {
       parts.push(`A Netshoes não devolveu nenhum produto para ${done} palavra(s)-chave.${emptySamples.length ? ` Exemplo da resposta recebida — ${emptySamples[0]}` : ''}`);
-    } else if (found === 0 && totals.newlyTracked > 0 && totals.withHistory === 0) {
-      parts.push(`A Netshoes devolveu ${itemsSeen} produto(s) e a Netshoes só informa o preço atual (sem preço "de"). Registrei o preço de ${totals.newlyTracked} produto(s) agora: a comparação com os últimos ${NETSHOES_HISTORY_DAYS} dias começa nas próximas buscas, quando o preço de algum deles mudar. Busque de novo em algumas horas ou amanhã.`);
     } else if (found === 0) {
-      parts.push(`A Netshoes devolveu ${itemsSeen} produto(s), ${withDiscount ? `${withDiscount} com desconto, mas todos já estavam salvos` : `mas nenhum com preço abaixo do normal (queda mínima de ${NETSHOES_MIN_DROP_PCT}%, comparando com os últimos ${NETSHOES_HISTORY_DAYS} dias)`}. ${totals.withHistory} produto(s) já tinham histórico de preço; maior queda vista: ${Math.round(totals.maxDiscount)}%.`);
+      const diag = `Diagnóstico: ${totals.parsedItems} produto(s) lidos, ${totals.withFeedDiscount} com preço "de" maior que o atual no feed da Netshoes, ${totals.withHistory} com histórico de preço (${totals.newlyTracked} registrados agora); maior queda vista: ${Math.round(totals.maxDiscount)}%.${totals.sample ? ` Exemplo da resposta: ${totals.sample}.` : ''}`;
+      if (withDiscount) {
+        parts.push(`A Netshoes devolveu ${itemsSeen} produto(s); ${withDiscount} em promoção, mas todos já estavam salvos no painel. ${diag}`);
+      } else {
+        parts.push(`A Netshoes devolveu ${itemsSeen} produto(s) pela busca de palavra-chave (a busca traz produtos do catálogo, não só os em promoção), mas nenhum está abaixo do preço normal (queda mínima de ${NETSHOES_MIN_DROP_PCT}%). ${diag}`);
+      }
     }
     if (totals.historyError) parts.push(`Histórico de preços indisponível (${totals.historyError}). Rode o arquivo 0003_promotion_price_history.sql no Supabase; enquanto isso a comparação usa só o preço "de" da Netshoes.`);
     if (skipped) parts.push(`${skipped} palavra(s)-chave ficaram para a próxima busca (limite de tempo). Clique em buscar de novo para continuar.`);
@@ -383,12 +393,20 @@ async function scanNetshoes(req, res) {
   }
 }
 
-// Converte "199.90" ou "199,90" em número.
+// Converte "199.90", "199,90", "1.299,90" ou "1,299.90" em número.
+// O último separador (ponto ou vírgula) é o decimal; o outro é separador de milhar.
 function parsePrice(value) {
   if (value === null || value === undefined || value === '') return null;
-  let s = String(value).trim();
-  if (s.includes(',') && s.includes('.')) s = s.replace(/\./g, '').replace(',', '.');
-  else if (s.includes(',')) s = s.replace(',', '.');
+  let s = String(value).replace(/[^\d.,-]/g, '');
+  if (!s) return null;
+  const lastDot = s.lastIndexOf('.');
+  const lastComma = s.lastIndexOf(',');
+  if (lastDot >= 0 && lastComma >= 0) {
+    if (lastComma > lastDot) s = s.replace(/\./g, '').replace(',', '.');
+    else s = s.replace(/,/g, '');
+  } else if (lastComma >= 0) {
+    s = s.replace(',', '.');
+  }
   const n = parseFloat(s);
   return Number.isFinite(n) ? n : null;
 }
@@ -414,7 +432,7 @@ function median(values) {
 //                  (se o produto ainda não tem histórico: o preço "de" da Netshoes)
 //   é promoção quando preço atual < preço normal em pelo menos NETSHOES_MIN_DROP_PCT.
 async function processNetshoesItems(items, marketplaceId, group, publisherId, mid, seenUrls) {
-  const stats = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0 };
+  const stats = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0 };
 
   // 1) Lê os itens (um por link, mesmo que apareça em mais de uma palavra-chave)
   const parsed = [];
@@ -430,6 +448,7 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
     seenUrls.add(productUrl);
     parsed.push({ title, productUrl, price, regularPrice, imageUrl: item.imageUrl || item.image || null });
   }
+  stats.parsedItems = parsed.length;
   if (!parsed.length) return { found: 0, withDiscount: 0, stats };
 
   // 2) Histórico de preços desses links nos últimos 7 dias
@@ -457,9 +476,20 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
   let withDiscount = 0;
   for (const c of parsed) {
     const h = historyByUrl.get(c.productUrl);
-    let reference = null;
-    if (h && h.prices.length) { reference = median(h.prices); stats.withHistory += 1; }
-    else if (c.regularPrice && c.regularPrice > c.price) reference = c.regularPrice;
+    // Duas fontes de "preço normal", vale a MAIOR que seja acima do preço atual:
+    //  a) o preço "de" que a própria Netshoes informa no feed (price > saleprice);
+    //  b) a mediana dos preços que o sistema registrou nos últimos 7 dias.
+    // Antes, se o produto já tinha histórico, o preço "de" do feed era IGNORADO — e como o
+    // histórico guardava o preço já promocional, a queda sempre dava 0%.
+    const feedRef = c.regularPrice && c.regularPrice > c.price ? c.regularPrice : null;
+    if (feedRef) stats.withFeedDiscount += 1;
+    let historyRef = null;
+    if (h && h.prices.length) {
+      stats.withHistory += 1;
+      const med = median(h.prices);
+      if (med > c.price) historyRef = med;
+    }
+    const reference = Math.max(feedRef || 0, historyRef || 0) || null;
 
     const drop = reference && reference > c.price ? ((reference - c.price) / reference) * 100 : 0;
     if (drop > 0) {
