@@ -127,6 +127,9 @@ async function checkCoupons() {
     const r = await couponApi({ action: 'coupons_check', url, price });
     let html = '';
 
+    if (r.product && r.product.source === 'page') {
+      html += `<div class="cp-note" style="color:var(--accent)">A API do Mercado Livre bloqueou esse produto, então li os dados pela página pública. Preço, título e imagem costumam vir certos; categoria e vendedor podem não vir — nesse caso os cupons restritos aparecem com um aviso "confira".</div>`;
+    }
     if (r.product) {
       const p = r.product;
       html += `<div class="cp-product">
