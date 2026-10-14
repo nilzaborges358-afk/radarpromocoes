@@ -140,7 +140,8 @@ async function checkCoupons() {
         </div>
       </div>`;
     } else if (r.productError) {
-      html += `<div class="cp-note" style="color:var(--bad)">Não consegui ler o produto: ${esc(r.productError)}${r.priceUsed ? '' : ' Informe o preço no campo ao lado para eu calcular o valor final.'}</div>`;
+      html += `<div class="cp-note" style="color:var(--accent)"><b>O Mercado Livre bloqueia a leitura automática desse produto.</b> Digite o preço do produto no campo ao lado e clique em "Ver cupons" de novo para eu calcular o valor final com cada cupom.
+        <details class="cp-excluded"><summary>detalhes técnicos</summary><div style="margin-top:6px; word-break:break-all;">${esc(r.productError)}</div></details></div>`;
     } else if (!r.marketplace) {
       html += `<div class="cp-note">Não reconheci o marketplace desse link; mostrei os cupons do Mercado Livre. Preencha o preço para calcular o valor final.</div>`;
     } else if (r.marketplace !== 'mercadolivre') {
@@ -148,7 +149,7 @@ async function checkCoupons() {
     }
 
     if (!r.totalCoupons) {
-      html += `<div class="cp-note">Você ainda não cadastrou nenhum cupom para esse marketplace. Use o bloco "Meus cupons" logo abaixo.</div>`;
+      html += `<div class="cp-note">Você ainda não cadastrou nenhum cupom. Use o bloco "Cupons que posso divulgar" logo abaixo.</div>`;
     } else if (!r.applicable.length) {
       html += `<div class="cp-note"><b>Nenhum dos seus cupons vale para esse produto.</b> Veja abaixo o motivo de cada um.</div>`;
     } else {
