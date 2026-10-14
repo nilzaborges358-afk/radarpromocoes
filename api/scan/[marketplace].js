@@ -2,6 +2,7 @@ const { getSalePrice } = require('../../src/integrations/mercadolivre/client');
 const { searchProductOffers, generateShortLink } = require('../../src/integrations/shopee/client');
 const netshoesClient = require('../../src/integrations/netshoes/client');
 const { supabaseAdmin } = require('../../src/core/database/supabaseClient');
+const { loadNetshoesCoupons, bestNetshoesCoupon } = require('../../src/core/coupons');
 
 const MIN_DISCOUNT_PCT = 10; // era 15 — baixei pra achar mais resultado em categorias mais de nicho
 
@@ -34,8 +35,13 @@ const NETSHOES_HISTORY_MIN_GAP_HOURS = 6; // não grava o mesmo produto de novo 
 // em toda busca, sem nunca ter havido queda real. Por isso a Shopee agora usa o mesmo método da
 // Netshoes: só é promoção quando o preço ATUAL está abaixo do que o sistema já viu nos últimos 7 dias.
 const SHOPEE_MIN_DROP_PCT = 5;              // queda real mínima contra o histórico
-const SHOPEE_ACCEPT_LISTED_DISCOUNT = false; // true = aceita também o "desconto de tabela" (sem prova de queda)
-const SHOPEE_LISTED_MIN_PCT = 30;           // usado só se a linha acima for true
+const SHOPEE_ACCEPT_LISTED_DISCOUNT = true;  // true = aceita também o "desconto de tabela" (marcado como tal; false = só queda comprovada)
+const SHOPEE_LISTED_MIN_PCT = 30;           // desconto de tabela mínimo para entrar (usado só se a linha acima for true)
+
+// Netshoes por CUPOM: o feed da Rakuten não informa promoção de produto, mas informa os cupons ativos.
+// Produto + cupom válido para ele = oferta real ("R$ X na loja, R$ Y com o cupom CÓDIGO").
+const NETSHOES_COUPON_MIN_PCT = 5;          // desconto mínimo do cupom para virar oferta
+const NETSHOES_COUPON_MAX_PER_SCAN = 20;    // teto de ofertas por cupom em cada busca (cupom do site todo vale pra tudo)
 
 // GET  /api/scan/mercadolivre?groups=id1,id2,none
 // POST /api/scan/mercadolivre   { groups: ['id1','id2','none'] }   (usado pelo painel — não tem limite de tamanho de URL)
@@ -284,6 +290,18 @@ async function scanNetshoes(req, res) {
       tokenError = err.message;
     }
 
+    // Cupons ativos da Netshoes (para montar ofertas "produto + cupom"). Falha aqui não derruba a busca.
+    let couponList = [];
+    let couponNote = null;
+    try {
+      const loaded = await loadNetshoesCoupons({ auth, mid, tokenError });
+      if (loaded.error) couponNote = loaded.error;
+      else couponList = loaded.coupons.filter((c) => c.code);
+    } catch (err) {
+      couponNote = err.message;
+    }
+    const couponCtx = { list: couponList, left: NETSHOES_COUPON_MAX_PER_SCAN, deals: 0 };
+
     const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
     const groupsParam = getGroupsParam(req);
     const selectedRows = groupsParam ? (allGroups || []).filter((g) => groupsParam.includes(g.id)) : allGroups;
@@ -336,7 +354,7 @@ async function scanNetshoes(req, res) {
           done += 1;
           itemsSeen += items.length;
           if (!items.length && items.rawSample && emptySamples.length < 1) emptySamples.push(`"${task.keyword}": ${items.rawSample}`);
-          const result = await processNetshoesItems(items, marketplace.id, task.group, publisherId, mid, seenUrls);
+          const result = await processNetshoesItems(items, marketplace.id, task.group, publisherId, mid, seenUrls, couponCtx);
           found += result.found;
           withDiscount += result.withDiscount;
           totals.withSale += result.stats.withSale;
@@ -371,6 +389,9 @@ async function scanNetshoes(req, res) {
       await supabaseAdmin.from('promotion_price_history').delete().eq('marketplace_id', marketplace.id).lt('checked_at', keepSince);
     }
 
+    const couponDiag = couponNote
+      ? ` Cupons da Netshoes: não consegui ler (${couponNote}).`
+      : ` Cupons ativos com código: ${couponList.length}${couponCtx.deals ? `; ${couponCtx.deals} oferta(s) criada(s) por cupom` : ''}.`;
     const attempted = done + errors.length;
     const allFailed = attempted > 0 && errors.length === attempted;
     const parts = [];
@@ -385,11 +406,13 @@ async function scanNetshoes(req, res) {
         : '';
       const diag = `Diagnóstico: ${totals.parsedItems} produto(s) lidos, ${totals.withFeedDiscount} com preço "de" maior que o atual no feed da Netshoes, ${totals.withHistory} com histórico de preço (${totals.newlyTracked} registrados agora; histórico mais antigo: ${historyDays} dia(s)); ${totals.changed} já tiveram o preço alterado (${totals.rose} subiram); maior queda vista: ${Math.round(totals.maxDiscount)}%.${frozen}${totals.sample ? ` Exemplo da resposta: ${totals.sample}.` : ''}`;
       if (withDiscount) {
-        parts.push(`A Netshoes devolveu ${itemsSeen} produto(s); ${withDiscount} em promoção, mas todos já estavam salvos no painel. ${diag}`);
+        parts.push(`A Netshoes devolveu ${itemsSeen} produto(s); ${withDiscount} em promoção, mas todos já estavam salvos no painel. ${diag}${couponDiag}`);
       } else {
-        parts.push(`A Netshoes devolveu ${itemsSeen} produto(s) pela busca de palavra-chave (a busca traz produtos do catálogo, não só os em promoção), mas nenhum está abaixo do preço normal (queda mínima de ${NETSHOES_MIN_DROP_PCT}%). ${diag}`);
+        parts.push(`A Netshoes devolveu ${itemsSeen} produto(s) pela busca de palavra-chave (a busca traz produtos do catálogo, não só os em promoção), mas nenhum está abaixo do preço normal (queda mínima de ${NETSHOES_MIN_DROP_PCT}%) nem tem cupom que valha para ele. ${diag}${couponDiag}`);
       }
     }
+    if (found > 0 && couponNote) parts.push(`Aviso: não consegui ler os cupons da Netshoes (${couponNote}).`);
+    if (found > 0 && couponCtx.deals) parts.push(`${couponCtx.deals} das ofertas vieram de cupom ativo da Netshoes.`);
     if (totals.historyError) parts.push(`Histórico de preços indisponível (${totals.historyError}). Rode o arquivo 0003_promotion_price_history.sql no Supabase; enquanto isso a comparação usa só o preço "de" da Netshoes.`);
     if (skipped) parts.push(`${skipped} palavra(s)-chave ficaram para a próxima busca (limite de tempo). Clique em buscar de novo para continuar.`);
     if (!allFailed && errors.length) parts.push(`${errors.length} palavra(s)-chave falharam: ${errors[0]}`);
@@ -446,7 +469,7 @@ function median(values) {
 //   preço normal = mediana dos preços registrados nos últimos 7 dias
 //                  (se o produto ainda não tem histórico: o preço "de" da Netshoes)
 //   é promoção quando preço atual < preço normal em pelo menos NETSHOES_MIN_DROP_PCT.
-async function processNetshoesItems(items, marketplaceId, group, publisherId, mid, seenUrls) {
+async function processNetshoesItems(items, marketplaceId, group, publisherId, mid, seenUrls, couponCtx) {
   const stats = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0, changed: 0, rose: 0, oldestMs: 0 };
 
   // 1) Lê os itens (um por link, mesmo que apareça em mais de uma palavra-chave)
@@ -490,6 +513,7 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
 
   // 3) Decide quem está em promoção
   const candidates = [];
+  const couponCandidates = [];
   let withDiscount = 0;
   for (const c of parsed) {
     const h = historyByUrl.get(c.productUrl);
@@ -516,10 +540,32 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
       stats.withSale += 1;
       stats.maxDiscount = Math.max(stats.maxDiscount, drop);
     }
-    if (drop <= 0 || drop < NETSHOES_MIN_DROP_PCT) continue;
+    if (drop <= 0 || drop < NETSHOES_MIN_DROP_PCT) {
+      // Sem queda de preço: vê se algum cupom ativo vale para este produto (oferta "produto + cupom").
+      if (couponCtx && couponCtx.list.length) {
+        const best = bestNetshoesCoupon(couponCtx.list, { title: c.title, price: c.price, category: null });
+        if (best) {
+          const pct = (best.discount / c.price) * 100;
+          if (pct >= NETSHOES_COUPON_MIN_PCT) {
+            couponCandidates.push({ ...c, regularPrice: c.price, price: best.finalPrice, discountRate: Number(pct.toFixed(2)), source: 'netshoes_coupon', _pct: pct });
+          }
+        }
+      }
+      continue;
+    }
 
     withDiscount += 1;
-    candidates.push({ ...c, regularPrice: reference, discountRate: Number(drop.toFixed(2)) });
+    candidates.push({ ...c, regularPrice: reference, discountRate: Number(drop.toFixed(2)), source: 'netshoes_rakuten_api' });
+  }
+
+  // Ofertas por cupom: as de maior desconto primeiro, respeitando o teto da busca inteira.
+  if (couponCandidates.length && couponCtx.left > 0) {
+    couponCandidates.sort((a, b) => b._pct - a._pct);
+    const take = couponCandidates.slice(0, couponCtx.left);
+    couponCtx.left -= take.length;
+    couponCtx.deals += take.length;
+    withDiscount += take.length;
+    candidates.push(...take);
   }
 
   // 4) Registra o preço de hoje no histórico (só quem não foi registrado nas últimas 6h)
@@ -568,8 +614,9 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
         current_price: c.price,
         previous_price: c.regularPrice,
         discount_rate: c.discountRate,
-        source: 'netshoes_rakuten_api',
+        source: c.source || 'netshoes_rakuten_api',
         status: 'PENDING',
+        last_seen_at: now,
         affiliate_url: netshoesClient.buildAffiliateLink(publisherId, mid, c.productUrl),
         affiliate_url_added_at: now,
       });
@@ -588,6 +635,7 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
         current_price: c.price,
         previous_price: c.regularPrice,
         discount_rate: c.discountRate,
+        source: c.source || 'netshoes_rakuten_api',
         watch_group_id: existing.watch_group_id || group.id,
         last_seen_at: now,
       })
@@ -628,7 +676,7 @@ async function scanShopee(req, res) {
     let skipped = 0;
     const errors = [];
     const seenUrls = new Set();
-    const totals = { checked: 0, listedOnly: 0, withHistory: 0, trackedNow: 0, maxDrop: 0, changed: 0, historyError: null };
+    const totals = { checked: 0, updated: 0, listedOnly: 0, withHistory: 0, trackedNow: 0, maxDrop: 0, changed: 0, historyError: null };
 
     for (const group of groups || []) {
       try {
@@ -650,6 +698,7 @@ async function scanShopee(req, res) {
           const offers = await searchProductOffers(creds.client_id, creds.client_secret, keyword, { limit: perKeywordLimit, sortType, page });
           const r = await processShopeeOffers(offers, marketplace.id, group, keyword, creds, seenUrls);
           found += r.found;
+          totals.updated += r.updated;
           totals.checked += r.checked;
           totals.listedOnly += r.listedOnly;
           totals.withHistory += r.withHistory;
@@ -675,8 +724,10 @@ async function scanShopee(req, res) {
     }
 
     const parts = [];
-    if (found === 0 && totals.checked > 0) {
-      parts.push(`A Shopee devolveu ${totals.checked} produto(s), mas nenhum caiu de preço de verdade (queda mínima de ${SHOPEE_MIN_DROP_PCT}% contra o que já vi nos últimos ${NETSHOES_HISTORY_DAYS} dias). Em ${totals.listedOnly} havia só "desconto" de preço de tabela, que a Shopee informa sem prova de promoção, e por isso foram ignorados. ${totals.trackedNow} passaram a ser acompanhados agora e ${totals.withHistory} já tinham histórico (${totals.changed} com preço diferente do histórico). Rode a busca de novo nos próximos dias.`);
+    if (found === 0 && totals.updated > 0) {
+      parts.push(`Nenhuma promoção nova; ${totals.updated} já existente(s) no painel foi(ram) atualizada(s) com o preço e o desconto de agora.`);
+    } else if (found === 0 && totals.checked > 0) {
+      parts.push(`A Shopee devolveu ${totals.checked} produto(s), mas nenhum caiu de preço de verdade (queda mínima de ${SHOPEE_MIN_DROP_PCT}% contra o que já vi nos últimos ${NETSHOES_HISTORY_DAYS} dias)${SHOPEE_ACCEPT_LISTED_DISCOUNT ? ` nem tinha desconto de tabela de pelo menos ${SHOPEE_LISTED_MIN_PCT}%` : `. Em ${totals.listedOnly} havia só "desconto" de preço de tabela, que a Shopee informa sem prova de promoção, e por isso foram ignorados`}. ${totals.trackedNow} passaram a ser acompanhados agora e ${totals.withHistory} já tinham histórico (${totals.changed} com preço diferente do histórico). Rode a busca de novo nos próximos dias.`);
     }
     if (totals.historyError) parts.push(`Histórico de preços indisponível (${totals.historyError}): sem ele não dá para provar queda de preço, então nada foi salvo como promoção.`);
     if (skipped) parts.push(`${skipped} palavra(s)-chave ficaram para a próxima busca (limite de tempo).`);
@@ -715,7 +766,7 @@ function titleMatchesKeyword(title, keyword) {
 //   é promoção quando o preço atual está abaixo dele em pelo menos SHOPEE_MIN_DROP_PCT.
 // O priceDiscountRate da Shopee (preço de tabela) NÃO conta como prova — ver comentário no topo do arquivo.
 async function processShopeeOffers(offers, marketplaceId, group, keyword, creds, seenUrls) {
-  const stats = { found: 0, checked: 0, listedOnly: 0, withHistory: 0, trackedNow: 0, maxDrop: 0, changed: 0, historyError: null };
+  const stats = { found: 0, updated: 0, checked: 0, listedOnly: 0, withHistory: 0, trackedNow: 0, maxDrop: 0, changed: 0, historyError: null };
 
   // 1) Lê as ofertas (descarta título sem relação com a busca e links repetidos)
   const parsed = [];
@@ -774,7 +825,7 @@ async function processShopeeOffers(offers, marketplaceId, group, keyword, creds,
     if (drop < SHOPEE_MIN_DROP_PCT) {
       // Sem queda comprovada. Só aceita o "desconto de tabela" se o dono ligou essa opção.
       if (c.listedRate >= MIN_DISCOUNT_PCT) stats.listedOnly += 1;
-      if (SHOPEE_ACCEPT_LISTED_DISCOUNT && !(h && h.prices.length) && c.listedRate >= SHOPEE_LISTED_MIN_PCT) {
+      if (SHOPEE_ACCEPT_LISTED_DISCOUNT && c.listedRate >= SHOPEE_LISTED_MIN_PCT) {
         reference = Number((c.price / (1 - c.listedRate / 100)).toFixed(2));
         drop = c.listedRate;
         source = 'shopee_listed_price';
@@ -823,10 +874,12 @@ async function processShopeeOffers(offers, marketplaceId, group, keyword, creds,
           current_price: c.price,
           previous_price: c.previousPrice,
           discount_rate: c.discountRate,
+          source: c.source,
           watch_group_id: existing.watch_group_id || group.id,
           last_seen_at: now,
         })
         .eq('id', existing.id);
+      stats.updated += 1;
       continue;
     }
 
@@ -852,6 +905,7 @@ async function processShopeeOffers(offers, marketplaceId, group, keyword, creds,
       discount_rate: c.discountRate,
       source: c.source,
       status: 'PENDING',
+      last_seen_at: now,
       affiliate_url: affiliateUrl,
       affiliate_url_added_at: affiliateUrl ? now : null,
     });
