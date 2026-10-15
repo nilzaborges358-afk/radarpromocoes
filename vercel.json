@@ -1,6 +1,13 @@
 {
   "functions": {
-    "api/scan/*.js": { "maxDuration": 60 },
-    "api/quicklink.js": { "maxDuration": 30 }
+    "api/scan/*.js": {
+      "maxDuration": 60
+    },
+    "api/quicklink.js": {
+      "maxDuration": 30
+    },
+    "api/dispatch.js": {
+      "maxDuration": 30
+    }
   }
 }
