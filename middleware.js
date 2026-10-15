@@ -22,6 +22,10 @@ function isPublicPath(url) {
   // Só libera o callback de verdade (precisa do "code" que o Mercado Livre gera) —
   // iniciar o login do zero continua exigindo sessão válida no painel.
   if (url.pathname === '/api/auth/mercadolivre' && url.searchParams.has('code')) return true;
+  // "Relogio" externo do disparador (cron-job.org etc.): so passa com a chave secreta
+  // DISPATCH_CRON_KEY (Environment Variable da Vercel). Sem a variavel, nada e liberado.
+  const cronKey = process.env.DISPATCH_CRON_KEY;
+  if (cronKey && url.pathname === '/api/dispatch' && url.searchParams.has('tick') && url.searchParams.get('key') === cronKey) return true;
   return false;
 }
 
