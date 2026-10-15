@@ -240,6 +240,15 @@ function buildAffiliateLink(publisherId, mid, targetUrl) {
     // se vier um link da própria Rakuten, usa a página real (parâmetro murl)
     if (/linksynergy\.com$/i.test(u.hostname) && u.searchParams.get('murl')) clean = u.searchParams.get('murl');
   } catch { /* mantém como veio */ }
+  // Remove parâmetros de rastreio de outras pessoas/redes (af_*, utm_*, clickid, ran*, pid...)
+  // que vêm colados em links copiados de outros afiliados — senão a comissão pode ir para eles.
+  try {
+    const u = new URL(clean);
+    for (const key of [...u.searchParams.keys()]) {
+      if (/^(af_|utm_|ran)/i.test(key) || /^(clickid|pid|is_retargeting|campaign|gclid|fbclid|sid|u1)$/i.test(key)) u.searchParams.delete(key);
+    }
+    clean = u.toString();
+  } catch { /* mantém como veio */ }
   return `https://click.linksynergy.com/deeplink?id=${encodeURIComponent(id)}&mid=${encodeURIComponent(m)}&murl=${encodeURIComponent(clean)}`;
 }
 
