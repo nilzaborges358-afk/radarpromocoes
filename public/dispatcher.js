@@ -404,17 +404,19 @@ async function verifyQueueUI() {
 // toca um alarme + notificação, e você só abre, escolhe o grupo e envia (1 toque).
 
 function beep() {
+  // Som suave: dois toques graves e curtos, tipo "gota" (sem aquele bipe agudo de alerta).
   try {
     if (!audioCtx) return;
-    [0, 0.25, 0.5].forEach((delay) => {
+    const t0 = audioCtx.currentTime;
+    [[392, 0], [523.25, 0.32]].forEach(([freq, delay]) => { // sol -> do
       const o = audioCtx.createOscillator();
       const g = audioCtx.createGain();
-      o.type = 'sine'; o.frequency.value = 880;
-      g.gain.setValueAtTime(0.0001, audioCtx.currentTime + delay);
-      g.gain.exponentialRampToValueAtTime(0.4, audioCtx.currentTime + delay + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + delay + 0.2);
+      o.type = 'sine'; o.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, t0 + delay);
+      g.gain.exponentialRampToValueAtTime(0.12, t0 + delay + 0.04);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + delay + 1.1);
       o.connect(g); g.connect(audioCtx.destination);
-      o.start(audioCtx.currentTime + delay); o.stop(audioCtx.currentTime + delay + 0.22);
+      o.start(t0 + delay); o.stop(t0 + delay + 1.2);
     });
   } catch { /* sem áudio: segue */ }
 }
@@ -422,7 +424,7 @@ function beep() {
 function startAlarm(title) {
   stopAlarm();
   beep();
-  waAlarmTimer = setInterval(beep, 6000); // repete até você abrir
+  waAlarmTimer = setInterval(beep, 20000); // repete a cada 20s até você abrir
   const original = document.title;
   let on = false;
   waTitleTimer = setInterval(() => { on = !on; document.title = on ? '🔔 ENVIAR AGORA!' : original; }, 800);
