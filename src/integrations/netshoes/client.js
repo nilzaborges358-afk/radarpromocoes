@@ -14,8 +14,11 @@ const REQUEST_TIMEOUT_MS = 8000;
  * escopo, a mensagem de erro dela aparece nos logs e eu ajusto.
  */
 async function getAccessToken(clientId, clientSecret, scope) {
+  // O "scope" da Rakuten é o SID NUMÉRICO da conta. Se o campo guardar o ID de link
+  // (letras e números misturados), não manda scope — senão a Rakuten recusa o token.
+  const useScope = scope && /^\d+$/.test(String(scope).trim());
   const body = { grant_type: 'client_credentials' };
-  if (scope) body.scope = String(scope);
+  if (useScope) body.scope = String(scope).trim();
 
   const res = await fetch(`${API_BASE}/token`, {
     method: 'POST',
@@ -228,7 +231,22 @@ async function searchProductsPage(auth, mid, rawKeyword, { max, page }) {
  * https://click.linksynergy.com/deeplink?id={publisherId}&mid={mid}&murl={url}
  */
 function buildAffiliateLink(publisherId, mid, targetUrl) {
-  return `https://click.linksynergy.com/deeplink?id=${encodeURIComponent(publisherId)}&mid=${encodeURIComponent(mid)}&murl=${encodeURIComponent(targetUrl)}`;
+  const id = String(publisherId || '').trim();
+  const m = String(mid || '').trim();
+  // Sempre manda a URL limpa do produto (sem "?" de rastreio de outras redes).
+  let clean = String(targetUrl || '').trim();
+  try {
+    const u = new URL(clean);
+    // se vier um link da própria Rakuten, usa a página real (parâmetro murl)
+    if (/linksynergy\.com$/i.test(u.hostname) && u.searchParams.get('murl')) clean = u.searchParams.get('murl');
+  } catch { /* mantém como veio */ }
+  return `https://click.linksynergy.com/deeplink?id=${encodeURIComponent(id)}&mid=${encodeURIComponent(m)}&murl=${encodeURIComponent(clean)}`;
+}
+
+// O "id" do deep link da Rakuten é o ID de link do publisher (ex: kZWqNv3DKnE — letras e números
+// misturados, ~11 caracteres), e NÃO o SID numérico da conta (ex: 4758523).
+function publisherIdLooksNumeric(publisherId) {
+  return /^\d+$/.test(String(publisherId || '').trim());
 }
 
 
@@ -342,4 +360,4 @@ async function fetchCoupons(auth, mid, { page = 1, perPage = 100 } = {}) {
   throw new Error(failures.length ? failures.join(' | ') : 'nenhum token da Rakuten disponível para buscar cupons');
 }
 
-module.exports = { getAccessToken, searchProducts, buildAffiliateLink, parseProductSearchXml, sanitizeKeyword, fetchCoupons, parseCouponXml };
+module.exports = { getAccessToken, searchProducts, buildAffiliateLink, publisherIdLooksNumeric, parseProductSearchXml, sanitizeKeyword, fetchCoupons, parseCouponXml };
