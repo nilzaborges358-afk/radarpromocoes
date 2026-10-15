@@ -231,7 +231,7 @@ async function refreshQueue() {
       $('queueInfo').textContent = 'Fila vazia: nenhuma promoção com link de afiliado, vista nos últimos 3 dias, que ainda não tenha ido para esse destino. Rode uma busca no Painel geral.';
     } else {
       const n = r.next;
-      $('queueInfo').textContent = `Na fila: ${r.count}. Próxima: ${n.title.slice(0, 70)} — R$ ${Number(n.price).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}${n.discount ? ` (${Math.round(n.discount)}% OFF)` : ''}${n.marketplace ? ` · ${n.marketplace}` : ''}`;
+      $('queueInfo').textContent = `Na fila: ${r.count}. Próxima: ${n.title.slice(0, 70)} — R$ ${Number(n.price).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${n.discount ? ` (${Math.round(n.discount)}% OFF)` : ''}${n.marketplace ? ` · ${n.marketplace}` : ''}`;
     }
   } catch (err) {
     $('queueInfo').textContent = `Erro: ${err.message}`;
