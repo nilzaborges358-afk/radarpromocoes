@@ -100,7 +100,26 @@ async function generateShortLink(appId, appSecret, originUrl, subId) {
   return data?.generateShortLink?.shortLink || null;
 }
 
+/**
+ * Consulta UM anúncio pelo itemId (usado antes de disparar, para confirmar que ainda existe).
+ * Retorna o nó do produto ou null se a Shopee não devolver mais esse item.
+ */
+async function getProductOffer(appId, appSecret, itemId) {
+  if (!/^\d+$/.test(String(itemId))) throw new Error('itemId inválido');
+  const query = `
+    query {
+      productOfferV2(itemId: ${itemId}, limit: 1) {
+        nodes { itemId productName priceMin productLink }
+      }
+    }
+  `;
+  const data = await graphqlRequest(appId, appSecret, query, {});
+  const nodes = data?.productOfferV2?.nodes || [];
+  return nodes.find((n) => String(n.itemId) === String(itemId)) || null;
+}
+
 module.exports = {
+  getProductOffer,
   searchProductOffers,
   generateShortLink,
 };
