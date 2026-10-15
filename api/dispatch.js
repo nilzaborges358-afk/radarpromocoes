@@ -446,7 +446,7 @@ function parsePrice(value) {
     s = s.replace(',', '.');
   }
   const n = parseFloat(s);
-  return Number.isFinite(n) ? n : null;
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : null; // sempre 2 casas
 }
 
 function chunk(list, size) {
@@ -589,7 +589,7 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
   for (const part of chunk(candidates.map((c) => c.productUrl), 10)) {
     const { data, error } = await supabaseAdmin
       .from('promotions')
-      .select('id, original_url, watch_group_id, current_price')
+      .select('id, original_url, watch_group_id, current_price, status')
       .eq('marketplace_id', marketplaceId)
       .in('original_url', part);
     if (error) throw new Error(`banco de dados: ${error.message}`);
@@ -638,6 +638,8 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
         source: c.source || 'netshoes_rakuten_api',
         watch_group_id: existing.watch_group_id || group.id,
         last_seen_at: now,
+        // Refaz o link de afiliado (corrige links antigos gerados com ID errado), exceto os que você já marcou como afiliados.
+        ...(existing.status === 'AFFILIATED' ? {} : { affiliate_url: netshoesClient.buildAffiliateLink(publisherId, mid, c.productUrl) }),
       })
       .eq('id', existing.id)));
   }
