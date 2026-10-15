@@ -109,8 +109,8 @@ function renderForm(slug) {
   if (slug === 'netshoes') {
     return `
       <div class="field">
-        <label>Publisher ID (Rakuten Advertising)</label>
-        <input type="text" id="netshoes-tag" placeholder="Ex: seuID123" />
+        <label>ID do link (Publisher ID do Deep Link — letras e números)</label>
+        <input type="text" id="netshoes-tag" placeholder="Ex: kZWqNv3DKnE (valor de id= no link gerado pela Rakuten)" />
       </div>
       <div class="field">
         <label>MID da Netshoes (Advertiser ID)</label>
@@ -132,7 +132,7 @@ function renderForm(slug) {
         <button class="primary" onclick="saveCredentials('netshoes')">Salvar credenciais</button>
       </div>
       <div class="save-msg" id="netshoes-save-msg"></div>
-      <p class="soon-note" style="margin-top:10px;">O Publisher ID e o MID você encontra no seu painel da Rakuten Advertising, depois de aprovado no programa "Parceiro Netshoes".</p>
+      <p class="soon-note" style="margin-top:10px;">O ID do link é o valor que aparece depois de id= num link gerado em Links > Deep Link Creator (NÃO é o número da conta, tipo 4758523). O MID você encontra no seu painel da Rakuten Advertising, depois de aprovado no programa "Parceiro Netshoes".</p>
     `;
   }
 
