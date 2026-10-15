@@ -26,6 +26,7 @@ async function generateLink(slug) {
     linkText.textContent = data.affiliateUrl;
     linkText.dataset.link = data.affiliateUrl;
     resultBox.classList.add('show');
+    if (data.warning) { msg.textContent = data.warning; msg.className = 'msg error'; }
   } catch (err) {
     msg.textContent = `Erro: ${err.message}`;
     msg.className = 'msg error';
