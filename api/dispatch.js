@@ -300,13 +300,12 @@ async function listDestinations(res) {
   const { data, error } = await supabaseAdmin.from('dispatch_destinations').select('id, name, platform, chat_id, daily_limit, created_at').order('created_at');
   if (error) return fail(res, 500, dbError(error));
   const since = isoAgo(DAY);
-  const out = [];
-  for (const d of data || []) {
-    const { count } = await supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true })
-      .eq('destination_id', d.id).eq('skipped', false).gte('sent_at', since);
-    out.push({ ...d, sentLast24h: count || 0 });
-  }
-  const payload = await jobsPayload();
+  const [counts, payload] = await Promise.all([
+    Promise.all((data || []).map((d) => supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true })
+      .eq('destination_id', d.id).eq('skipped', false).gte('sent_at', since).then((r) => r.count || 0, () => 0))),
+    jobsPayload(),
+  ]);
+  const out = (data || []).map((d, i) => ({ ...d, sentLast24h: counts[i] }));
   res.status(200).json({ destinations: out, jobs: payload.jobs, now: payload.now });
 }
 
