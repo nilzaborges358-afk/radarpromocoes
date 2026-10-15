@@ -1,5 +1,5 @@
 const { generateShortLink } = require('../src/integrations/shopee/client');
-const { buildAffiliateLink } = require('../src/integrations/netshoes/client');
+const { buildAffiliateLink, publisherIdLooksNumeric } = require('../src/integrations/netshoes/client');
 const awinClient = require('../src/integrations/awin/client');
 const { getAwinContext } = require('../src/core/awin');
 const { supabaseAdmin } = require('../src/core/database/supabaseClient');
@@ -66,7 +66,10 @@ module.exports = async function handler(req, res) {
         return;
       }
       const link = buildAffiliateLink(creds.extra_credential, creds.extra_credential_2, url);
-      res.status(200).json({ ok: true, affiliateUrl: link });
+      const warning = publisherIdLooksNumeric(creds.extra_credential)
+        ? 'Atenção: o "Publisher ID" salvo é só número (SID). O link da Rakuten costuma exigir o ID de link (letras e números). Se o link der "Invalid Publisher Code", troque em /marketplaces.html pelo id que aparece no link gerado pelo Deep Link Creator da Rakuten.'
+        : null;
+      res.status(200).json({ ok: true, affiliateUrl: link, warning });
       return;
     }
 
