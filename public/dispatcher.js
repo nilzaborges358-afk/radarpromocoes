@@ -1,550 +1,583 @@
-const $ = (id) => document.getElementById(id);
-const MIN_INTERVAL = 2; // minutos — abaixo disso vira spam
+const { supabaseAdmin } = require('../src/core/database/supabaseClient');
+const { getNetshoesContext, loadNetshoesCoupons, bestNetshoesCoupon } = require('../src/core/coupons');
+const { getProductOffer } = require('../src/integrations/shopee/client');
 
-let destinations = [];
-let groups = [];
-let running = false;
-let inFlight = false;
-let nextAt = 0;
-let sentThisRun = 0;
-let errorsInRow = 0;
-let tickTimer = null;
-let wakeLock = null;
-let waRunning = false;
-let waPending = null;
-let waAlarmTimer = null;
-let waTitleTimer = null;
-let audioCtx = null;
-const WA_MIN_INTERVAL = 1; // minutos (WhatsApp assistido: quem envia é você)
+// Disparador de promo--es (Telegram autom-tico / WhatsApp assistido).
+// GET  /api/dispatch                      -> lista destinos
+// POST /api/dispatch { action: ... }      -> create_destination | delete_destination | test | queue | verify | send_next | job_start | job_stop | job_ack | tick
+// Precisa das tabelas dispatch_destinations e dispatch_log (SQL em supabase/migrations/0002_disparador.sql).
 
-function escapeHtml(str) {
-  const d = document.createElement('div');
-  d.textContent = str == null ? '' : String(str);
-  return d.innerHTML;
+const QUEUE_DAYS_SEEN = 3;     // s\u00f3 promo\u00e7\u00f5es vistas pela busca nos \u00faltimos 3 dias
+const NO_REPEAT_DAYS = 14;     // n\u00e3o repete a mesma promo\u00e7\u00e3o no mesmo destino por 2 semanas
+const MIN_GAP_SECONDS = 20;    // trava anti-duplo-clique
+const COUPON_CACHE_MS = 10 * 60 * 1000;
+let couponCache = { at: 0, list: null };
+
+// ---------------- utilit-rios ----------------
+
+const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const money = (n) => Number(n).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const r2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+const isoAgo = (ms) => new Date(Date.now() - ms).toISOString();
+const DAY = 24 * 60 * 60 * 1000;
+
+function fail(res, status, error, extra) {
+  res.status(status).json({ error, ...(extra || {}) });
 }
 
-async function api(body) {
-  const res = await fetch('/api/dispatch', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = new Error(data.error || 'Falha na requisição');
-    err.code = data.code;
-    err.retryAfter = data.retryAfter;
-    throw err;
+function tableMissing(error) {
+  const m = String((error && (error.message || error)) || '');
+  return (error && error.code === '42P01') || /does not exist|schema cache|relation .* not found/i.test(m);
+}
+
+function dbError(error) {
+  if (tableMissing(error)) {
+    return 'As tabelas do disparador ainda nao existem no Supabase. Rode os SQLs 0002_disparador.sql e 0003_disparo_continuo.sql (SQL Editor > New query) e tente de novo.';
   }
+  return `banco de dados: ${error.message || error}`;
+}
+
+async function telegram(token, method, payload) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 12000);
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {}),
+      signal: ctrl.signal,
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!data.ok) {
+      const err = new Error(data.description || `Telegram respondeu ${r.status}`);
+      err.status = data.error_code || r.status;
+      err.retryAfter = data.parameters && data.parameters.retry_after;
+      throw err;
+    }
+    return data.result;
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('O Telegram demorou demais para responder.');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function friendlyTelegramError(err) {
+  const m = String(err.message || '');
+  if (/unauthorized|not found/i.test(m) && err.status === 401) return 'Token do bot inv\u00e1lido. Copie de novo no @BotFather.';
+  if (/chat not found/i.test(m)) return 'Chat n\u00e3o encontrado. Confira o @canal (ou id) e se o bot foi adicionado ao canal/grupo.';
+  if (/not enough rights|have no rights|administrator|forbidden/i.test(m)) return 'O bot n\u00e3o tem permiss\u00e3o para postar. Em canal, torne o bot administrador com permiss\u00e3o de postar.';
+  return m;
+}
+
+// ---------------- mensagens (v-rias varia--es) ----------------
+
+const OPENERS = ['\ud83d\udd25', '\ud83d\uded2', '\ud83d\udc40', '\ud83d\udca5', '\u26a1', '\ud83d\ude0d'];
+
+function pick(arr, n) { return arr[Math.abs(n) % arr.length]; }
+
+// Monta o texto. "turn" gira entre os modelos, ent-o duas mensagens seguidas nunca saem iguais.
+// Tom: quem est- compartilhando achou uma oferta boa. Nada de aviso t-cnico/-link de afiliado- no texto.
+function buildMessage(p, turn, footer) {
+  const emoji = pick(OPENERS, turn + p.title.length);
+  const title = esc(p.title);
+  const link = esc(p.affiliate_url);
+  const { price, listPrice, coupon, finalPrice } = p.view;
+  const off = p.view.discount ? Math.round(p.view.discount) : null;
+  const hasList = listPrice && listPrice > price;
+  const now = coupon ? finalPrice : price;
+
+  const priceLine = hasList
+    ? `\ud83d\udcb0 De <s>R$ ${money(listPrice)}</s> por <b>R$ ${money(now)}</b>${off ? ` (${off}% OFF)` : ''}`
+    : `\ud83d\udcb0 Por apenas <b>R$ ${money(now)}</b>${off ? ` (${off}% OFF)` : ''}`;
+  const couponLine = coupon ? `\ud83c\udf9f\ufe0f Use o cupom <b>${esc(coupon)}</b> no carrinho` : null;
+  const storeLine = coupon ? `\ud83d\udcb3 Pre\u00e7o na loja: R$ ${money(price)}` : null;
+
+  const templates = [
+    () => [`${emoji} <b>Olha o que a gente encontrou!</b>`, '', title, '', priceLine, couponLine, '', `\ud83d\uded2 Aproveite: ${link}`],
+    () => [`${emoji} <b>Oferta boa demais pra deixar passar</b>`, '', title, '', priceLine, couponLine, '', `\ud83d\udc49 ${link}`],
+    () => [`\u2705 <b>Separamos essa pra voc\u00ea</b>`, '', title, priceLine, storeLine, couponLine, '', `Garanta aqui \ud83d\udc47`, link],
+    () => [`${emoji} <b>Achado do dia</b>`, title, '', priceLine, couponLine, '', `\ud83d\uded2 ${link}`],
+    () => [`${emoji} <b>Pre\u00e7o bom apareceu!</b>`, '', title, '', priceLine, couponLine, '', `Corre ver: ${link}`],
+    () => [`\u2b50 <b>Recomenda\u00e7\u00e3o do dia</b>`, '', title, '', priceLine, couponLine, '', `\ud83d\udc49 Confira aqui: ${link}`],
+  ];
+
+  const lines = templates[Math.abs(turn) % templates.length]().filter((l) => l !== null && l !== undefined);
+  const cleaned = [];
+  for (const l of lines) { if (l === '' && (cleaned.length === 0 || cleaned[cleaned.length - 1] === '')) continue; cleaned.push(l); }
+  // Rodap- opcional - mas nunca deixa sair aviso de "afiliado".
+  const safeFooter = footer && !/afiliad/i.test(footer) ? footer : '';
+  if (safeFooter) cleaned.push('', esc(safeFooter));
+  return cleaned.join('\n');
+}
+
+// Vers-o sem HTML para o WhatsApp (que n-o entende <b>/<s>).
+function toPlain(html) {
+  return html.replace(/<\/?(b|s)>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+
+// ---------------- valida--o antes de enviar ----------------
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const DEAD_RE = /o produto n[\u00e3a]o existe|produto n[\u00e3a]o encontrado|p[\u00e1a]gina n[\u00e3a]o encontrada|produto indispon[\u00edi]vel|product (does not exist|not found)/i;
+const BADLINK_RE = /invalid publisher code|partnership status/i;
+
+// Abre o link como um cliente abriria e procura sinais claros de problema.
+// S- reprova quando o sinal - claro; se o site bloquear/der erro de rede, segue (inconclusivo).
+async function checkLink(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const r = await fetch(url, { redirect: 'follow', signal: ctrl.signal, headers: { 'User-Agent': UA, 'Accept-Language': 'pt-BR,pt;q=0.9', Accept: 'text/html,*/*' } });
+    if (r.status === 404 || r.status === 410) return { ok: false, kind: 'dead', reason: `a p\u00e1gina do produto n\u00e3o existe mais (erro ${r.status})` };
+    const text = (await r.text().catch(() => '')).slice(0, 40000);
+    if (BADLINK_RE.test(text)) return { ok: false, kind: 'badlink', reason: 'a rede de afiliados recusou o link (ID/parceria inv\u00e1lidos)' };
+    if (DEAD_RE.test(text)) return { ok: false, kind: 'dead', reason: 'a loja informa que o produto n\u00e3o existe' };
+    return { ok: true };
+  } catch { return { ok: true, inconclusive: true }; }
+  finally { clearTimeout(timer); }
+}
+
+function shopeeIds(url) {
+  const u = String(url || '');
+  let m = u.match(/\/product\/(\d+)\/(\d+)/) || u.match(/-i\.(\d+)\.(\d+)/);
+  return m ? { shopId: m[1], itemId: m[2] } : null;
+}
+
+let shopeeCreds;
+async function getShopeeCreds() {
+  if (shopeeCreds !== undefined) return shopeeCreds;
+  const { data: mp } = await supabaseAdmin.from('marketplaces').select('id').eq('slug', 'shopee').maybeSingle();
+  if (!mp) return (shopeeCreds = null);
+  const { data: c } = await supabaseAdmin.from('marketplace_credentials').select('client_id, client_secret').eq('marketplace_id', mp.id).maybeSingle();
+  return (shopeeCreds = c && c.client_id && c.client_secret ? c : null);
+}
+
+// Confirma na API oficial da Shopee que o an-ncio ainda existe e qual o pre-o de hoje.
+async function checkShopee(p) {
+  const ids = shopeeIds(p.original_url);
+  const creds = await getShopeeCreds();
+  if (!ids || !creds) return { ok: true, inconclusive: true };
+  try {
+    const node = await getProductOffer(creds.client_id, creds.client_secret, ids.itemId);
+    if (!node) return { ok: false, kind: 'dead', reason: 'a Shopee n\u00e3o devolve mais esse an\u00fancio (produto removido)' };
+    const live = Number(String(node.priceMin).replace(',', '.'));
+    return { ok: true, livePrice: Number.isFinite(live) && live > 0 ? live : null };
+  } catch { return { ok: true, inconclusive: true }; }
+}
+
+// Retorna { ok, kind, reason, livePrice }
+async function validatePromotion(p) {
+  const slug = p.marketplaces && p.marketplaces.slug;
+  if (slug === 'shopee') {
+    const sh = await checkShopee(p);
+    if (!sh.ok) return sh;
+    if (sh.livePrice && Number(p.current_price) > 0 && sh.livePrice > Number(p.current_price) * 1.05) {
+      return { ok: false, kind: 'stale', reason: `o pre\u00e7o subiu (de R$ ${money(p.current_price)} para R$ ${money(sh.livePrice)})` };
+    }
+  }
+  return checkLink(p.affiliate_url);
+}
+
+async function ignorePromotion(p, why) {
+  await supabaseAdmin.from('promotions').update({ status: 'IGNORED' }).eq('id', p.id);
+  await supabaseAdmin.from('integration_logs').insert({ marketplace_id: null, level: 'warn', message: `Disparador removeu da fila "${String(p.title).slice(0, 60)}": ${why}` }).then(() => {}, () => {});
+}
+
+// ---------------- fila ----------------
+
+async function getDestination(id) {
+  const { data, error } = await supabaseAdmin.from('dispatch_destinations').select('*').eq('id', id).maybeSingle();
+  if (error) throw new Error(dbError(error));
   return data;
 }
 
-function log(text, kind) {
-  const line = document.createElement('div');
-  if (kind) line.className = kind;
-  line.textContent = `${new Date().toLocaleTimeString('pt-BR')}  ${text}`;
-  const box = $('log');
-  box.prepend(line);
-  while (box.children.length > 60) box.removeChild(box.lastChild);
-}
+async function loadQueue(destId, body) {
+  const groupIds = Array.isArray(body.group_ids) ? body.group_ids : [];
+  const since = isoAgo(QUEUE_DAYS_SEEN * DAY);
 
-// ---------- carregar dados ----------
+  let q = supabaseAdmin
+    .from('promotions')
+    .select('id, title, image_url, original_url, current_price, previous_price, discount_rate, source, status, affiliate_url, watch_group_id, last_seen_at, detected_at, marketplaces(slug, name)')
+    .not('affiliate_url', 'is', null)
+    .neq('status', 'IGNORED')
+    .gt('current_price', 0)
+    .or(`last_seen_at.gte.${since},and(last_seen_at.is.null,detected_at.gte.${since})`)
+    .order('discount_rate', { ascending: false, nullsFirst: false })
+    .limit(600);
+  const { data, error } = await q;
+  if (error) throw new Error(dbError(error));
 
-async function fetchJson(url) {
-  const res = await fetch(url);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.error) throw new Error(data.error || `Erro ${res.status}`);
-  return data;
-}
+  const { data: logs, error: logErr } = await supabaseAdmin
+    .from('dispatch_log').select('promotion_id').eq('destination_id', destId).gte('sent_at', isoAgo(NO_REPEAT_DAYS * DAY));
+  if (logErr) throw new Error(dbError(logErr));
+  const already = new Set((logs || []).map((l) => l.promotion_id));
 
-// Destinos e grupos carregam de forma independente: se um falhar, o outro continua aparecendo.
-async function loadAll() {
-  const [d, g] = await Promise.allSettled([fetchJson('/api/dispatch'), fetchJson('/api/groups')]);
+  const wantNone = groupIds.includes('none');
+  const mp = body.marketplace || null;
 
-  if (d.status === 'fulfilled') {
-    destinations = d.value.destinations || [];
-    $('destMsg').textContent = '';
-  } else {
-    destinations = [];
-    $('destMsg').textContent = `Erro ao carregar destinos: ${d.reason.message} (já rodou o SQL 0002_disparador.sql no Supabase? Está logado?)`;
-  }
-
-  if (g.status === 'fulfilled') groups = g.value.groups || [];
-  else { groups = []; $('queueInfo').textContent = `Erro ao carregar grupos: ${g.reason.message}`; }
-
-  renderDestinations(d.status === 'rejected' ? d.reason.message : null);
-  renderGroups();
-  restoreSettings();
-  updateModeUI();
-}
-
-function renderDestinations(loadError) {
-  // O seletor da etapa 2 é montado primeiro, independente da lista da etapa 1.
-  const sel = $('destSelect');
-  const prev = sel.value;
-  if (destinations.length) {
-    sel.innerHTML = destinations.map((d) => `<option value="${d.id}">${escapeHtml(d.name)}${d.platform === 'whatsapp_manual' ? ' (WhatsApp)' : ' (Telegram)'}</option>`).join('');
-    if (destinations.some((d) => d.id === prev)) sel.value = prev;
-  } else {
-    sel.innerHTML = `<option value="">${loadError ? 'Erro ao carregar destinos' : 'Nenhum destino — adicione na etapa 1'}</option>`;
-  }
-
-  const list = $('destList');
-  if (!destinations.length) {
-    list.innerHTML = '<div class="dest-row"><span class="dest-meta">Nenhum destino ainda. Adicione um abaixo.</span></div>';
-  } else {
-    list.innerHTML = destinations.map((d) => `
-      <div class="dest-row">
-        <div>
-          <div class="dest-name">${escapeHtml(d.name)}</div>
-          <div class="dest-meta">${d.platform === 'telegram' ? `Telegram · ${escapeHtml(d.chat_id)}` : 'WhatsApp (assistido)'} · enviados em 24h: ${d.sentLast24h}/${d.daily_limit}</div>
-        </div>
-        <div class="dest-actions">
-          <button class="btn secondary small" data-test="${d.id}">Testar</button>
-          <button class="btn danger small" data-del="${d.id}">Remover</button>
-        </div>
-      </div>`).join('');
-    list.querySelectorAll('[data-test]').forEach((b) => b.addEventListener('click', () => testDestination(b.dataset.test)));
-    list.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', () => removeDestination(b.dataset.del)));
-  }
-
-}
-
-// Nomes iguais viram UM grupo só. O valor da caixinha guarda todos os ids do grupo (separados por vírgula).
-function mergedGroups() {
-  const map = new Map();
-  groups.forEach((g) => {
-    const key = String(g.name || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    if (!map.has(key)) map.set(key, { name: String(g.name || '').replace(/\s+/g, ' ').trim(), ids: [] });
-    map.get(key).ids.push(g.id);
-    const cleaned = String(g.name || '').replace(/\s+/g, ' ').trim();
-    if (!/[A-ZÀ-Þ]/.test(map.get(key).name) && /[A-ZÀ-Þ]/.test(cleaned)) map.get(key).name = cleaned;
+  return (data || []).filter((p) => {
+    if (already.has(p.id)) return false;
+    if (!/^https?:\/\//i.test(p.affiliate_url || '')) return false;
+    if (mp && (!p.marketplaces || p.marketplaces.slug !== mp)) return false;
+    if (groupIds.length) {
+      if (p.watch_group_id) { if (!groupIds.includes(p.watch_group_id)) return false; }
+      else if (!wantNone) return false;
+    }
+    return true;
   });
-  return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
 }
 
-function renderGroups() {
-  const options = [...mergedGroups().map((g) => ({ id: g.ids.join(','), name: g.name })), { id: 'none', name: 'Sem grupo' }];
-  $('groupBox').innerHTML = options.map((g) => `
-    <label class="check"><input type="checkbox" class="grp" value="${escapeHtml(g.id)}" checked /> ${escapeHtml(g.name)}</label>`).join('');
-}
-
-// ---------- configurações lembradas no navegador (nada sensível) ----------
-
-function saveSettings() {
-  localStorage.setItem('dispatcher', JSON.stringify({
-    dest: $('destSelect').value, mp: $('mpSelect').value, interval: $('interval').value,
-    maxSends: $('maxSends').value, footer: $('footer').value,
-  }));
-}
-
-function restoreSettings() {
+async function netshoesCoupons() {
+  if (couponCache.list && Date.now() - couponCache.at < COUPON_CACHE_MS) return couponCache.list;
   try {
-    const s = JSON.parse(localStorage.getItem('dispatcher') || '{}');
-    if (s.dest && destinations.some((d) => d.id === s.dest)) $('destSelect').value = s.dest;
-    if (s.mp !== undefined) $('mpSelect').value = s.mp;
-    if (s.interval) $('interval').value = s.interval;
-    if (s.maxSends) $('maxSends').value = s.maxSends;
-    if (s.footer !== undefined && !/afiliad/i.test(s.footer)) $('footer').value = s.footer;
-  } catch { /* ignora */ }
+    const ctx = await getNetshoesContext(supabaseAdmin);
+    if (ctx.error) return null;
+    const loaded = await loadNetshoesCoupons(ctx);
+    if (loaded.error) return null;
+    couponCache = { at: Date.now(), list: loaded.coupons || [] };
+    return couponCache.list;
+  } catch { return null; }
 }
 
-function selectedDest() {
-  return destinations.find((d) => d.id === $('destSelect').value) || null;
-}
+// Calcula o que vai aparecer na mensagem. Retorna null se a promo--o n-o vale mais (ex.: cupom venceu).
+async function buildView(p) {
+  const slug = p.marketplaces && p.marketplaces.slug;
+  let price = Number(p.current_price);
+  let listPrice = p.previous_price ? Number(p.previous_price) : null;
+  let coupon = null; let finalPrice = null;
 
-function updateModeUI() {
-  const dest = selectedDest();
-  const manual = dest && dest.platform === 'whatsapp_manual';
-  $('startBtn').classList.toggle('hidden', running || manual);
-  $('stopBtn').classList.toggle('hidden', !running);
-  $('waStartBtn').classList.toggle('hidden', !manual || waRunning);
-  $('waStopBtn').classList.toggle('hidden', !manual || !waRunning);
-  $('waBtn').classList.toggle('hidden', !manual || waRunning);
-  $('runWarn').classList.toggle('hidden', manual && !waRunning);
-  const busy = running || waRunning;
-  ['destSelect', 'mpSelect', 'interval', 'maxSends', 'footer', 'testBtn', 'queueBtn', 'verifyBtn'].forEach((id) => { $(id).disabled = busy; });
-  document.querySelectorAll('.grp').forEach((c) => { c.disabled = busy; });
-}
-
-function filters() {
-  const group_ids = [...document.querySelectorAll('.grp:checked')].flatMap((c) => c.value.split(',')).filter(Boolean);
-  return { group_ids, marketplace: $('mpSelect').value || null, footer: $('footer').value.trim() };
-}
-
-// ---------- destinos ----------
-
-async function addDestination() {
-  const btn = $('addDestBtn');
-  btn.disabled = true;
-  $('destMsg').textContent = '';
-  try {
-    const data = await api({
-      action: 'create_destination',
-      platform: $('newPlatform').value,
-      name: $('newName').value,
-      chat_id: $('newChat').value,
-      bot_token: $('newToken').value,
-      daily_limit: $('newLimit').value,
-    });
-    ['newName', 'newChat', 'newToken'].forEach((id) => { $(id).value = ''; });
-    $('destMsg').textContent = data.botUsername ? `Destino criado. Bot reconhecido: @${data.botUsername}. Clique em "Testar".` : 'Destino criado.';
-    await loadAll();
-  } catch (err) {
-    $('destMsg').textContent = `Erro: ${err.message}`;
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-async function removeDestination(id) {
-  if (!confirm('Remover esse destino? O histórico de envios dele também some.')) return;
-  await api({ action: 'delete_destination', id });
-  await loadAll();
-}
-
-// Abre o WhatsApp numa aba aberta no clique (senão o navegador bloqueia o pop-up).
-function openWhatsAppTab() {
-  return window.open('', '_blank');
-}
-function fillWhatsAppTab(tab, message) {
-  const url = `https://wa.me/?text=${encodeURIComponent(message)}`;
-  if (tab) tab.location = url; else window.open(url, '_blank');
-}
-
-async function testDestination(id) {
-  const dest = destinations.find((d) => d.id === id);
-  const tab = dest && dest.platform === 'whatsapp_manual' ? openWhatsAppTab() : null;
-  try {
-    const r = await api({ action: 'test', destination_id: id });
-    if (r.manual) fillWhatsAppTab(tab, r.message);
-    log(`Teste enviado para "${dest ? dest.name : ''}".`, 'ok');
-    $('destMsg').textContent = 'Teste enviado — confira no destino.';
-  } catch (err) {
-    if (tab) tab.close();
-    log(`Teste falhou: ${err.message}`, 'err');
-    $('destMsg').textContent = `Erro: ${err.message}`;
-  }
-}
-
-// ---------- fila ----------
-
-async function refreshQueue() {
-  const dest = selectedDest();
-  if (!dest) { $('queueInfo').textContent = 'Crie um destino primeiro.'; return; }
-  $('queueInfo').textContent = 'Consultando a fila...';
-  try {
-    const f = filters();
-    const r = await api({ action: 'queue', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace });
-    if (!r.count) {
-      $('queueInfo').textContent = 'Fila vazia: nenhuma promoção com link de afiliado, vista nos últimos 3 dias, que ainda não tenha ido para esse destino. Rode uma busca no Painel geral.';
-    } else {
-      const n = r.next;
-      $('queueInfo').textContent = `Na fila: ${r.count}. Próxima: ${n.title.slice(0, 70)} — R$ ${Number(n.price).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${n.discount ? ` (${Math.round(n.discount)}% OFF)` : ''}${n.marketplace ? ` · ${n.marketplace}` : ''}`;
+  if (slug === 'netshoes') {
+    const fromCoupon = p.source === 'netshoes_coupon';
+    // Em ofertas por cupom, current_price j- - o pre-o COM cupom e previous_price - o pre-o da loja.
+    const storePrice = fromCoupon ? Number(p.previous_price) : price;
+    const list = await netshoesCoupons();
+    const best = list && storePrice > 0 ? bestNetshoesCoupon(list, { title: p.title, price: storePrice, category: null }) : null;
+    if (best) {
+      coupon = best.coupon.code; finalPrice = r2(best.finalPrice); price = r2(storePrice);
+      listPrice = fromCoupon ? null : listPrice;
+    } else if (fromCoupon) {
+      return null; // a oferta dependia de um cupom que n\u00e3o consigo confirmar agora
     }
-  } catch (err) {
-    $('queueInfo').textContent = `Erro: ${err.message}`;
   }
+
+  const base = coupon ? finalPrice : price;
+  const ref = listPrice && listPrice > price ? listPrice : (coupon ? price : null);
+  const discount = ref && base < ref ? ((ref - base) / ref) * 100 : (p.discount_rate ? Number(p.discount_rate) : null);
+  return { price: r2(price), listPrice: listPrice ? r2(listPrice) : null, coupon, finalPrice, discount };
 }
 
-// ---------- disparo automático (Telegram) ----------
+// ---------------- a--es ----------------
 
-async function acquireWakeLock() {
-  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch { /* sem suporte: segue */ }
-}
-function releaseWakeLock() {
-  try { if (wakeLock) wakeLock.release(); } catch { /* ignora */ }
-  wakeLock = null;
-}
-document.addEventListener('visibilitychange', () => {
-  if (running && document.visibilityState === 'visible') acquireWakeLock();
-});
-window.addEventListener('beforeunload', (e) => {
-  if (running) { e.preventDefault(); e.returnValue = ''; }
-});
+async function createDestination(res, body) {
+  const platform = body.platform === 'whatsapp_manual' ? 'whatsapp_manual' : 'telegram';
+  const name = String(body.name || '').replace(/\s+/g, ' ').trim();
+  if (!name) return fail(res, 400, 'D\u00ea um nome ao destino (ex.: Achadinhos).');
+  const dailyLimit = Math.min(Math.max(parseInt(body.daily_limit, 10) || 60, 1), 200);
 
-async function startRun() {
-  const dest = selectedDest();
-  if (!dest) { alert('Crie e selecione um destino.'); return; }
-  const interval = parseInt($('interval').value, 10);
-  const maxSends = parseInt($('maxSends').value, 10) || 20;
-  const f = filters();
+  const row = { name: name.slice(0, 80), platform, daily_limit: dailyLimit, chat_id: null, bot_token: null };
+  let botUsername = null;
 
-  if (!interval || interval < MIN_INTERVAL) { alert(`O intervalo mínimo é ${MIN_INTERVAL} minutos.`); return; }
-  if (!f.group_ids.length) { alert('Marque pelo menos um grupo.'); return; }
-  if (!confirm(`Enviar 1 promoção a cada ${interval} min para "${dest.name}", até ${maxSends} envios.\n\nA aba precisa ficar aberta e o computador ligado. Começar?`)) return;
-
-  saveSettings();
-  running = true;
-  sentThisRun = 0;
-  errorsInRow = 0;
-  nextAt = Date.now(); // o primeiro envio sai agora
-  await acquireWakeLock();
-  tickTimer = setInterval(tick, 1000);
-  updateModeUI();
-  log(`Disparo iniciado: ${interval} min de intervalo, até ${maxSends} envios.`, 'ok');
-}
-
-function stopRun(reason) {
-  if (!running) return;
-  running = false;
-  clearInterval(tickTimer);
-  tickTimer = null;
-  releaseWakeLock();
-  updateModeUI();
-  $('statusBox').classList.remove('running');
-  $('statusBox').innerHTML = `<b>Parado.</b> ${escapeHtml(reason || '')}`;
-  log(`Disparo parado. ${reason || ''}`);
-  loadAll();
-}
-
-function tick() {
-  if (!running) return;
-  const remaining = nextAt - Date.now();
-  const box = $('statusBox');
-  box.classList.add('running');
-  if (inFlight) {
-    box.innerHTML = '<span class="big">Enviando...</span>';
-  } else if (remaining > 0) {
-    const m = String(Math.floor(remaining / 60000)).padStart(2, '0');
-    const s = String(Math.floor((remaining % 60000) / 1000)).padStart(2, '0');
-    box.innerHTML = `<span class="big">Próximo envio em ${m}:${s}</span><br>Enviados nesta sessão: ${sentThisRun}`;
+  if (platform === 'telegram') {
+    const chat = String(body.chat_id || '').trim();
+    const token = String(body.bot_token || '').trim();
+    if (!chat) return fail(res, 400, 'Preencha o Chat (@nome_do_canal ou o id num\u00e9rico).');
+    if (!/^\d+:[\w-]{20,}$/.test(token)) return fail(res, 400, 'Token do bot com formato estranho. Ele parece com 123456789:ABCdef... (copie inteiro do @BotFather).');
+    try { botUsername = (await telegram(token, 'getMe')).username; }
+    catch (err) { return fail(res, 400, friendlyTelegramError(err)); }
+    row.chat_id = /^-?\d+$/.test(chat) || chat.startsWith('@') ? chat : `@${chat}`;
+    row.bot_token = token;
   }
-  if (remaining <= 0 && !inFlight) doSend();
+
+  const { error } = await supabaseAdmin.from('dispatch_destinations').insert(row);
+  if (error) return fail(res, 500, dbError(error));
+  res.status(200).json({ ok: true, botUsername });
 }
 
-async function doSend() {
-  inFlight = true;
-  const dest = selectedDest();
-  const f = filters();
-  const interval = parseInt($('interval').value, 10);
-  const maxSends = parseInt($('maxSends').value, 10) || 20;
+async function listDestinations(res) {
+  const { data, error } = await supabaseAdmin.from('dispatch_destinations').select('id, name, platform, chat_id, daily_limit, created_at').order('created_at');
+  if (error) return fail(res, 500, dbError(error));
+  const since = isoAgo(DAY);
+  const out = [];
+  for (const d of data || []) {
+    const { count } = await supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true })
+      .eq('destination_id', d.id).eq('skipped', false).gte('sent_at', since);
+    out.push({ ...d, sentLast24h: count || 0 });
+  }
+  const payload = await jobsPayload();
+  res.status(200).json({ destinations: out, jobs: payload.jobs, now: payload.now });
+}
 
-  try {
-    const r = await api({ action: 'send_next', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace, footer: f.footer });
-    logSkipped(r.skipped);
-    if (r.empty) {
-      stopRun('A fila acabou: não há mais promoções com link de afiliado para esse filtro.');
-      return;
+async function sendTest(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+  const text = '\u2705 Teste do Radar de Promo\u00e7\u00f5es: se voc\u00ea est\u00e1 lendo isso, o destino est\u00e1 funcionando.';
+  if (dest.platform === 'whatsapp_manual') return res.status(200).json({ ok: true, manual: true, message: text });
+  try { await telegram(dest.bot_token, 'sendMessage', { chat_id: dest.chat_id, text }); }
+  catch (err) { return fail(res, 400, friendlyTelegramError(err)); }
+  res.status(200).json({ ok: true });
+}
+
+async function queue(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+  const list = await loadQueue(dest.id, body);
+  if (!list.length) return res.status(200).json({ count: 0 });
+  const n = list[0];
+  res.status(200).json({
+    count: list.length,
+    next: { title: n.title, price: Number(n.current_price), discount: n.discount_rate ? Number(n.discount_rate) : null, marketplace: n.marketplaces ? n.marketplaces.name : null },
+  });
+}
+
+
+// Confere os pr-ximos da fila SEM enviar nada. Quem n-o existe mais - removido (vai para "Ignoradas").
+async function verifyQueue(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+  const list = await loadQueue(dest.id, body);
+  const sample = list.slice(0, 12);
+  const out = { total: list.length, checked: 0, ok: 0, removed: [], warnings: [] };
+  for (const p of sample) {
+    const check = await validatePromotion(p);
+    out.checked += 1;
+    if (check.ok) { out.ok += 1; continue; }
+    if (check.kind === 'badlink') { out.warnings.push(check.reason); break; }
+    if (check.kind === 'dead') await ignorePromotion(p, check.reason);
+    out.removed.push({ title: p.title, reason: check.reason });
+  }
+  res.status(200).json(out);
+}
+
+async function sendNext(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+
+  // limite di-rio e trava anti-duplo-clique
+  const { count: sent24 } = await supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true })
+    .eq('destination_id', dest.id).eq('skipped', false).gte('sent_at', isoAgo(DAY));
+  if ((sent24 || 0) >= dest.daily_limit) return fail(res, 429, `Limite de ${dest.daily_limit} envios em 24h atingido para "${dest.name}".`, { code: 'daily_limit' });
+
+  const { data: last } = await supabaseAdmin.from('dispatch_log').select('sent_at').eq('destination_id', dest.id).eq('skipped', false)
+    .order('sent_at', { ascending: false }).limit(1);
+  if (last && last[0] && Date.now() - new Date(last[0].sent_at).getTime() < MIN_GAP_SECONDS * 1000) {
+    return fail(res, 429, 'Envio muito r\u00e1pido, aguardando alguns segundos.', { code: 'too_fast' });
+  }
+
+  const list = await loadQueue(dest.id, body);
+  let chosen = null; let view = null; let tries = 0;
+  const skippedInfo = [];
+  for (const p of list) {
+    if (tries >= 8) break;
+    tries += 1;
+    // 1) o produto/link ainda existe e funciona?
+    const check = await validatePromotion(p);
+    if (!check.ok) {
+      if (check.kind === 'badlink') {
+        return fail(res, 409, `Parei por seguran\u00e7a: ${check.reason}. Confira o ID de afiliado em Marketplaces antes de continuar.`, { code: 'bad_link' });
+      }
+      if (check.kind === 'dead') await ignorePromotion(p, check.reason);
+      await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: `pulada: ${check.reason}` });
+      skippedInfo.push({ title: p.title, reason: check.reason });
+      continue;
     }
-    sentThisRun += 1;
-    errorsInRow = 0;
-    log(`✅ ${r.sent.title.slice(0, 70)}${r.sent.marketplace ? ` (${r.sent.marketplace})` : ''}${r.sent.coupon ? ` · cupom ${r.sent.coupon}` : ''} — restam ${r.remaining} na fila`, 'ok');
-    if (sentThisRun >= maxSends) { stopRun(`Meta de ${maxSends} envios atingida.`); return; }
-    nextAt = Date.now() + interval * 60000;
-  } catch (err) {
-    errorsInRow += 1;
-    log(`⚠️ ${err.message}`, 'err');
-    if (err.code === 'daily_limit') { stopRun('Limite diário do destino atingido.'); return; }
-    if (err.code === 'bad_link') { stopRun('O link de afiliado foi recusado — corrija o ID em Marketplaces.'); return; }
-    if (err.code === 'rate_limited') nextAt = Date.now() + ((err.retryAfter || 60) + 1) * 1000;
-    else if (err.code === 'too_fast') nextAt = Date.now() + 60000;
-    else if (errorsInRow >= 3) { stopRun('3 falhas seguidas — parei por segurança.'); return; }
-    else nextAt = Date.now() + 60000;
-  } finally {
-    inFlight = false;
+    // 2) pre-o/cupom de agora
+    const v = await buildView(p);
+    if (v) { chosen = p; view = v; break; }
+    await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: 'pulada: cupom n\u00e3o confirmado' });
+    skippedInfo.push({ title: p.title, reason: 'o cupom dessa oferta n\u00e3o est\u00e1 mais v\u00e1lido' });
   }
-}
+  if (!chosen) return res.status(200).json({ empty: true, skipped: skippedInfo });
 
-// ---------- WhatsApp assistido ----------
+  chosen.view = view;
+  const { count: total } = await supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true }).eq('destination_id', dest.id);
+  const html = buildMessage(chosen, total || 0, String(body.footer || '').slice(0, 120));
+  const remaining = Math.max(list.length - tries, 0);
+  const slugName = chosen.marketplaces ? chosen.marketplaces.name : null;
 
-async function openNextWhatsApp() {
-  const dest = selectedDest();
-  if (!dest) return;
-  const f = filters();
-  const tab = openWhatsAppTab();
+  if (dest.platform === 'whatsapp_manual') {
+    const plain = toPlain(html);
+    await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: plain });
+    return res.status(200).json({ ok: true, manual: true, message: plain, promotion: { title: chosen.title, coupon: view.coupon }, remaining, skipped: skippedInfo });
+  }
+
   try {
-    const r = await api({ action: 'send_next', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace, footer: f.footer });
-    logSkipped(r.skipped);
-    if (r.empty) {
-      if (tab) tab.close();
-      $('statusBox').textContent = 'Fila vazia para esse filtro.';
-      return;
+    let done = false;
+    if (chosen.image_url && /^https:\/\//i.test(chosen.image_url) && html.length <= 1000) {
+      try {
+        await telegram(dest.bot_token, 'sendPhoto', { chat_id: dest.chat_id, photo: chosen.image_url, caption: html, parse_mode: 'HTML' });
+        done = true;
+      } catch (e) { if (e.status === 429) throw e; /* imagem recusada: manda s\u00f3 o texto */ }
     }
-    fillWhatsAppTab(tab, r.message);
-    $('statusBox').innerHTML = `<b>Preparado:</b> ${escapeHtml(r.promotion.title.slice(0, 80))}${r.promotion.coupon ? ` · cupom <b>${escapeHtml(r.promotion.coupon)}</b>` : ''}<br>Restam ${r.remaining} na fila. Escolha o grupo no WhatsApp e toque em enviar.`;
-    log(`📱 Preparado para WhatsApp: ${r.promotion.title.slice(0, 70)}`, 'ok');
-    loadAll();
+    if (!done) await telegram(dest.bot_token, 'sendMessage', { chat_id: dest.chat_id, text: html, parse_mode: 'HTML', disable_web_page_preview: false });
   } catch (err) {
-    if (tab) tab.close();
-    $('statusBox').textContent = `Erro: ${err.message}`;
-    log(`⚠️ ${err.message}`, 'err');
+    if (err.status === 429) return fail(res, 429, 'Telegram pediu para ir mais devagar.', { code: 'rate_limited', retryAfter: err.retryAfter || 60 });
+    return fail(res, 502, friendlyTelegramError(err));
   }
+
+  await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: toPlain(html) });
+  res.status(200).json({ ok: true, sent: { title: chosen.title, marketplace: slugName, coupon: view.coupon }, remaining, skipped: skippedInfo });
 }
 
 
-function logSkipped(list) {
-  (list || []).forEach((x) => log(`⏭️ Pulada: ${String(x.title).slice(0, 60)} — ${x.reason}`, 'err'));
+// ---------------- disparo continuo (estado no servidor) ----------------
+
+const CLAIM_STALE_MS = 150 * 1000;
+
+function fakeRes() {
+  return { code: 200, body: null, status(c) { this.code = c; return this; }, json(b) { this.body = b; return this; } };
 }
 
-// ---------- verificar fila (sem enviar) ----------
+async function jobsPayload() {
+  const now = new Date().toISOString();
+  const { data, error } = await supabaseAdmin.from('dispatch_jobs').select('*');
+  if (error) return { jobs: [], now, jobsError: error.message };
+  return { jobs: data || [], now };
+}
 
-async function verifyQueueUI() {
-  const dest = selectedDest();
-  if (!dest) { $('queueInfo').textContent = 'Crie um destino primeiro.'; return; }
-  $('queueInfo').textContent = 'Conferindo os próximos produtos (abrindo cada link)... pode levar até 1 minuto.';
-  $('verifyBtn').disabled = true;
-  try {
-    const f = filters();
-    const r = await api({ action: 'verify', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace });
-    let msg = `Conferidos ${r.checked} de ${r.total} na fila: ${r.ok} ok`;
-    if (r.removed.length) msg += `, ${r.removed.length} removidos (produto não existe mais)`;
-    if (r.warnings.length) msg += `. ⚠️ ${r.warnings[0]}`;
-    $('queueInfo').textContent = msg + '.';
-    r.removed.forEach((x) => log(`🗑️ Removida: ${String(x.title).slice(0, 60)} — ${x.reason}`, 'err'));
-  } catch (err) {
-    $('queueInfo').textContent = `Erro: ${err.message}`;
-  } finally {
-    $('verifyBtn').disabled = false;
+async function startJob(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino nao encontrado.');
+  const isTelegram = dest.platform === 'telegram';
+  const interval = Math.max(parseInt(body.interval_min, 10) || 0, isTelegram ? 2 : 1);
+  const maxSends = Math.min(Math.max(parseInt(body.max_sends, 10) || 20, 1), 500);
+  const footer = String(body.footer || '').slice(0, 120);
+  const nowIso = new Date().toISOString();
+  const row = {
+    destination_id: dest.id, mode: isTelegram ? 'auto' : 'assisted', status: 'running',
+    interval_min: interval, max_sends: maxSends, sent_count: 0, next_run_at: nowIso, claimed_at: null,
+    filters: { group_ids: Array.isArray(body.group_ids) ? body.group_ids : [], marketplace: body.marketplace || null, footer },
+    pending: null, last_event: 'Disparo iniciado.', last_error: null, error_streak: 0, updated_at: nowIso,
+  };
+  const { error } = await supabaseAdmin.from('dispatch_jobs').upsert(row, { onConflict: 'destination_id' });
+  if (error) return fail(res, 500, dbError(error));
+  res.status(200).json(await jobsPayload());
+}
+
+async function stopJob(res, body) {
+  const { error } = await supabaseAdmin.from('dispatch_jobs')
+    .update({ status: 'stopped', pending: null, claimed_at: null, last_event: 'Parado por voce.', updated_at: new Date().toISOString() })
+    .eq('destination_id', body.destination_id);
+  if (error) return fail(res, 500, dbError(error));
+  res.status(200).json(await jobsPayload());
+}
+
+// WhatsApp assistido: a pessoa abriu o WhatsApp -> conta como enviado e recomeca a contagem.
+async function ackJob(res, body) {
+  const { data: job, error } = await supabaseAdmin.from('dispatch_jobs').select('*').eq('destination_id', body.destination_id).maybeSingle();
+  if (error) return fail(res, 500, dbError(error));
+  if (job && job.pending) {
+    const sent = job.sent_count + 1;
+    const done = sent >= job.max_sends;
+    await supabaseAdmin.from('dispatch_jobs').update({
+      pending: null, sent_count: sent, status: done ? 'stopped' : 'running',
+      next_run_at: new Date(Date.now() + job.interval_min * 60000).toISOString(),
+      last_event: done ? `Meta de ${job.max_sends} envios atingida.` : `Aberto no WhatsApp: ${String(job.pending.title || '').slice(0, 60)}`,
+      last_error: null, updated_at: new Date().toISOString(),
+    }).eq('id', job.id);
   }
+  res.status(200).json(await jobsPayload());
 }
 
-// ---------- WhatsApp com alerta (semi-automático) ----------
-// O WhatsApp não permite postar em grupo por API. Aqui o sistema prepara a mensagem no tempo certo,
-// toca um alarme + notificação, e você só abre, escolhe o grupo e envia (1 toque).
-
-function beep() {
-  // Som suave: dois toques graves e curtos, tipo "gota" (sem aquele bipe agudo de alerta).
+async function processJob(job) {
+  const nowIso = () => new Date().toISOString();
+  const finish = (patch) => supabaseAdmin.from('dispatch_jobs').update({ claimed_at: null, updated_at: nowIso(), ...patch }).eq('id', job.id);
+  let r;
   try {
-    if (!audioCtx) return;
-    const t0 = audioCtx.currentTime;
-    [[392, 0], [523.25, 0.32]].forEach(([freq, delay]) => { // sol -> do
-      const o = audioCtx.createOscillator();
-      const g = audioCtx.createGain();
-      o.type = 'sine'; o.frequency.value = freq;
-      g.gain.setValueAtTime(0.0001, t0 + delay);
-      g.gain.exponentialRampToValueAtTime(0.12, t0 + delay + 0.04);
-      g.gain.exponentialRampToValueAtTime(0.0001, t0 + delay + 1.1);
-      o.connect(g); g.connect(audioCtx.destination);
-      o.start(t0 + delay); o.stop(t0 + delay + 1.2);
-    });
-  } catch { /* sem áudio: segue */ }
-}
+    const dest = await getDestination(job.destination_id);
+    if (!dest) { await finish({ status: 'stopped', last_error: 'Destino removido.' }); return; }
+    const f = job.filters || {};
+    const fr = fakeRes();
+    await sendNext(fr, { destination_id: dest.id, group_ids: f.group_ids || [], marketplace: f.marketplace || null, footer: f.footer || '' });
+    r = { status: fr.code, json: fr.body || {} };
+  } catch (e) {
+    r = { status: 500, json: { error: e.message || 'erro inesperado' } };
+  }
 
-function startAlarm(title) {
-  stopAlarm();
-  beep();
-  waAlarmTimer = setInterval(beep, 20000); // repete a cada 20s até você abrir
-  const original = document.title;
-  let on = false;
-  waTitleTimer = setInterval(() => { on = !on; document.title = on ? '🔔 ENVIAR AGORA!' : original; }, 800);
-  waTitleTimer.original = original;
-  try {
-    if ('Notification' in window && Notification.permission === 'granted') {
-      const n = new Notification('📱 Promoção pronta para enviar', { body: title.slice(0, 100), requireInteraction: true });
-      n.onclick = () => { window.focus(); n.close(); };
-    }
-  } catch { /* ignora */ }
-}
+  const j = r.json;
+  const skippedTxt = j.skipped && j.skipped.length ? ` (${j.skipped.length} pulada(s) por problema no produto)` : '';
 
-function stopAlarm() {
-  if (waAlarmTimer) clearInterval(waAlarmTimer);
-  if (waTitleTimer) { clearInterval(waTitleTimer); document.title = waTitleTimer.original || document.title; }
-  waAlarmTimer = null; waTitleTimer = null;
-}
-
-async function startWaRun() {
-  const dest = selectedDest();
-  if (!dest) { alert('Crie e selecione um destino.'); return; }
-  const interval = parseInt($('interval').value, 10);
-  const f = filters();
-  if (!interval || interval < WA_MIN_INTERVAL) { alert(`O intervalo mínimo é ${WA_MIN_INTERVAL} minuto.`); return; }
-  if (!f.group_ids.length) { alert('Marque pelo menos um grupo.'); return; }
-  try { audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)(); await audioCtx.resume(); } catch { /* sem áudio */ }
-  try { if ('Notification' in window && Notification.permission === 'default') await Notification.requestPermission(); } catch { /* ignora */ }
-  saveSettings();
-  waRunning = true; waPending = null; inFlight = false; sentThisRun = 0;
-  nextAt = Date.now(); // a primeira já vem pronta agora
-  await acquireWakeLock();
-  tickTimer = setInterval(waTick, 1000);
-  updateModeUI();
-  beep(); // teste de som
-  log(`Alertas do WhatsApp iniciados: uma promoção pronta a cada ${interval} min.`, 'ok');
-}
-
-function stopWaRun(reason) {
-  if (!waRunning) return;
-  waRunning = false; waPending = null;
-  clearInterval(tickTimer); tickTimer = null;
-  stopAlarm(); releaseWakeLock();
-  $('waOpenBtn').classList.add('hidden');
-  $('statusBox').classList.remove('running', 'alert');
-  $('statusBox').innerHTML = `<b>Parado.</b> ${escapeHtml(reason || '')}`;
-  updateModeUI();
-  log(`Alertas parados. ${reason || ''}`);
-  loadAll();
-}
-
-async function waTick() {
-  if (!waRunning) return;
-  const box = $('statusBox');
-  if (waPending) return; // alarme tocando, esperando você
-  const remaining = nextAt - Date.now();
-  if (inFlight) { box.innerHTML = '<span class="big">Preparando e conferindo o produto...</span>'; return; }
-  if (remaining > 0) {
-    box.classList.add('running'); box.classList.remove('alert');
-    const m = String(Math.floor(remaining / 60000)).padStart(2, '0');
-    const s = String(Math.floor((remaining % 60000) / 1000)).padStart(2, '0');
-    box.innerHTML = `<span class="big">Próxima promoção em ${m}:${s}</span><br>Enviadas nesta sessão: ${sentThisRun}`;
+  if (r.status === 200 && j.empty) {
+    await finish({ status: 'stopped', pending: null, last_event: 'A fila acabou: nao ha mais promocoes validas para esse filtro.' + skippedTxt });
     return;
   }
-  inFlight = true;
-  const dest = selectedDest();
-  const f = filters();
-  try {
-    const r = await api({ action: 'send_next', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace, footer: f.footer });
-    logSkipped(r.skipped);
-    if (r.empty) { stopWaRun('A fila acabou: não há mais promoções válidas para esse filtro.'); return; }
-    waPending = r;
-    try { navigator.clipboard.writeText(r.message); } catch { /* ignora */ }
-    box.classList.remove('running'); box.classList.add('alert');
-    box.innerHTML = `<span class="big">🔔 PRONTA PARA ENVIAR</span><br>${escapeHtml(r.promotion.title.slice(0, 90))}${r.promotion.coupon ? ` · cupom <b>${escapeHtml(r.promotion.coupon)}</b>` : ''}<br>Restam ${r.remaining} na fila. Aperte o botão (ou Enter), escolha o grupo e envie.`;
-    $('waOpenBtn').classList.remove('hidden');
-    startAlarm(r.promotion.title);
-  } catch (err) {
-    log(`⚠️ ${err.message}`, 'err');
-    if (err.code === 'daily_limit' || err.code === 'bad_link') { stopWaRun(err.message); return; }
-    nextAt = Date.now() + 30000;
-  } finally {
-    inFlight = false;
+  if (r.status === 200) {
+    if (job.mode === 'assisted') {
+      await finish({
+        pending: { message: j.message, title: j.promotion.title, coupon: j.promotion.coupon, remaining: j.remaining, prepared_at: nowIso() },
+        last_event: 'Promocao pronta para enviar.' + skippedTxt, last_error: null, error_streak: 0,
+      });
+      return;
+    }
+    const sent = job.sent_count + 1;
+    const done = sent >= job.max_sends;
+    const t = (j.sent && j.sent.title ? j.sent.title : '').slice(0, 70);
+    await finish({
+      sent_count: sent, status: done ? 'stopped' : 'running',
+      next_run_at: new Date(Date.now() + job.interval_min * 60000).toISOString(),
+      last_event: (done ? `Meta de ${job.max_sends} envios atingida. ` : '') + `Enviado: ${t}${j.sent && j.sent.coupon ? ` (cupom ${j.sent.coupon})` : ''}${skippedTxt}`,
+      last_error: null, error_streak: 0,
+    });
+    return;
   }
+  // erros
+  const code = j.code;
+  const msg = j.error || 'Falha ao enviar.';
+  if (code === 'daily_limit' || code === 'bad_link') { await finish({ status: 'stopped', pending: null, last_error: msg }); return; }
+  if (code === 'rate_limited') { await finish({ next_run_at: new Date(Date.now() + ((j.retryAfter || 60) + 1) * 1000).toISOString(), last_error: msg }); return; }
+  const streak = (job.error_streak || 0) + 1;
+  if (streak >= 30) { await finish({ status: 'stopped', error_streak: streak, last_error: `${msg} (parei apos 30 falhas seguidas)` }); return; }
+  await finish({ next_run_at: new Date(Date.now() + 60000).toISOString(), error_streak: streak, last_error: msg });
 }
 
-function waOpenPending() {
-  if (!waPending) return;
-  const r = waPending;
-  waPending = null;
-  stopAlarm();
-  window.open(`https://wa.me/?text=${encodeURIComponent(r.message)}`, '_blank');
-  sentThisRun += 1;
-  log(`📱 Aberto no WhatsApp: ${r.promotion.title.slice(0, 70)}`, 'ok');
-  $('waOpenBtn').classList.add('hidden');
-  $('statusBox').classList.remove('alert');
-  nextAt = Date.now() + (parseInt($('interval').value, 10) || 3) * 60000; // contagem recomeça depois que você abre
+// Roda os disparos que ja estao na hora. Pode ser chamado pela pagina aberta ou por um "relogio" externo.
+async function tickJobs() {
+  const nowIso = new Date().toISOString();
+  const { data: due, error } = await supabaseAdmin.from('dispatch_jobs').select('*')
+    .eq('status', 'running').is('pending', null).lte('next_run_at', nowIso).limit(3);
+  if (error) throw new Error(dbError(error));
+  const work = [];
+  for (const j of due || []) {
+    const stale = new Date(Date.now() - CLAIM_STALE_MS).toISOString();
+    // "trava" atomica: so quem conseguir marcar o claimed_at executa (evita envio duplicado)
+    const { data: claimed } = await supabaseAdmin.from('dispatch_jobs').update({ claimed_at: nowIso })
+      .eq('id', j.id).eq('status', 'running').lte('next_run_at', nowIso)
+      .or(`claimed_at.is.null,claimed_at.lt.${stale}`).select().maybeSingle();
+    if (claimed) work.push(processJob(claimed));
+  }
+  await Promise.all(work);
 }
 
-document.addEventListener('keydown', (e) => {
-  if (waRunning && waPending && (e.key === 'Enter') && document.activeElement && document.activeElement.tagName !== 'INPUT') { e.preventDefault(); waOpenPending(); }
-});
-window.addEventListener('beforeunload', (e) => {
-  if (waRunning) { e.preventDefault(); e.returnValue = ''; }
-});
+module.exports = async function handler(req, res) {
+  try {
+    if (req.method === 'GET') {
+      if (req.query && req.query.tick) { await tickJobs(); return res.status(200).json({ ok: true }); }
+      return await listDestinations(res);
+    }
+    if (req.method !== 'POST') return fail(res, 405, 'M\u00e9todo n\u00e3o permitido.');
 
-// ---------- eventos ----------
-
-$('newPlatform').addEventListener('change', () => {
-  document.querySelectorAll('.tg-only').forEach((el) => el.classList.toggle('hidden', $('newPlatform').value !== 'telegram'));
-});
-$('addDestBtn').addEventListener('click', addDestination);
-$('destSelect').addEventListener('change', () => { updateModeUI(); saveSettings(); $('queueInfo').textContent = ''; });
-$('queueBtn').addEventListener('click', refreshQueue);
-$('testBtn').addEventListener('click', () => { const d = selectedDest(); if (d) testDestination(d.id); });
-$('startBtn').addEventListener('click', startRun);
-$('stopBtn').addEventListener('click', () => stopRun('Parado por você.'));
-$('waBtn').addEventListener('click', openNextWhatsApp);
-$('waStartBtn').addEventListener('click', startWaRun);
-$('waStopBtn').addEventListener('click', () => stopWaRun('Parado por você.'));
-$('waOpenBtn').addEventListener('click', waOpenPending);
-$('verifyBtn').addEventListener('click', verifyQueueUI);
-
-loadAll();
+    const body = req.body || {};
+    switch (body.action) {
+      case 'create_destination': return await createDestination(res, body);
+      case 'delete_destination': {
+        const { error } = await supabaseAdmin.from('dispatch_destinations').delete().eq('id', body.id);
+        if (error) return fail(res, 500, dbError(error));
+        return res.status(200).json({ ok: true });
+      }
+      case 'test': return await sendTest(res, body);
+      case 'queue': return await queue(res, body);
+      case 'verify': return await verifyQueue(res, body);
+      case 'job_start': return await startJob(res, body);
+      case 'job_stop': return await stopJob(res, body);
+      case 'job_ack': return await ackJob(res, body);
+      case 'tick': await tickJobs(); return res.status(200).json(await jobsPayload());
+      case 'send_next': return await sendNext(res, body);
+      default: return fail(res, 400, 'A\u00e7\u00e3o inv\u00e1lida.');
+    }
+  } catch (err) {
+    console.error('dispatch error', err);
+    fail(res, 500, err.message || 'Erro inesperado no disparador.');
+  }
+};
