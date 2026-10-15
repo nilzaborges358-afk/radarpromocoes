@@ -266,7 +266,7 @@ async function testSearch() {
         <div class="item">
           <img src="${item.image || ''}" alt="" loading="lazy" />
           <div>${escapeHtml(item.title)}</div>
-          <div class="t-price">R$ ${Number(item.price).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</div>
+          <div class="t-price">R$ ${Number(item.price).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
         </div>
       `).join('');
       msg.textContent = 'Isso aqui bate com o que você quer? Se sim, clique em "Criar grupo".';
