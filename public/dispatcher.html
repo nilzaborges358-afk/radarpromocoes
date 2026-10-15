@@ -72,6 +72,8 @@
   .log .err { color: var(--bad); }
   .msg { font-size:12px; color: var(--muted); margin-top:8px; min-height:16px; }
   .hidden { display:none !important; }
+  .status-box.alert { border-color: var(--accent); animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { background:#2a2108; } }
 </style>
 </head>
 <body>
@@ -148,7 +150,7 @@
       </div>
       <div class="field" style="max-width:150px;"><label>Intervalo (min)</label><input type="number" id="interval" value="5" min="2" /></div>
       <div class="field" style="max-width:170px;"><label>Parar após (envios)</label><input type="number" id="maxSends" value="20" min="1" max="200" /></div>
-      <div class="field full"><label>Rodapé da mensagem (opcional — recomendo identificar como link de afiliado)</label><input type="text" id="footer" value="🔗 Link de afiliado" /></div>
+      <div class="field full"><label>Linha final da mensagem (opcional — ex.: "Siga o canal para mais ofertas")</label><input type="text" id="footer" value="" /></div>
       <div class="field full">
         <label>Grupos / nichos que podem ser enviados</label>
         <div class="groups-box" id="groupBox"></div>
@@ -159,13 +161,17 @@
 
     <div class="controls">
       <button class="btn secondary" id="queueBtn">Atualizar fila</button>
+      <button class="btn secondary" id="verifyBtn">🔍 Verificar fila</button>
       <button class="btn secondary" id="testBtn">Enviar teste</button>
       <button class="btn" id="startBtn">▶ Iniciar disparo</button>
       <button class="btn danger hidden" id="stopBtn">■ Parar</button>
-      <button class="btn hidden" id="waBtn">📱 Abrir próximo no WhatsApp</button>
+      <button class="btn hidden" id="waStartBtn">🔔 Iniciar alertas do WhatsApp</button>
+      <button class="btn danger hidden" id="waStopBtn">■ Parar alertas</button>
+      <button class="btn secondary hidden" id="waBtn">📱 Abrir próximo agora</button>
     </div>
 
     <div class="status-box" id="statusBox">Parado.</div>
+    <button class="btn hidden" id="waOpenBtn" style="width:100%;margin-top:10px;padding:18px;font-size:16px;">📱 ABRIR NO WHATSAPP E ENVIAR</button>
     <div class="warn" id="runWarn">O disparo só funciona com esta aba aberta e o computador ligado. Se fechar a aba ou o notebook dormir, ele para — e nada é enviado em segundo plano.</div>
   </div>
 
