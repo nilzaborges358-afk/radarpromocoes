@@ -4,7 +4,7 @@ const { getProductOffer } = require('../src/integrations/shopee/client');
 
 // Disparador de promo--es (Telegram autom-tico / WhatsApp assistido).
 // GET  /api/dispatch                      -> lista destinos
-// POST /api/dispatch { action: ... }      -> create_destination | delete_destination | test | queue | send_next
+// POST /api/dispatch { action: ... }      -> create_destination | delete_destination | test | queue | verify | send_next | job_start | job_stop | job_ack | tick
 // Precisa das tabelas dispatch_destinations e dispatch_log (SQL em supabase/migrations/0002_disparador.sql).
 
 const QUEUE_DAYS_SEEN = 3;     // s\u00f3 promo\u00e7\u00f5es vistas pela busca nos \u00faltimos 3 dias
@@ -32,7 +32,7 @@ function tableMissing(error) {
 
 function dbError(error) {
   if (tableMissing(error)) {
-    return 'As tabelas do disparador ainda n\u00e3o existem no Supabase. Rode o SQL do arquivo 0002_disparador.sql (SQL Editor > New query) e tente de novo.';
+    return 'As tabelas do disparador ainda nao existem no Supabase. Rode os SQLs 0002_disparador.sql e 0003_disparo_continuo.sql (SQL Editor > New query) e tente de novo.';
   }
   return `banco de dados: ${error.message || error}`;
 }
@@ -306,7 +306,8 @@ async function listDestinations(res) {
       .eq('destination_id', d.id).eq('skipped', false).gte('sent_at', since);
     out.push({ ...d, sentLast24h: count || 0 });
   }
-  res.status(200).json({ destinations: out });
+  const payload = await jobsPayload();
+  res.status(200).json({ destinations: out, jobs: payload.jobs, now: payload.now });
 }
 
 async function sendTest(res, body) {
@@ -420,9 +421,141 @@ async function sendNext(res, body) {
   res.status(200).json({ ok: true, sent: { title: chosen.title, marketplace: slugName, coupon: view.coupon }, remaining, skipped: skippedInfo });
 }
 
+
+// ---------------- disparo continuo (estado no servidor) ----------------
+
+const CLAIM_STALE_MS = 150 * 1000;
+
+function fakeRes() {
+  return { code: 200, body: null, status(c) { this.code = c; return this; }, json(b) { this.body = b; return this; } };
+}
+
+async function jobsPayload() {
+  const now = new Date().toISOString();
+  const { data, error } = await supabaseAdmin.from('dispatch_jobs').select('*');
+  if (error) return { jobs: [], now, jobsError: error.message };
+  return { jobs: data || [], now };
+}
+
+async function startJob(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino nao encontrado.');
+  const isTelegram = dest.platform === 'telegram';
+  const interval = Math.max(parseInt(body.interval_min, 10) || 0, isTelegram ? 2 : 1);
+  const maxSends = Math.min(Math.max(parseInt(body.max_sends, 10) || 20, 1), 500);
+  const footer = String(body.footer || '').slice(0, 120);
+  const nowIso = new Date().toISOString();
+  const row = {
+    destination_id: dest.id, mode: isTelegram ? 'auto' : 'assisted', status: 'running',
+    interval_min: interval, max_sends: maxSends, sent_count: 0, next_run_at: nowIso, claimed_at: null,
+    filters: { group_ids: Array.isArray(body.group_ids) ? body.group_ids : [], marketplace: body.marketplace || null, footer },
+    pending: null, last_event: 'Disparo iniciado.', last_error: null, error_streak: 0, updated_at: nowIso,
+  };
+  const { error } = await supabaseAdmin.from('dispatch_jobs').upsert(row, { onConflict: 'destination_id' });
+  if (error) return fail(res, 500, dbError(error));
+  res.status(200).json(await jobsPayload());
+}
+
+async function stopJob(res, body) {
+  const { error } = await supabaseAdmin.from('dispatch_jobs')
+    .update({ status: 'stopped', pending: null, claimed_at: null, last_event: 'Parado por voce.', updated_at: new Date().toISOString() })
+    .eq('destination_id', body.destination_id);
+  if (error) return fail(res, 500, dbError(error));
+  res.status(200).json(await jobsPayload());
+}
+
+// WhatsApp assistido: a pessoa abriu o WhatsApp -> conta como enviado e recomeca a contagem.
+async function ackJob(res, body) {
+  const { data: job, error } = await supabaseAdmin.from('dispatch_jobs').select('*').eq('destination_id', body.destination_id).maybeSingle();
+  if (error) return fail(res, 500, dbError(error));
+  if (job && job.pending) {
+    const sent = job.sent_count + 1;
+    const done = sent >= job.max_sends;
+    await supabaseAdmin.from('dispatch_jobs').update({
+      pending: null, sent_count: sent, status: done ? 'stopped' : 'running',
+      next_run_at: new Date(Date.now() + job.interval_min * 60000).toISOString(),
+      last_event: done ? `Meta de ${job.max_sends} envios atingida.` : `Aberto no WhatsApp: ${String(job.pending.title || '').slice(0, 60)}`,
+      last_error: null, updated_at: new Date().toISOString(),
+    }).eq('id', job.id);
+  }
+  res.status(200).json(await jobsPayload());
+}
+
+async function processJob(job) {
+  const nowIso = () => new Date().toISOString();
+  const finish = (patch) => supabaseAdmin.from('dispatch_jobs').update({ claimed_at: null, updated_at: nowIso(), ...patch }).eq('id', job.id);
+  let r;
+  try {
+    const dest = await getDestination(job.destination_id);
+    if (!dest) { await finish({ status: 'stopped', last_error: 'Destino removido.' }); return; }
+    const f = job.filters || {};
+    const fr = fakeRes();
+    await sendNext(fr, { destination_id: dest.id, group_ids: f.group_ids || [], marketplace: f.marketplace || null, footer: f.footer || '' });
+    r = { status: fr.code, json: fr.body || {} };
+  } catch (e) {
+    r = { status: 500, json: { error: e.message || 'erro inesperado' } };
+  }
+
+  const j = r.json;
+  const skippedTxt = j.skipped && j.skipped.length ? ` (${j.skipped.length} pulada(s) por problema no produto)` : '';
+
+  if (r.status === 200 && j.empty) {
+    await finish({ status: 'stopped', pending: null, last_event: 'A fila acabou: nao ha mais promocoes validas para esse filtro.' + skippedTxt });
+    return;
+  }
+  if (r.status === 200) {
+    if (job.mode === 'assisted') {
+      await finish({
+        pending: { message: j.message, title: j.promotion.title, coupon: j.promotion.coupon, remaining: j.remaining, prepared_at: nowIso() },
+        last_event: 'Promocao pronta para enviar.' + skippedTxt, last_error: null, error_streak: 0,
+      });
+      return;
+    }
+    const sent = job.sent_count + 1;
+    const done = sent >= job.max_sends;
+    const t = (j.sent && j.sent.title ? j.sent.title : '').slice(0, 70);
+    await finish({
+      sent_count: sent, status: done ? 'stopped' : 'running',
+      next_run_at: new Date(Date.now() + job.interval_min * 60000).toISOString(),
+      last_event: (done ? `Meta de ${job.max_sends} envios atingida. ` : '') + `Enviado: ${t}${j.sent && j.sent.coupon ? ` (cupom ${j.sent.coupon})` : ''}${skippedTxt}`,
+      last_error: null, error_streak: 0,
+    });
+    return;
+  }
+  // erros
+  const code = j.code;
+  const msg = j.error || 'Falha ao enviar.';
+  if (code === 'daily_limit' || code === 'bad_link') { await finish({ status: 'stopped', pending: null, last_error: msg }); return; }
+  if (code === 'rate_limited') { await finish({ next_run_at: new Date(Date.now() + ((j.retryAfter || 60) + 1) * 1000).toISOString(), last_error: msg }); return; }
+  const streak = (job.error_streak || 0) + 1;
+  if (streak >= 30) { await finish({ status: 'stopped', error_streak: streak, last_error: `${msg} (parei apos 30 falhas seguidas)` }); return; }
+  await finish({ next_run_at: new Date(Date.now() + 60000).toISOString(), error_streak: streak, last_error: msg });
+}
+
+// Roda os disparos que ja estao na hora. Pode ser chamado pela pagina aberta ou por um "relogio" externo.
+async function tickJobs() {
+  const nowIso = new Date().toISOString();
+  const { data: due, error } = await supabaseAdmin.from('dispatch_jobs').select('*')
+    .eq('status', 'running').is('pending', null).lte('next_run_at', nowIso).limit(3);
+  if (error) throw new Error(dbError(error));
+  const work = [];
+  for (const j of due || []) {
+    const stale = new Date(Date.now() - CLAIM_STALE_MS).toISOString();
+    // "trava" atomica: so quem conseguir marcar o claimed_at executa (evita envio duplicado)
+    const { data: claimed } = await supabaseAdmin.from('dispatch_jobs').update({ claimed_at: nowIso })
+      .eq('id', j.id).eq('status', 'running').lte('next_run_at', nowIso)
+      .or(`claimed_at.is.null,claimed_at.lt.${stale}`).select().maybeSingle();
+    if (claimed) work.push(processJob(claimed));
+  }
+  await Promise.all(work);
+}
+
 module.exports = async function handler(req, res) {
   try {
-    if (req.method === 'GET') return await listDestinations(res);
+    if (req.method === 'GET') {
+      if (req.query && req.query.tick) { await tickJobs(); return res.status(200).json({ ok: true }); }
+      return await listDestinations(res);
+    }
     if (req.method !== 'POST') return fail(res, 405, 'M\u00e9todo n\u00e3o permitido.');
 
     const body = req.body || {};
@@ -436,6 +569,10 @@ module.exports = async function handler(req, res) {
       case 'test': return await sendTest(res, body);
       case 'queue': return await queue(res, body);
       case 'verify': return await verifyQueue(res, body);
+      case 'job_start': return await startJob(res, body);
+      case 'job_stop': return await stopJob(res, body);
+      case 'job_ack': return await ackJob(res, body);
+      case 'tick': await tickJobs(); return res.status(200).json(await jobsPayload());
       case 'send_next': return await sendNext(res, body);
       default: return fail(res, 400, 'A\u00e7\u00e3o inv\u00e1lida.');
     }
