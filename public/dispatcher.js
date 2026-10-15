@@ -10,6 +10,12 @@ let sentThisRun = 0;
 let errorsInRow = 0;
 let tickTimer = null;
 let wakeLock = null;
+let waRunning = false;
+let waPending = null;
+let waAlarmTimer = null;
+let waTitleTimer = null;
+let audioCtx = null;
+const WA_MIN_INTERVAL = 1; // minutos (WhatsApp assistido: quem envia é você)
 
 function escapeHtml(str) {
   const d = document.createElement('div');
@@ -139,7 +145,7 @@ function restoreSettings() {
     if (s.mp !== undefined) $('mpSelect').value = s.mp;
     if (s.interval) $('interval').value = s.interval;
     if (s.maxSends) $('maxSends').value = s.maxSends;
-    if (s.footer !== undefined) $('footer').value = s.footer;
+    if (s.footer !== undefined && !/afiliad/i.test(s.footer)) $('footer').value = s.footer;
   } catch { /* ignora */ }
 }
 
@@ -152,10 +158,13 @@ function updateModeUI() {
   const manual = dest && dest.platform === 'whatsapp_manual';
   $('startBtn').classList.toggle('hidden', running || manual);
   $('stopBtn').classList.toggle('hidden', !running);
-  $('waBtn').classList.toggle('hidden', !manual);
-  $('runWarn').classList.toggle('hidden', manual);
-  ['destSelect', 'mpSelect', 'interval', 'maxSends', 'footer', 'testBtn', 'queueBtn'].forEach((id) => { $(id).disabled = running; });
-  document.querySelectorAll('.grp').forEach((c) => { c.disabled = running; });
+  $('waStartBtn').classList.toggle('hidden', !manual || waRunning);
+  $('waStopBtn').classList.toggle('hidden', !manual || !waRunning);
+  $('waBtn').classList.toggle('hidden', !manual || waRunning);
+  $('runWarn').classList.toggle('hidden', manual && !waRunning);
+  const busy = running || waRunning;
+  ['destSelect', 'mpSelect', 'interval', 'maxSends', 'footer', 'testBtn', 'queueBtn', 'verifyBtn'].forEach((id) => { $(id).disabled = busy; });
+  document.querySelectorAll('.grp').forEach((c) => { c.disabled = busy; });
 }
 
 function filters() {
@@ -313,6 +322,7 @@ async function doSend() {
 
   try {
     const r = await api({ action: 'send_next', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace, footer: f.footer });
+    logSkipped(r.skipped);
     if (r.empty) {
       stopRun('A fila acabou: não há mais promoções com link de afiliado para esse filtro.');
       return;
@@ -326,6 +336,7 @@ async function doSend() {
     errorsInRow += 1;
     log(`⚠️ ${err.message}`, 'err');
     if (err.code === 'daily_limit') { stopRun('Limite diário do destino atingido.'); return; }
+    if (err.code === 'bad_link') { stopRun('O link de afiliado foi recusado — corrija o ID em Marketplaces.'); return; }
     if (err.code === 'rate_limited') nextAt = Date.now() + ((err.retryAfter || 60) + 1) * 1000;
     else if (err.code === 'too_fast') nextAt = Date.now() + 60000;
     else if (errorsInRow >= 3) { stopRun('3 falhas seguidas — parei por segurança.'); return; }
@@ -344,6 +355,7 @@ async function openNextWhatsApp() {
   const tab = openWhatsAppTab();
   try {
     const r = await api({ action: 'send_next', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace, footer: f.footer });
+    logSkipped(r.skipped);
     if (r.empty) {
       if (tab) tab.close();
       $('statusBox').textContent = 'Fila vazia para esse filtro.';
@@ -360,6 +372,162 @@ async function openNextWhatsApp() {
   }
 }
 
+
+function logSkipped(list) {
+  (list || []).forEach((x) => log(`⏭️ Pulada: ${String(x.title).slice(0, 60)} — ${x.reason}`, 'err'));
+}
+
+// ---------- verificar fila (sem enviar) ----------
+
+async function verifyQueueUI() {
+  const dest = selectedDest();
+  if (!dest) { $('queueInfo').textContent = 'Crie um destino primeiro.'; return; }
+  $('queueInfo').textContent = 'Conferindo os próximos produtos (abrindo cada link)... pode levar até 1 minuto.';
+  $('verifyBtn').disabled = true;
+  try {
+    const f = filters();
+    const r = await api({ action: 'verify', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace });
+    let msg = `Conferidos ${r.checked} de ${r.total} na fila: ${r.ok} ok`;
+    if (r.removed.length) msg += `, ${r.removed.length} removidos (produto não existe mais)`;
+    if (r.warnings.length) msg += `. ⚠️ ${r.warnings[0]}`;
+    $('queueInfo').textContent = msg + '.';
+    r.removed.forEach((x) => log(`🗑️ Removida: ${String(x.title).slice(0, 60)} — ${x.reason}`, 'err'));
+  } catch (err) {
+    $('queueInfo').textContent = `Erro: ${err.message}`;
+  } finally {
+    $('verifyBtn').disabled = false;
+  }
+}
+
+// ---------- WhatsApp com alerta (semi-automático) ----------
+// O WhatsApp não permite postar em grupo por API. Aqui o sistema prepara a mensagem no tempo certo,
+// toca um alarme + notificação, e você só abre, escolhe o grupo e envia (1 toque).
+
+function beep() {
+  try {
+    if (!audioCtx) return;
+    [0, 0.25, 0.5].forEach((delay) => {
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.type = 'sine'; o.frequency.value = 880;
+      g.gain.setValueAtTime(0.0001, audioCtx.currentTime + delay);
+      g.gain.exponentialRampToValueAtTime(0.4, audioCtx.currentTime + delay + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + delay + 0.2);
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(audioCtx.currentTime + delay); o.stop(audioCtx.currentTime + delay + 0.22);
+    });
+  } catch { /* sem áudio: segue */ }
+}
+
+function startAlarm(title) {
+  stopAlarm();
+  beep();
+  waAlarmTimer = setInterval(beep, 6000); // repete até você abrir
+  const original = document.title;
+  let on = false;
+  waTitleTimer = setInterval(() => { on = !on; document.title = on ? '🔔 ENVIAR AGORA!' : original; }, 800);
+  waTitleTimer.original = original;
+  try {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      const n = new Notification('📱 Promoção pronta para enviar', { body: title.slice(0, 100), requireInteraction: true });
+      n.onclick = () => { window.focus(); n.close(); };
+    }
+  } catch { /* ignora */ }
+}
+
+function stopAlarm() {
+  if (waAlarmTimer) clearInterval(waAlarmTimer);
+  if (waTitleTimer) { clearInterval(waTitleTimer); document.title = waTitleTimer.original || document.title; }
+  waAlarmTimer = null; waTitleTimer = null;
+}
+
+async function startWaRun() {
+  const dest = selectedDest();
+  if (!dest) { alert('Crie e selecione um destino.'); return; }
+  const interval = parseInt($('interval').value, 10);
+  const f = filters();
+  if (!interval || interval < WA_MIN_INTERVAL) { alert(`O intervalo mínimo é ${WA_MIN_INTERVAL} minuto.`); return; }
+  if (!f.group_ids.length) { alert('Marque pelo menos um grupo.'); return; }
+  try { audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)(); await audioCtx.resume(); } catch { /* sem áudio */ }
+  try { if ('Notification' in window && Notification.permission === 'default') await Notification.requestPermission(); } catch { /* ignora */ }
+  saveSettings();
+  waRunning = true; waPending = null; inFlight = false; sentThisRun = 0;
+  nextAt = Date.now(); // a primeira já vem pronta agora
+  await acquireWakeLock();
+  tickTimer = setInterval(waTick, 1000);
+  updateModeUI();
+  beep(); // teste de som
+  log(`Alertas do WhatsApp iniciados: uma promoção pronta a cada ${interval} min.`, 'ok');
+}
+
+function stopWaRun(reason) {
+  if (!waRunning) return;
+  waRunning = false; waPending = null;
+  clearInterval(tickTimer); tickTimer = null;
+  stopAlarm(); releaseWakeLock();
+  $('waOpenBtn').classList.add('hidden');
+  $('statusBox').classList.remove('running', 'alert');
+  $('statusBox').innerHTML = `<b>Parado.</b> ${escapeHtml(reason || '')}`;
+  updateModeUI();
+  log(`Alertas parados. ${reason || ''}`);
+  loadAll();
+}
+
+async function waTick() {
+  if (!waRunning) return;
+  const box = $('statusBox');
+  if (waPending) return; // alarme tocando, esperando você
+  const remaining = nextAt - Date.now();
+  if (inFlight) { box.innerHTML = '<span class="big">Preparando e conferindo o produto...</span>'; return; }
+  if (remaining > 0) {
+    box.classList.add('running'); box.classList.remove('alert');
+    const m = String(Math.floor(remaining / 60000)).padStart(2, '0');
+    const s = String(Math.floor((remaining % 60000) / 1000)).padStart(2, '0');
+    box.innerHTML = `<span class="big">Próxima promoção em ${m}:${s}</span><br>Enviadas nesta sessão: ${sentThisRun}`;
+    return;
+  }
+  inFlight = true;
+  const dest = selectedDest();
+  const f = filters();
+  try {
+    const r = await api({ action: 'send_next', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace, footer: f.footer });
+    logSkipped(r.skipped);
+    if (r.empty) { stopWaRun('A fila acabou: não há mais promoções válidas para esse filtro.'); return; }
+    waPending = r;
+    try { navigator.clipboard.writeText(r.message); } catch { /* ignora */ }
+    box.classList.remove('running'); box.classList.add('alert');
+    box.innerHTML = `<span class="big">🔔 PRONTA PARA ENVIAR</span><br>${escapeHtml(r.promotion.title.slice(0, 90))}${r.promotion.coupon ? ` · cupom <b>${escapeHtml(r.promotion.coupon)}</b>` : ''}<br>Restam ${r.remaining} na fila. Aperte o botão (ou Enter), escolha o grupo e envie.`;
+    $('waOpenBtn').classList.remove('hidden');
+    startAlarm(r.promotion.title);
+  } catch (err) {
+    log(`⚠️ ${err.message}`, 'err');
+    if (err.code === 'daily_limit' || err.code === 'bad_link') { stopWaRun(err.message); return; }
+    nextAt = Date.now() + 30000;
+  } finally {
+    inFlight = false;
+  }
+}
+
+function waOpenPending() {
+  if (!waPending) return;
+  const r = waPending;
+  waPending = null;
+  stopAlarm();
+  window.open(`https://wa.me/?text=${encodeURIComponent(r.message)}`, '_blank');
+  sentThisRun += 1;
+  log(`📱 Aberto no WhatsApp: ${r.promotion.title.slice(0, 70)}`, 'ok');
+  $('waOpenBtn').classList.add('hidden');
+  $('statusBox').classList.remove('alert');
+  nextAt = Date.now() + (parseInt($('interval').value, 10) || 3) * 60000; // contagem recomeça depois que você abre
+}
+
+document.addEventListener('keydown', (e) => {
+  if (waRunning && waPending && (e.key === 'Enter') && document.activeElement && document.activeElement.tagName !== 'INPUT') { e.preventDefault(); waOpenPending(); }
+});
+window.addEventListener('beforeunload', (e) => {
+  if (waRunning) { e.preventDefault(); e.returnValue = ''; }
+});
+
 // ---------- eventos ----------
 
 $('newPlatform').addEventListener('change', () => {
@@ -372,5 +540,9 @@ $('testBtn').addEventListener('click', () => { const d = selectedDest(); if (d) 
 $('startBtn').addEventListener('click', startRun);
 $('stopBtn').addEventListener('click', () => stopRun('Parado por você.'));
 $('waBtn').addEventListener('click', openNextWhatsApp);
+$('waStartBtn').addEventListener('click', startWaRun);
+$('waStopBtn').addEventListener('click', () => stopWaRun('Parado por você.'));
+$('waOpenBtn').addEventListener('click', waOpenPending);
+$('verifyBtn').addEventListener('click', verifyQueueUI);
 
 loadAll();
