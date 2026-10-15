@@ -60,7 +60,7 @@ async function loadAll() {
     $('destMsg').textContent = '';
   } else {
     destinations = [];
-    $('destMsg').textContent = `Erro ao carregar destinos: ${d.reason.message} (já rodou o SQL v30 no Supabase? Está logado?)`;
+    $('destMsg').textContent = `Erro ao carregar destinos: ${d.reason.message} (já rodou o SQL 0002_disparador.sql no Supabase? Está logado?)`;
   }
 
   if (g.status === 'fulfilled') groups = g.value.groups || [];
