@@ -1,5 +1,6 @@
 const { supabaseAdmin } = require('../src/core/database/supabaseClient');
 const { getNetshoesContext, loadNetshoesCoupons, bestNetshoesCoupon } = require('../src/core/coupons');
+const { getProductOffer } = require('../src/integrations/shopee/client');
 
 // Disparador de promoções (Telegram automático / WhatsApp assistido).
 // GET  /api/dispatch                      -> lista destinos
@@ -72,50 +73,117 @@ function friendlyTelegramError(err) {
 
 // ---------------- mensagens (várias variações) ----------------
 
-const OPENERS = ['🔥', '💥', '⚡', '🚨', '🛒', '😍', '🤑', '👀'];
+const OPENERS = ['🔥', '🛒', '👀', '💥', '⚡', '😍'];
 
 function pick(arr, n) { return arr[Math.abs(n) % arr.length]; }
 
 // Monta o texto. "turn" gira entre os modelos, então duas mensagens seguidas nunca saem iguais.
+// Tom: quem está compartilhando achou uma oferta boa. Nada de aviso técnico/“link de afiliado” no texto.
 function buildMessage(p, turn, footer) {
   const emoji = pick(OPENERS, turn + p.title.length);
   const title = esc(p.title);
   const link = esc(p.affiliate_url);
   const { price, listPrice, coupon, finalPrice } = p.view;
   const off = p.view.discount ? Math.round(p.view.discount) : null;
+  const hasList = listPrice && listPrice > price;
+  const now = coupon ? finalPrice : price;
 
-  // linhas de preço
-  const deLine = listPrice && listPrice > price ? `De <s>R$ ${money(listPrice)}</s> por <b>R$ ${money(price)}</b>` : `<b>R$ ${money(price)}</b>`;
-  const couponLine = coupon ? `🎟️ Cupom <b>${esc(coupon)}</b>: fica <b>R$ ${money(finalPrice)}</b>` : null;
-  const offTxt = off ? ` (${off}% OFF)` : '';
-  const shortPrice = coupon ? `R$ ${money(finalPrice)} com o cupom ${esc(coupon)}` : `R$ ${money(price)}`;
+  const priceLine = hasList
+    ? `💰 De <s>R$ ${money(listPrice)}</s> por <b>R$ ${money(now)}</b>${off ? ` (${off}% OFF)` : ''}`
+    : `💰 Por apenas <b>R$ ${money(now)}</b>${off ? ` (${off}% OFF)` : ''}`;
+  const couponLine = coupon ? `🎟️ Use o cupom <b>${esc(coupon)}</b> no carrinho` : null;
+  const storeLine = coupon ? `💳 Preço na loja: R$ ${money(price)}` : null;
 
   const templates = [
-    // 0
-    () => [`${emoji} <b>ACHADINHO!</b>`, '', title, '', deLine + offTxt, couponLine, '', `👉 ${link}`],
-    // 1
-    () => [`${emoji} Olha esse preço: <b>${shortPrice}</b>${offTxt}`, '', title, couponLine && listPrice ? `Antes: <s>R$ ${money(listPrice)}</s>` : (listPrice && listPrice > price ? `Antes: <s>R$ ${money(listPrice)}</s>` : null), '', `Garanta aqui 👇`, link],
-    // 2
-    () => [`🛍️ <b>Promoção no ar</b>`, title, '', deLine, couponLine, off ? `📉 ${off}% de desconto` : null, '', `🔗 ${link}`],
-    // 3
-    () => [`${emoji} Corre que pode acabar!`, '', `<b>${title}</b>`, `💰 ${shortPrice}${listPrice && listPrice > price ? ` (era R$ ${money(listPrice)})` : ''}`, '', `Comprar: ${link}`],
-    // 4
-    () => [`✅ <b>Achado do dia</b>`, '', title, '', couponLine ? `Preço na loja: R$ ${money(price)}` : deLine + offTxt, couponLine, '', `👉 Pegue pelo link: ${link}`],
-    // 5
-    () => [`${emoji} <b>Tá barato!</b> ${off ? `${off}% OFF` : ''}`.trim(), title, '', `${listPrice && listPrice > price ? `<s>R$ ${money(listPrice)}</s> → ` : ''}<b>R$ ${money(couponLine ? finalPrice : price)}</b>${coupon ? ` (cupom ${esc(coupon)})` : ''}`, '', `🛒 ${link}`],
+    () => [`${emoji} <b>Olha o que a gente encontrou!</b>`, '', title, '', priceLine, couponLine, '', `🛒 Aproveite: ${link}`],
+    () => [`${emoji} <b>Oferta boa demais pra deixar passar</b>`, '', title, '', priceLine, couponLine, '', `👉 ${link}`],
+    () => [`✅ <b>Separamos essa pra você</b>`, '', title, priceLine, storeLine, couponLine, '', `Garanta aqui 👇`, link],
+    () => [`${emoji} <b>Achado do dia</b>`, title, '', priceLine, couponLine, '', `🛒 ${link}`],
+    () => [`${emoji} <b>Preço bom apareceu!</b>`, '', title, '', priceLine, couponLine, '', `Corre ver: ${link}`],
+    () => [`⭐ <b>Recomendação do dia</b>`, '', title, '', priceLine, couponLine, '', `👉 Confira aqui: ${link}`],
   ];
 
   const lines = templates[Math.abs(turn) % templates.length]().filter((l) => l !== null && l !== undefined);
-  // limpa linhas em branco repetidas
   const cleaned = [];
   for (const l of lines) { if (l === '' && (cleaned.length === 0 || cleaned[cleaned.length - 1] === '')) continue; cleaned.push(l); }
-  if (footer) cleaned.push('', esc(footer));
+  // Rodapé opcional — mas nunca deixa sair aviso de "afiliado".
+  const safeFooter = footer && !/afiliad/i.test(footer) ? footer : '';
+  if (safeFooter) cleaned.push('', esc(safeFooter));
   return cleaned.join('\n');
 }
 
 // Versão sem HTML para o WhatsApp (que não entende <b>/<s>).
 function toPlain(html) {
   return html.replace(/<\/?(b|s)>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+
+// ---------------- validação antes de enviar ----------------
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const DEAD_RE = /o produto n[ãa]o existe|produto n[ãa]o encontrado|p[áa]gina n[ãa]o encontrada|produto indispon[íi]vel|product (does not exist|not found)/i;
+const BADLINK_RE = /invalid publisher code|partnership status/i;
+
+// Abre o link como um cliente abriria e procura sinais claros de problema.
+// Só reprova quando o sinal é claro; se o site bloquear/der erro de rede, segue (inconclusivo).
+async function checkLink(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const r = await fetch(url, { redirect: 'follow', signal: ctrl.signal, headers: { 'User-Agent': UA, 'Accept-Language': 'pt-BR,pt;q=0.9', Accept: 'text/html,*/*' } });
+    if (r.status === 404 || r.status === 410) return { ok: false, kind: 'dead', reason: `a página do produto não existe mais (erro ${r.status})` };
+    const text = (await r.text().catch(() => '')).slice(0, 40000);
+    if (BADLINK_RE.test(text)) return { ok: false, kind: 'badlink', reason: 'a rede de afiliados recusou o link (ID/parceria inválidos)' };
+    if (DEAD_RE.test(text)) return { ok: false, kind: 'dead', reason: 'a loja informa que o produto não existe' };
+    return { ok: true };
+  } catch { return { ok: true, inconclusive: true }; }
+  finally { clearTimeout(timer); }
+}
+
+function shopeeIds(url) {
+  const u = String(url || '');
+  let m = u.match(/\/product\/(\d+)\/(\d+)/) || u.match(/-i\.(\d+)\.(\d+)/);
+  return m ? { shopId: m[1], itemId: m[2] } : null;
+}
+
+let shopeeCreds;
+async function getShopeeCreds() {
+  if (shopeeCreds !== undefined) return shopeeCreds;
+  const { data: mp } = await supabaseAdmin.from('marketplaces').select('id').eq('slug', 'shopee').maybeSingle();
+  if (!mp) return (shopeeCreds = null);
+  const { data: c } = await supabaseAdmin.from('marketplace_credentials').select('client_id, client_secret').eq('marketplace_id', mp.id).maybeSingle();
+  return (shopeeCreds = c && c.client_id && c.client_secret ? c : null);
+}
+
+// Confirma na API oficial da Shopee que o anúncio ainda existe e qual o preço de hoje.
+async function checkShopee(p) {
+  const ids = shopeeIds(p.original_url);
+  const creds = await getShopeeCreds();
+  if (!ids || !creds) return { ok: true, inconclusive: true };
+  try {
+    const node = await getProductOffer(creds.client_id, creds.client_secret, ids.itemId);
+    if (!node) return { ok: false, kind: 'dead', reason: 'a Shopee não devolve mais esse anúncio (produto removido)' };
+    const live = Number(String(node.priceMin).replace(',', '.'));
+    return { ok: true, livePrice: Number.isFinite(live) && live > 0 ? live : null };
+  } catch { return { ok: true, inconclusive: true }; }
+}
+
+// Retorna { ok, kind, reason, livePrice }
+async function validatePromotion(p) {
+  const slug = p.marketplaces && p.marketplaces.slug;
+  if (slug === 'shopee') {
+    const sh = await checkShopee(p);
+    if (!sh.ok) return sh;
+    if (sh.livePrice && Number(p.current_price) > 0 && sh.livePrice > Number(p.current_price) * 1.05) {
+      return { ok: false, kind: 'stale', reason: `o preço subiu (de R$ ${money(p.current_price)} para R$ ${money(sh.livePrice)})` };
+    }
+  }
+  return checkLink(p.affiliate_url);
+}
+
+async function ignorePromotion(p, why) {
+  await supabaseAdmin.from('promotions').update({ status: 'IGNORED' }).eq('id', p.id);
+  await supabaseAdmin.from('integration_logs').insert({ marketplace_id: null, level: 'warn', message: `Disparador removeu da fila "${String(p.title).slice(0, 60)}": ${why}` }).then(() => {}, () => {});
 }
 
 // ---------------- fila ----------------
@@ -263,6 +331,25 @@ async function queue(res, body) {
   });
 }
 
+
+// Confere os próximos da fila SEM enviar nada. Quem não existe mais é removido (vai para "Ignoradas").
+async function verifyQueue(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino não encontrado.');
+  const list = await loadQueue(dest.id, body);
+  const sample = list.slice(0, 12);
+  const out = { total: list.length, checked: 0, ok: 0, removed: [], warnings: [] };
+  for (const p of sample) {
+    const check = await validatePromotion(p);
+    out.checked += 1;
+    if (check.ok) { out.ok += 1; continue; }
+    if (check.kind === 'badlink') { out.warnings.push(check.reason); break; }
+    if (check.kind === 'dead') await ignorePromotion(p, check.reason);
+    out.removed.push({ title: p.title, reason: check.reason });
+  }
+  res.status(200).json(out);
+}
+
 async function sendNext(res, body) {
   const dest = await getDestination(body.destination_id);
   if (!dest) return fail(res, 404, 'Destino não encontrado.');
@@ -280,15 +367,28 @@ async function sendNext(res, body) {
 
   const list = await loadQueue(dest.id, body);
   let chosen = null; let view = null; let tries = 0;
+  const skippedInfo = [];
   for (const p of list) {
     if (tries >= 8) break;
     tries += 1;
+    // 1) o produto/link ainda existe e funciona?
+    const check = await validatePromotion(p);
+    if (!check.ok) {
+      if (check.kind === 'badlink') {
+        return fail(res, 409, `Parei por segurança: ${check.reason}. Confira o ID de afiliado em Marketplaces antes de continuar.`, { code: 'bad_link' });
+      }
+      if (check.kind === 'dead') await ignorePromotion(p, check.reason);
+      await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: `pulada: ${check.reason}` });
+      skippedInfo.push({ title: p.title, reason: check.reason });
+      continue;
+    }
+    // 2) preço/cupom de agora
     const v = await buildView(p);
     if (v) { chosen = p; view = v; break; }
-    // oferta que não vale mais: registra como pulada para não ficar travando a fila
     await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: 'pulada: cupom não confirmado' });
+    skippedInfo.push({ title: p.title, reason: 'o cupom dessa oferta não está mais válido' });
   }
-  if (!chosen) return res.status(200).json({ empty: true });
+  if (!chosen) return res.status(200).json({ empty: true, skipped: skippedInfo });
 
   chosen.view = view;
   const { count: total } = await supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true }).eq('destination_id', dest.id);
@@ -299,7 +399,7 @@ async function sendNext(res, body) {
   if (dest.platform === 'whatsapp_manual') {
     const plain = toPlain(html);
     await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: plain });
-    return res.status(200).json({ ok: true, manual: true, message: plain, promotion: { title: chosen.title, coupon: view.coupon }, remaining });
+    return res.status(200).json({ ok: true, manual: true, message: plain, promotion: { title: chosen.title, coupon: view.coupon }, remaining, skipped: skippedInfo });
   }
 
   try {
@@ -317,7 +417,7 @@ async function sendNext(res, body) {
   }
 
   await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: toPlain(html) });
-  res.status(200).json({ ok: true, sent: { title: chosen.title, marketplace: slugName, coupon: view.coupon }, remaining });
+  res.status(200).json({ ok: true, sent: { title: chosen.title, marketplace: slugName, coupon: view.coupon }, remaining, skipped: skippedInfo });
 }
 
 module.exports = async function handler(req, res) {
@@ -335,6 +435,7 @@ module.exports = async function handler(req, res) {
       }
       case 'test': return await sendTest(res, body);
       case 'queue': return await queue(res, body);
+      case 'verify': return await verifyQueue(res, body);
       case 'send_next': return await sendNext(res, body);
       default: return fail(res, 400, 'Ação inválida.');
     }
