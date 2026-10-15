@@ -13,6 +13,9 @@ function num(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+// Arredonda para 2 casas (centavos) — evita preços como 59,841.
+function r2(n) { return Math.round((Number(n) + Number.EPSILON) * 100) / 100; }
+
 function listFrom(value) {
   return String(value || '').split(',').map((v) => v.trim().toUpperCase()).filter(Boolean);
 }
@@ -259,8 +262,8 @@ function matchCoupons(coupons, ctx) {
       discount = c.discount_type === 'percent' ? (price * value) / 100 : value;
       const cap = num(c.max_discount);
       if (cap && discount > cap) discount = cap;
-      discount = Math.min(discount, price);
-      finalPrice = Math.max(price - discount, 0);
+      discount = r2(Math.min(discount, price));
+      finalPrice = r2(Math.max(price - discount, 0));
     }
     applicable.push({ coupon: c, discount, finalPrice, warnings });
   }
@@ -545,8 +548,8 @@ function matchNetshoesCoupon(c, product) {
   let discount = null; let finalPrice = null;
   if (product.price && parsed.type && parsed.value && !parsed.approx) {
     discount = parsed.type === 'percent' ? (product.price * parsed.value) / 100 : parsed.value;
-    discount = Math.min(discount, product.price);
-    finalPrice = Math.max(product.price - discount, 0);
+    discount = r2(Math.min(discount, product.price));
+    finalPrice = r2(Math.max(product.price - discount, 0));
   } else if (parsed.approx) {
     warnings.push('o desconto é "até X": o valor real pode ser menor');
   }
@@ -642,8 +645,8 @@ async function netshoesProducts(supabase, body) {
         applies = true;
         discount = type === 'percent' ? (price * value) / 100 : value;
         if (cap && discount > cap) discount = cap;
-        discount = Math.min(discount, price);
-        finalPrice = Math.max(price - discount, 0);
+        discount = r2(Math.min(discount, price));
+        finalPrice = r2(Math.max(price - discount, 0));
       }
     }
     products.push({
