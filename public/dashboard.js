@@ -521,7 +521,7 @@ function buildShareMessage(promo, { includeLink = true } = {}) {
 }
 
 function formatPrice(value) {
-  return Number(value).toLocaleString('pt-BR', { minimumFractionDigits: 2 });
+  return Number(value).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function escapeHtml(str) {
