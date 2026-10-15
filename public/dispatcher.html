@@ -72,6 +72,7 @@
   .log .err { color: var(--bad); }
   .msg { font-size:12px; color: var(--muted); margin-top:8px; min-height:16px; }
   .hidden { display:none !important; }
+  select option { background:#14161a; color:#e8e8e8; }
   .status-box.alert { border-color: var(--accent); animation: pulse 1s infinite; }
   @keyframes pulse { 50% { background:#2a2108; } }
 </style>
@@ -181,7 +182,7 @@
     <div class="log" id="log"></div>
   </div>
 
-  <script src="dispatcher.js"></script>
+  <script src="dispatcher.js?v=20261015c"></script>
   <script>
     document.getElementById('logoutLink').addEventListener('click', async () => {
       await fetch('/api/auth/session', { method: 'DELETE' });
