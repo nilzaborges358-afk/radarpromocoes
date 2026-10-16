@@ -133,7 +133,7 @@
   <!-- 2. Envio -->
   <div class="block">
     <div class="block-title">2. Envio</div>
-    <p class="block-sub">Só entram na fila promoções que têm link de afiliado, que a busca viu nos últimos 3 dias, e que ainda não foram enviadas a esse destino nas últimas 2 semanas. Vão primeiro as de maior desconto.</p>
+    <p class="block-sub">Só entram na fila promoções que têm link de afiliado, que a busca viu nas últimas 24 horas (e o sistema confere o preço de novo na hora de enviar), e que ainda não foram enviadas a esse destino nas últimas 2 semanas. Vão primeiro as de maior desconto.</p>
 
     <div class="grid">
       <div class="field"><label>Destino</label><select id="destSelect"></select></div>
@@ -182,7 +182,7 @@
     <div class="log" id="log"></div>
   </div>
 
-  <script src="dispatcher.js?v=20261015c"></script>
+  <script src="dispatcher.js?v=20261015d"></script>
   <script>
     document.getElementById('logoutLink').addEventListener('click', async () => {
       await fetch('/api/auth/session', { method: 'DELETE' });
