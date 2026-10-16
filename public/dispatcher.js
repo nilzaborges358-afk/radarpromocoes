@@ -1,564 +1,193 @@
-const $ = (id) => document.getElementById(id);
-const MIN_INTERVAL = 2; // minutos — abaixo disso vira spam
-
-let destinations = [];
-let groups = [];
-let jobs = [];
-let serverOffset = 0; // diferenca entre o relogio do servidor e o do computador
-let pollTimer = null;
-let uiTimer = null;
-let ticking = false;
-let lastTickErr = '';
-let lastSeen = {};
-let alarmKey = null;
-let audioCtx = null;
-let waAlarmTimer = null;
-let waTitleTimer = null;
-const WA_MIN_INTERVAL = 1; // minutos (WhatsApp assistido: quem envia e voce)
-
-function escapeHtml(str) {
-  const d = document.createElement('div');
-  d.textContent = str == null ? '' : String(str);
-  return d.innerHTML;
-}
-
-async function api(body) {
-  const res = await fetch('/api/dispatch', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = new Error(data.error || 'Falha na requisição');
-    err.code = data.code;
-    err.retryAfter = data.retryAfter;
-    throw err;
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8" />
+<title>Radar — Disparador</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #101114; --panel: #17181c; --line: #2b2d33; --ink: #f3f2ee;
+    --muted: #8b8d94; --accent: #e7b24a; --good: #5fcb8f; --bad: #e2604a;
+    --font-display: 'Space Grotesk', sans-serif; --font-body: 'Inter', sans-serif;
   }
-  return data;
-}
+  * { box-sizing: border-box; }
+  body { margin:0; background: var(--bg); color: var(--ink); font-family: var(--font-body); -webkit-font-smoothing: antialiased; }
 
-function log(text, kind) {
-  const line = document.createElement('div');
-  if (kind) line.className = kind;
-  line.textContent = `${new Date().toLocaleTimeString('pt-BR')}  ${text}`;
-  const box = $('log');
-  box.prepend(line);
-  while (box.children.length > 60) box.removeChild(box.lastChild);
-}
+  nav { display:flex; justify-content:space-between; align-items:center; padding:18px 32px; border-bottom:1px solid var(--line); }
+  nav .nav-links { display:flex; gap:24px; }
+  nav .logout-link { cursor:pointer; }
+  nav a { color: var(--muted); text-decoration:none; font-size:13px; font-weight:500; padding-bottom:4px; border-bottom:2px solid transparent; }
+  nav a.active { color: var(--ink); border-bottom-color: var(--accent); }
 
-// ---------- erros visíveis ----------
-// Se algo quebrar, a mensagem aparece na tela (em vez de campos em branco sem explicação).
-function showPageError(msg) {
-  const el = $('destMsg');
-  if (el) el.textContent = `Erro na página: ${msg}. Atualize com Ctrl+F5; se continuar, me mande esta mensagem.`;
-}
-window.addEventListener('error', (e) => showPageError(e.message));
-window.addEventListener('unhandledrejection', (e) => showPageError((e.reason && e.reason.message) || String(e.reason)));
+  .masthead { padding: 28px 32px 8px; }
+  .wordmark { font-family: var(--font-display); font-weight:700; font-size:24px; margin:0; letter-spacing:-0.02em; }
+  .wordmark span { color: var(--accent); }
+  .tagline { font-size:13px; color: var(--muted); margin:4px 0 0; }
 
-// ---------- carregar dados ----------
+  .block { margin: 20px 32px; padding: 20px 22px; background: var(--panel); border: 1px solid var(--line); }
+  .block-title { font-family: var(--font-display); font-weight:600; font-size:15px; margin-bottom:4px; }
+  .block-sub { font-size:12px; color: var(--muted); margin:0 0 16px; line-height:1.5; }
 
-async function fetchJson(url) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 15000);
-  try {
-    const res = await fetch(url, { signal: ctrl.signal });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || data.error) throw new Error(data.error || `Erro ${res.status}`);
-    return data;
-  } catch (err) {
-    if (err.name === 'AbortError') throw new Error('o servidor demorou mais de 15s para responder');
-    throw err;
-  } finally {
-    clearTimeout(timer);
+  .grid { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; }
+  .field { flex:1; min-width:180px; }
+  .field label { display:block; font-size:12px; color: var(--muted); margin-bottom:6px; }
+  .field input, .field select {
+    width:100%; background:#0d0e10; border:1px solid var(--line); color: var(--ink);
+    padding:9px 10px; font-family: var(--font-body); font-size:13px;
   }
-}
+  .full { flex-basis:100%; }
 
-// Destinos e grupos carregam de forma independente: se um falhar, o outro continua aparecendo.
-async function loadAll() {
-  // Nunca deixa os campos em branco enquanto carrega.
-  if (!$('destSelect').options.length) $('destSelect').innerHTML = '<option value="">Carregando destinos...</option>';
-  if (!$('groupBox').children.length) $('groupBox').innerHTML = '<span class="dest-meta">Carregando grupos...</span>';
-  const [d, g] = await Promise.allSettled([fetchJson('/api/dispatch'), fetchJson('/api/groups')]);
+  button { font-family: var(--font-body); }
+  .btn { background: var(--accent); color:#1a1204; border:none; font-weight:600; font-size:13px; padding:10px 18px; cursor:pointer; }
+  .btn.secondary { background:transparent; color: var(--ink); border:1px solid var(--line); }
+  .btn.danger { background:transparent; color: var(--bad); border:1px solid var(--bad); }
+  .btn.small { padding:6px 10px; font-size:12px; }
+  .btn:disabled { opacity:0.5; cursor:not-allowed; }
 
-  if (d.status === 'fulfilled') {
-    destinations = d.value.destinations || [];
-    jobs = d.value.jobs || [];
-    if (d.value.now) serverOffset = new Date(d.value.now).getTime() - Date.now();
-    $('destMsg').textContent = '';
-  } else {
-    destinations = [];
-    $('destMsg').textContent = `Erro ao carregar destinos: ${d.reason.message} (já rodou o SQL 0002_disparador.sql no Supabase? Está logado?)`;
-  }
+  .dest-list { display:flex; flex-direction:column; gap:1px; background:var(--line); margin-bottom:16px; }
+  .dest-row { background:#0d0e10; padding:10px 14px; display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+  .dest-name { font-size:13px; font-weight:600; }
+  .dest-meta { font-size:11.5px; color: var(--muted); }
+  .dest-actions { display:flex; gap:8px; }
 
-  if (g.status === 'fulfilled') groups = g.value.groups || [];
-  else { groups = []; $('queueInfo').textContent = `Erro ao carregar grupos: ${g.reason.message}`; }
+  details { margin: 0 0 14px; font-size:12.5px; color: var(--muted); }
+  details summary { cursor:pointer; color: var(--accent); }
+  details ol { margin:8px 0 0 18px; padding:0; line-height:1.6; }
 
-  renderDestinations(d.status === 'rejected' ? d.reason.message : null);
-  renderGroups();
-  restoreSettings();
-  applyJobToUI();
-  updateModeUI();
-  jobs.forEach((j) => { lastSeen[j.id] = jobSig(j); });
-  renderJob();
-  ensurePolling();
-}
+  .groups-box { display:flex; flex-wrap:wrap; gap:6px 16px; padding-top:4px; max-height:220px; overflow-y:auto; }
+  .check { display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; }
 
-function renderDestinations(loadError) {
-  // O seletor da etapa 2 é montado primeiro, independente da lista da etapa 1.
-  const sel = $('destSelect');
-  const prev = sel.value;
-  if (destinations.length) {
-    sel.innerHTML = destinations.map((d) => `<option value="${d.id}">${escapeHtml(d.name)}${d.platform === 'whatsapp_manual' ? ' (WhatsApp)' : ' (Telegram)'}</option>`).join('');
-    if (destinations.some((d) => d.id === prev)) sel.value = prev;
-  } else {
-    sel.innerHTML = `<option value="">${loadError ? 'Erro ao carregar destinos' : 'Nenhum destino — adicione na etapa 1'}</option>`;
-  }
+  .queue-info { margin-top:12px; font-size:12.5px; color: var(--muted); min-height:18px; }
+  .controls { display:flex; gap:10px; margin-top:14px; flex-wrap:wrap; align-items:center; }
+  .status-box { margin-top:14px; padding:12px 14px; background:#0d0e10; border:1px solid var(--line); font-size:13px; min-height:44px; }
+  .status-box .big { font-family: var(--font-display); font-size:18px; font-weight:600; }
+  .status-box.running { border-color: var(--good); }
+  .warn { margin-top:12px; font-size:12px; color: var(--accent); line-height:1.5; }
 
-  const list = $('destList');
-  if (!destinations.length) {
-    list.innerHTML = '<div class="dest-row"><span class="dest-meta">Nenhum destino ainda. Adicione um abaixo.</span></div>';
-  } else {
-    list.innerHTML = destinations.map((d) => `
-      <div class="dest-row">
-        <div>
-          <div class="dest-name">${escapeHtml(d.name)}</div>
-          <div class="dest-meta">${d.platform === 'telegram' ? `Telegram · ${escapeHtml(d.chat_id)}` : 'WhatsApp (assistido)'} · enviados em 24h: ${d.sentLast24h}/${d.daily_limit}</div>
-        </div>
-        <div class="dest-actions">
-          <button class="btn secondary small" data-test="${d.id}">Testar</button>
-          <button class="btn danger small" data-del="${d.id}">Remover</button>
-        </div>
-      </div>`).join('');
-    list.querySelectorAll('[data-test]').forEach((b) => b.addEventListener('click', () => testDestination(b.dataset.test)));
-    list.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', () => removeDestination(b.dataset.del)));
-  }
+  .log { max-height:260px; overflow:auto; font-size:12.5px; line-height:1.7; color: var(--muted); }
+  .log .ok { color: var(--good); }
+  .log .err { color: var(--bad); }
+  .msg { font-size:12px; color: var(--muted); margin-top:8px; min-height:16px; }
+  .hidden { display:none !important; }
+  select option { background:#14161a; color:#e8e8e8; }
+  .status-box.alert { border-color: var(--accent); animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { background:#2a2108; } }
+</style>
+</head>
+<body>
 
-}
+  <nav>
+    <div class="nav-links">
+      <a href="index.html">Painel geral</a>
+      <a href="marketplaces.html">Marketplaces</a>
+      <a href="watchlist.html">Lista de vigilância</a>
+      <a href="generator.html">Gerador de Link</a>
+      <a href="coupons.html">Cupons</a>
+      <a href="dispatcher.html" class="active">Disparador</a>
+    </div>
+    <a class="logout-link" id="logoutLink">Sair</a>
+  </nav>
 
-// Nomes iguais viram UM grupo só. O valor da caixinha guarda todos os ids do grupo (separados por vírgula).
-function mergedGroups() {
-  const map = new Map();
-  groups.forEach((g) => {
-    const key = String(g.name || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    if (!map.has(key)) map.set(key, { name: String(g.name || '').replace(/\s+/g, ' ').trim(), ids: [] });
-    map.get(key).ids.push(g.id);
-    const cleaned = String(g.name || '').replace(/\s+/g, ' ').trim();
-    if (!/[A-ZÀ-Þ]/.test(map.get(key).name) && /[A-ZÀ-Þ]/.test(cleaned)) map.get(key).name = cleaned;
-  });
-  return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
-}
+  <div class="masthead">
+    <h1 class="wordmark">Disparador<span>.</span></h1>
+    <p class="tagline">Envia as promoções que já têm o seu link de afiliado, uma de cada vez, no intervalo que você escolher</p>
+  </div>
 
-function renderGroups() {
-  const options = [...mergedGroups().map((g) => ({ id: g.ids.join(','), name: g.name })), { id: 'none', name: 'Sem grupo' }];
-  $('groupBox').innerHTML = options.map((g) => `
-    <label class="check"><input type="checkbox" class="grp" value="${escapeHtml(g.id)}" checked /> ${escapeHtml(g.name)}</label>`).join('');
-}
+  <!-- 1. Destinos -->
+  <div class="block">
+    <div class="block-title">1. Destinos</div>
+    <p class="block-sub">Telegram envia sozinho. WhatsApp não tem API oficial para postar em grupo: nele o sistema só prepara a mensagem e você toca em enviar.</p>
 
-// ---------- configurações lembradas no navegador (nada sensível) ----------
+    <div class="dest-list" id="destList"></div>
 
-function saveSettings() {
-  localStorage.setItem('dispatcher', JSON.stringify({
-    dest: $('destSelect').value, mp: $('mpSelect').value, interval: $('interval').value,
-    maxSends: $('maxSends').value, footer: $('footer').value, groups: filters().group_ids,
-  }));
-}
+    <details>
+      <summary>Como conectar um canal ou grupo do Telegram (5 minutos)</summary>
+      <ol>
+        <li>No Telegram, abra o <b>@BotFather</b>, mande <code>/newbot</code>, escolha um nome e copie o <b>token</b> que ele devolver.</li>
+        <li>Crie um canal ou grupo (ou use um que já exista) e <b>adicione o bot</b> nele. Em canal, o bot precisa ser <b>administrador</b> com permissão de postar.</li>
+        <li>Em <b>Chat</b>, use <code>@nome_do_canal</code> (canal público) ou o id numérico (grupo/canal privado).</li>
+        <li>Preencha abaixo, clique em <b>Adicionar destino</b> e depois em <b>Testar</b>.</li>
+      </ol>
+    </details>
 
-function checkGroups(ids) {
-  const set = new Set(ids || []);
-  document.querySelectorAll('.grp').forEach((c) => { c.checked = c.value.split(',').some((id) => set.has(id)); });
-}
+    <div class="grid">
+      <div class="field">
+        <label>Tipo</label>
+        <select id="newPlatform">
+          <option value="telegram">Telegram (automático)</option>
+          <option value="whatsapp_manual">WhatsApp (assistido)</option>
+        </select>
+      </div>
+      <div class="field"><label>Nome</label><input type="text" id="newName" placeholder="Ex: Achadinhos Beleza" /></div>
+      <div class="field tg-only"><label>Chat (@canal ou id)</label><input type="text" id="newChat" placeholder="@meucanal" /></div>
+      <div class="field tg-only"><label>Token do bot</label><input type="password" id="newToken" placeholder="123456:ABC..." /></div>
+      <div class="field" style="max-width:150px;"><label>Limite por 24h</label><input type="number" id="newLimit" value="60" min="1" max="200" /></div>
+      <button class="btn" id="addDestBtn">Adicionar destino</button>
+    </div>
+    <div class="msg" id="destMsg"></div>
+  </div>
 
-function restoreSettings() {
-  try {
-    const s = JSON.parse(localStorage.getItem('dispatcher') || '{}');
-    if (s.dest && destinations.some((d) => d.id === s.dest)) $('destSelect').value = s.dest;
-    if (s.mp !== undefined) $('mpSelect').value = s.mp;
-    if (s.interval) $('interval').value = s.interval;
-    if (s.maxSends) $('maxSends').value = s.maxSends;
-    if (s.footer !== undefined && !/afiliad/i.test(s.footer)) $('footer').value = s.footer;
-    if (Array.isArray(s.groups) && s.groups.length) checkGroups(s.groups);
-  } catch { /* ignora */ }
-}
+  <!-- 2. Envio -->
+  <div class="block">
+    <div class="block-title">2. Envio</div>
+    <p class="block-sub">Só entram na fila promoções que têm link de afiliado, que a busca viu nas últimas 24 horas (e o sistema confere o preço de novo na hora de enviar), e que ainda não foram enviadas a esse destino nas últimas 2 semanas. Vão primeiro as de maior desconto.</p>
 
-// Se ja existe um disparo rodando (ou parado) para o destino escolhido, mostra os filtros DELE.
-function applyJobToUI() {
-  const job = selectedJob(false);
-  if (!job) return;
-  const f = job.filters || {};
-  $('interval').value = job.interval_min;
-  $('maxSends').value = job.max_sends;
-  $('mpSelect').value = f.marketplace || '';
-  $('footer').value = f.footer || '';
-  checkGroups(f.group_ids || []);
-}
+    <div class="grid">
+      <div class="field"><label>Destino</label><select id="destSelect"></select></div>
+      <div class="field">
+        <label>Marketplace</label>
+        <select id="mpSelect">
+          <option value="">Todos</option>
+          <option value="shopee">Shopee</option>
+          <option value="netshoes">Netshoes</option>
+          <option value="riachuelo">Riachuelo</option>
+          <option value="mercadolivre">Mercado Livre</option>
+          <option value="magalu">Magalu</option>
+          <option value="amazon">Amazon</option>
+        </select>
+      </div>
+      <div class="field" style="max-width:150px;"><label>Intervalo (min)</label><input type="number" id="interval" value="5" min="2" /></div>
+      <div class="field" style="max-width:170px;"><label>Parar após (envios)</label><input type="number" id="maxSends" value="20" min="1" max="200" /></div>
+      <div class="field full"><label>Linha final da mensagem (opcional — ex.: "Siga o canal para mais ofertas")</label><input type="text" id="footer" value="" /></div>
+      <div class="field full">
+        <label>Grupos / nichos que podem ser enviados</label>
+        <div class="groups-box" id="groupBox"></div>
+      </div>
+    </div>
 
-function selectedDest() {
-  return destinations.find((d) => d.id === $('destSelect').value) || null;
-}
+    <div class="queue-info" id="queueInfo"></div>
 
-function updateModeUI() {
-  const dest = selectedDest();
-  const manual = !!dest && dest.platform === 'whatsapp_manual';
-  const busy = !!selectedJob(false);
-  $('startBtn').classList.toggle('hidden', busy || manual);
-  $('stopBtn').classList.toggle('hidden', !busy || manual);
-  $('waStartBtn').classList.toggle('hidden', !manual || busy);
-  $('waStopBtn').classList.toggle('hidden', !manual || !busy);
-  $('waBtn').classList.toggle('hidden', !manual || busy);
-  ['destSelect', 'mpSelect', 'interval', 'maxSends', 'footer', 'testBtn', 'queueBtn', 'verifyBtn'].forEach((id) => { $(id).disabled = busy && id !== 'destSelect' ? true : false; });
-  document.querySelectorAll('.grp').forEach((c) => { c.disabled = busy; });
-}
+    <div class="controls">
+      <button class="btn secondary" id="queueBtn">Atualizar fila</button>
+      <button class="btn secondary" id="verifyBtn">🔍 Verificar fila</button>
+      <button class="btn secondary" id="testBtn">Enviar teste</button>
+      <button class="btn" id="startBtn">▶ Iniciar disparo</button>
+      <button class="btn danger hidden" id="stopBtn">■ Parar</button>
+      <button class="btn hidden" id="waStartBtn">🔔 Iniciar alertas do WhatsApp</button>
+      <button class="btn danger hidden" id="waStopBtn">■ Parar alertas</button>
+      <button class="btn secondary hidden" id="waBtn">📱 Abrir próximo agora</button>
+    </div>
 
-function filters() {
-  const group_ids = [...document.querySelectorAll('.grp:checked')].flatMap((c) => c.value.split(',')).filter(Boolean);
-  return { group_ids, marketplace: $('mpSelect').value || null, footer: $('footer').value.trim() };
-}
+    <div class="status-box" id="statusBox">Parado.</div>
+    <button class="btn hidden" id="waOpenBtn" style="width:100%;margin-top:10px;padding:18px;font-size:16px;">📱 ABRIR NO WHATSAPP E ENVIAR</button>
+    <div class="warn" id="runWarn">O disparo fica salvo no servidor: você pode recarregar a página, trocar de aba ou publicar uma atualização que ele continua do ponto onde estava. Os envios são executados enquanto alguma página do painel estiver aberta ou se você configurar o relógio externo (cron-job.org) — veja as instruções.</div>
+  </div>
 
-// ---------- destinos ----------
+  <!-- 3. Registro -->
+  <div class="block">
+    <div class="block-title">3. Registro desta sessão</div>
+    <div class="log" id="log"></div>
+  </div>
 
-async function addDestination() {
-  const btn = $('addDestBtn');
-  btn.disabled = true;
-  $('destMsg').textContent = '';
-  try {
-    const data = await api({
-      action: 'create_destination',
-      platform: $('newPlatform').value,
-      name: $('newName').value,
-      chat_id: $('newChat').value,
-      bot_token: $('newToken').value,
-      daily_limit: $('newLimit').value,
+  <script src="dispatcher.js?v=20261015d"></script>
+  <script>
+    document.getElementById('logoutLink').addEventListener('click', async () => {
+      await fetch('/api/auth/session', { method: 'DELETE' });
+      window.location.href = '/login.html';
     });
-    ['newName', 'newChat', 'newToken'].forEach((id) => { $(id).value = ''; });
-    $('destMsg').textContent = data.botUsername ? `Destino criado. Bot reconhecido: @${data.botUsername}. Clique em "Testar".` : 'Destino criado.';
-    await loadAll();
-  } catch (err) {
-    $('destMsg').textContent = `Erro: ${err.message}`;
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-async function removeDestination(id) {
-  if (!confirm('Remover esse destino? O histórico de envios dele também some.')) return;
-  await api({ action: 'delete_destination', id });
-  await loadAll();
-}
-
-// Abre o WhatsApp numa aba aberta no clique (senão o navegador bloqueia o pop-up).
-function openWhatsAppTab() {
-  return window.open('', '_blank');
-}
-function fillWhatsAppTab(tab, message) {
-  const url = `https://wa.me/?text=${encodeURIComponent(message)}`;
-  if (tab) tab.location = url; else window.open(url, '_blank');
-}
-
-async function testDestination(id) {
-  const dest = destinations.find((d) => d.id === id);
-  const tab = dest && dest.platform === 'whatsapp_manual' ? openWhatsAppTab() : null;
-  try {
-    const r = await api({ action: 'test', destination_id: id });
-    if (r.manual) fillWhatsAppTab(tab, r.message);
-    log(`Teste enviado para "${dest ? dest.name : ''}".`, 'ok');
-    $('destMsg').textContent = 'Teste enviado — confira no destino.';
-  } catch (err) {
-    if (tab) tab.close();
-    log(`Teste falhou: ${err.message}`, 'err');
-    $('destMsg').textContent = `Erro: ${err.message}`;
-  }
-}
-
-// ---------- fila ----------
-
-async function refreshQueue() {
-  const dest = selectedDest();
-  if (!dest) { $('queueInfo').textContent = 'Crie um destino primeiro.'; return; }
-  $('queueInfo').textContent = 'Consultando a fila...';
-  try {
-    const f = filters();
-    const r = await api({ action: 'queue', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace });
-    if (!r.count) {
-      $('queueInfo').textContent = 'Fila vazia: nenhuma promoção com link de afiliado, vista nos últimos 3 dias, que ainda não tenha ido para esse destino. Rode uma busca no Painel geral.';
-    } else {
-      const n = r.next;
-      $('queueInfo').textContent = `Na fila: ${r.count}. Próxima: ${n.title.slice(0, 70)} — R$ ${Number(n.price).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${n.discount ? ` (${Math.round(n.discount)}% OFF)` : ''}${n.marketplace ? ` · ${n.marketplace}` : ''}`;
-    }
-  } catch (err) {
-    $('queueInfo').textContent = `Erro: ${err.message}`;
-  }
-}
-
-// ---------- disparo contínuo (o estado fica salvo no servidor) ----------
-// Recarregar a página, trocar de aba ou publicar uma atualização NÃO zera nada:
-// contador, horário do próximo envio e total enviado ficam no banco.
-
-function selectedJob(includeStopped) {
-  const d = selectedDest();
-  if (!d) return null;
-  const list = jobs.filter((j) => j.destination_id === d.id);
-  const running = list.find((j) => j.status === 'running');
-  return running || (includeStopped ? list[0] || null : null);
-}
-
-const serverNow = () => Date.now() + serverOffset;
-const jobSig = (j) => `${j.sent_count}|${j.status}|${j.last_event || ''}|${j.last_error || ''}`;
-
-function applyJobs(data) {
-  if (data.now) serverOffset = new Date(data.now).getTime() - Date.now();
-  jobs = data.jobs || [];
-  jobs.forEach((j) => {
-    const sig = jobSig(j);
-    if (lastSeen[j.id] !== undefined && lastSeen[j.id] !== sig) {
-      if (j.last_error) log(`⚠️ ${j.last_error}`, 'err');
-      else if (j.last_event) log(j.last_event, 'ok');
-    }
-    lastSeen[j.id] = sig;
-  });
-  updateModeUI();
-  renderJob();
-  ensurePolling();
-}
-
-// Pergunta ao servidor se tem envio na hora (e o servidor executa). Roda enquanto houver disparo ativo.
-async function tickServer() {
-  if (ticking) return;
-  ticking = true;
-  try {
-    applyJobs(await api({ action: 'tick' }));
-    lastTickErr = '';
-  } catch (err) {
-    if (err.message !== lastTickErr) { lastTickErr = err.message; log(`⚠️ Sem resposta do servidor (${err.message}). Tentando de novo...`, 'err'); }
-  } finally {
-    ticking = false;
-  }
-}
-
-function ensurePolling() {
-  const any = jobs.some((j) => j.status === 'running');
-  if (any && !pollTimer) { pollTimer = setInterval(tickServer, 10000); tickServer(); }
-  if (!any && pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-  if (!uiTimer) uiTimer = setInterval(renderJob, 1000);
-}
-
-function renderJob() {
-  const box = $('statusBox');
-  const openBtn = $('waOpenBtn');
-  const job = selectedJob(true);
-  if (!job) { openBtn.classList.add('hidden'); return; }
-
-  if (job.status !== 'running') {
-    box.classList.remove('running', 'alert');
-    box.innerHTML = `<b>Parado.</b> ${escapeHtml(job.last_event || '')}${job.last_error ? `<br>⚠️ ${escapeHtml(job.last_error)}` : ''}<br>Enviados nesta rodada: ${job.sent_count}/${job.max_sends}`;
-    openBtn.classList.add('hidden');
-    alarmKey = null; stopAlarm();
-    return;
-  }
-
-  if (job.pending) {
-    box.classList.remove('running'); box.classList.add('alert');
-    box.innerHTML = `<span class="big">🔔 PRONTA PARA ENVIAR</span><br>${escapeHtml(String(job.pending.title || '').slice(0, 90))}${job.pending.coupon ? ` · cupom <b>${escapeHtml(job.pending.coupon)}</b>` : ''}<br>Restam ${job.pending.remaining} na fila. Aperte o botão (ou Enter), escolha o grupo e envie.`;
-    openBtn.classList.remove('hidden');
-    if (alarmKey !== job.pending.prepared_at) {
-      alarmKey = job.pending.prepared_at;
-      startAlarm(String(job.pending.title || ''));
-      try { navigator.clipboard.writeText(job.pending.message); } catch { /* ignora */ }
-    }
-    return;
-  }
-
-  alarmKey = null; stopAlarm();
-  openBtn.classList.add('hidden');
-  box.classList.remove('alert'); box.classList.add('running');
-  const remaining = new Date(job.next_run_at).getTime() - serverNow();
-  const progress = `Enviados: ${job.sent_count}/${job.max_sends}`;
-  if (remaining > 0) {
-    const m = String(Math.floor(remaining / 60000)).padStart(2, '0');
-    const s = String(Math.floor((remaining % 60000) / 1000)).padStart(2, '0');
-    box.innerHTML = `<span class="big">Próximo envio em ${m}:${s}</span><br>${progress}${job.last_event ? `<br>${escapeHtml(job.last_event)}` : ''}`;
-  } else {
-    box.innerHTML = `<span class="big">${job.mode === 'assisted' ? 'Preparando e conferindo o produto...' : 'Enviando...'}</span><br>${progress}`;
-  }
-}
-
-async function startRun() {
-  const dest = selectedDest();
-  if (!dest) { alert('Crie e selecione um destino.'); return; }
-  const manual = dest.platform === 'whatsapp_manual';
-  const interval = parseInt($('interval').value, 10);
-  const maxSends = parseInt($('maxSends').value, 10) || 20;
-  const f = filters();
-  const minInterval = manual ? WA_MIN_INTERVAL : MIN_INTERVAL;
-  if (!interval || interval < minInterval) { alert(`O intervalo mínimo é ${minInterval} minuto(s).`); return; }
-  if (!f.group_ids.length) { alert('Marque pelo menos um grupo.'); return; }
-  const aviso = manual
-    ? 'A cada intervalo o sistema prepara a promoção e toca o alerta; você só abre e envia.'
-    : 'O disparo fica salvo no servidor: pode recarregar a página ou trocar de aba.';
-  if (!confirm(`Enviar 1 promoção a cada ${interval} min para "${dest.name}", até ${maxSends} envios.\n\n${aviso}\n\nComeçar?`)) return;
-
-  unlockAudio();
-  try { if (manual && 'Notification' in window && Notification.permission === 'default') await Notification.requestPermission(); } catch { /* ignora */ }
-  saveSettings();
-  try {
-    applyJobs(await api({ action: 'job_start', destination_id: dest.id, interval_min: interval, max_sends: maxSends, group_ids: f.group_ids, marketplace: f.marketplace, footer: f.footer }));
-    log(`Disparo iniciado: 1 promoção a cada ${interval} min, até ${maxSends} envios.`, 'ok');
-    if (manual) beep();
-  } catch (err) {
-    log(`⚠️ ${err.message}`, 'err');
-    alert(err.message);
-  }
-}
-
-async function stopRun() {
-  const job = selectedJob(false);
-  if (!job) return;
-  try {
-    applyJobs(await api({ action: 'job_stop', destination_id: job.destination_id }));
-    log('Disparo parado por você.');
-  } catch (err) { log(`⚠️ ${err.message}`, 'err'); }
-}
-
-// ---------- WhatsApp assistido ----------
-
-async function openNextWhatsApp() {
-  const dest = selectedDest();
-  if (!dest) return;
-  const f = filters();
-  const tab = openWhatsAppTab();
-  try {
-    const r = await api({ action: 'send_next', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace, footer: f.footer });
-    logSkipped(r.skipped);
-    if (r.empty) {
-      if (tab) tab.close();
-      $('statusBox').textContent = 'Fila vazia para esse filtro.';
-      return;
-    }
-    fillWhatsAppTab(tab, r.message);
-    $('statusBox').innerHTML = `<b>Preparado:</b> ${escapeHtml(r.promotion.title.slice(0, 80))}${r.promotion.coupon ? ` · cupom <b>${escapeHtml(r.promotion.coupon)}</b>` : ''}<br>Restam ${r.remaining} na fila. Escolha o grupo no WhatsApp e toque em enviar.`;
-    log(`📱 Preparado para WhatsApp: ${r.promotion.title.slice(0, 70)}`, 'ok');
-    loadAll();
-  } catch (err) {
-    if (tab) tab.close();
-    $('statusBox').textContent = `Erro: ${err.message}`;
-    log(`⚠️ ${err.message}`, 'err');
-  }
-}
-
-
-function logSkipped(list) {
-  (list || []).forEach((x) => log(`⏭️ Pulada: ${String(x.title).slice(0, 60)} — ${x.reason}`, 'err'));
-}
-
-// ---------- verificar fila (sem enviar) ----------
-
-async function verifyQueueUI() {
-  const dest = selectedDest();
-  if (!dest) { $('queueInfo').textContent = 'Crie um destino primeiro.'; return; }
-  $('queueInfo').textContent = 'Conferindo os próximos produtos (abrindo cada link)... pode levar até 1 minuto.';
-  $('verifyBtn').disabled = true;
-  try {
-    const f = filters();
-    const r = await api({ action: 'verify', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace });
-    let msg = `Conferidos ${r.checked} de ${r.total} na fila: ${r.ok} ok`;
-    if (r.removed.length) msg += `, ${r.removed.length} removidos (produto não existe mais)`;
-    if (r.warnings.length) msg += `. ⚠️ ${r.warnings[0]}`;
-    $('queueInfo').textContent = msg + '.';
-    r.removed.forEach((x) => log(`🗑️ Removida: ${String(x.title).slice(0, 60)} — ${x.reason}`, 'err'));
-  } catch (err) {
-    $('queueInfo').textContent = `Erro: ${err.message}`;
-  } finally {
-    $('verifyBtn').disabled = false;
-  }
-}
-
-// ---------- WhatsApp com alerta (semi-automático) ----------
-// O WhatsApp não permite postar em grupo por API. Aqui o sistema prepara a mensagem no tempo certo,
-// toca um alarme + notificação, e você só abre, escolhe o grupo e envia (1 toque).
-
-function beep() {
-  // Som suave: dois toques graves e curtos, tipo "gota" (sem aquele bipe agudo de alerta).
-  try {
-    if (!audioCtx) return;
-    const t0 = audioCtx.currentTime;
-    [[392, 0], [523.25, 0.32]].forEach(([freq, delay]) => { // sol -> do
-      const o = audioCtx.createOscillator();
-      const g = audioCtx.createGain();
-      o.type = 'sine'; o.frequency.value = freq;
-      g.gain.setValueAtTime(0.0001, t0 + delay);
-      g.gain.exponentialRampToValueAtTime(0.12, t0 + delay + 0.04);
-      g.gain.exponentialRampToValueAtTime(0.0001, t0 + delay + 1.1);
-      o.connect(g); g.connect(audioCtx.destination);
-      o.start(t0 + delay); o.stop(t0 + delay + 1.2);
-    });
-  } catch { /* sem áudio: segue */ }
-}
-
-function startAlarm(title) {
-  stopAlarm();
-  beep();
-  waAlarmTimer = setInterval(beep, 20000); // repete a cada 20s até você abrir
-  const original = document.title;
-  let on = false;
-  waTitleTimer = setInterval(() => { on = !on; document.title = on ? '🔔 ENVIAR AGORA!' : original; }, 800);
-  waTitleTimer.original = original;
-  try {
-    if ('Notification' in window && Notification.permission === 'granted') {
-      const n = new Notification('📱 Promoção pronta para enviar', { body: title.slice(0, 100), requireInteraction: true });
-      n.onclick = () => { window.focus(); n.close(); };
-    }
-  } catch { /* ignora */ }
-}
-
-function stopAlarm() {
-  if (waAlarmTimer) clearInterval(waAlarmTimer);
-  if (waTitleTimer) { clearInterval(waTitleTimer); document.title = waTitleTimer.original || document.title; }
-  waAlarmTimer = null; waTitleTimer = null;
-}
-
-function unlockAudio() {
-  try {
-    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-    if (audioCtx.state === 'suspended') audioCtx.resume();
-  } catch { /* sem áudio */ }
-}
-// O navegador só libera som depois de um clique. Qualquer clique na página já destrava.
-['pointerdown', 'keydown'].forEach((ev) => document.addEventListener(ev, unlockAudio, { passive: true }));
-
-async function waOpenPending() {
-  const job = selectedJob(false);
-  if (!job || !job.pending) return;
-  const msg = job.pending.message;
-  window.open(`https://wa.me/?text=${encodeURIComponent(msg)}`, '_blank'); // dentro do clique, senão o navegador bloqueia
-  stopAlarm(); alarmKey = null;
-  $('waOpenBtn').classList.add('hidden');
-  log(`📱 Aberto no WhatsApp: ${String(job.pending.title || '').slice(0, 70)}`, 'ok');
-  try { applyJobs(await api({ action: 'job_ack', destination_id: job.destination_id })); }
-  catch (err) { log(`⚠️ ${err.message}`, 'err'); }
-}
-
-document.addEventListener('keydown', (e) => {
-  const job = selectedJob(false);
-  if (job && job.pending && e.key === 'Enter' && document.activeElement && !['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(document.activeElement.tagName)) {
-    e.preventDefault(); waOpenPending();
-  }
-});
-
-// ---------- eventos ----------
-
-$('newPlatform').addEventListener('change', () => {
-  document.querySelectorAll('.tg-only').forEach((el) => el.classList.toggle('hidden', $('newPlatform').value !== 'telegram'));
-});
-$('addDestBtn').addEventListener('click', addDestination);
-$('destSelect').addEventListener('change', () => { applyJobToUI(); updateModeUI(); renderJob(); saveSettings(); $('queueInfo').textContent = ''; });
-$('queueBtn').addEventListener('click', refreshQueue);
-$('testBtn').addEventListener('click', () => { const d = selectedDest(); if (d) testDestination(d.id); });
-$('startBtn').addEventListener('click', startRun);
-$('stopBtn').addEventListener('click', stopRun);
-$('waBtn').addEventListener('click', openNextWhatsApp);
-$('waStartBtn').addEventListener('click', startRun);
-$('waStopBtn').addEventListener('click', stopRun);
-$('waOpenBtn').addEventListener('click', waOpenPending);
-$('verifyBtn').addEventListener('click', verifyQueueUI);
-
-loadAll();
+  </script>
+</body>
+</html>
