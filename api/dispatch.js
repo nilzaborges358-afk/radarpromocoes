@@ -1,582 +1,193 @@
-const { supabaseAdmin } = require('../src/core/database/supabaseClient');
-const { getNetshoesContext, loadNetshoesCoupons, bestNetshoesCoupon } = require('../src/core/coupons');
-const { getProductOffer } = require('../src/integrations/shopee/client');
-
-// Disparador de promo--es (Telegram autom-tico / WhatsApp assistido).
-// GET  /api/dispatch                      -> lista destinos
-// POST /api/dispatch { action: ... }      -> create_destination | delete_destination | test | queue | verify | send_next | job_start | job_stop | job_ack | tick
-// Precisa das tabelas dispatch_destinations e dispatch_log (SQL em supabase/migrations/0002_disparador.sql).
-
-const QUEUE_DAYS_SEEN = 3;     // s\u00f3 promo\u00e7\u00f5es vistas pela busca nos \u00faltimos 3 dias
-const NO_REPEAT_DAYS = 14;     // n\u00e3o repete a mesma promo\u00e7\u00e3o no mesmo destino por 2 semanas
-const MIN_GAP_SECONDS = 20;    // trava anti-duplo-clique
-const COUPON_CACHE_MS = 10 * 60 * 1000;
-let couponCache = { at: 0, list: null };
-
-// ---------------- utilit-rios ----------------
-
-const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-const money = (n) => Number(n).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const r2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
-const isoAgo = (ms) => new Date(Date.now() - ms).toISOString();
-const DAY = 24 * 60 * 60 * 1000;
-
-function fail(res, status, error, extra) {
-  res.status(status).json({ error, ...(extra || {}) });
-}
-
-function tableMissing(error) {
-  const m = String((error && (error.message || error)) || '');
-  return (error && error.code === '42P01') || /does not exist|schema cache|relation .* not found/i.test(m);
-}
-
-function dbError(error) {
-  if (tableMissing(error)) {
-    return 'As tabelas do disparador ainda nao existem no Supabase. Rode os SQLs 0002_disparador.sql e 0003_disparo_continuo.sql (SQL Editor > New query) e tente de novo.';
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8" />
+<title>Radar — Disparador</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #101114; --panel: #17181c; --line: #2b2d33; --ink: #f3f2ee;
+    --muted: #8b8d94; --accent: #e7b24a; --good: #5fcb8f; --bad: #e2604a;
+    --font-display: 'Space Grotesk', sans-serif; --font-body: 'Inter', sans-serif;
   }
-  return `banco de dados: ${error.message || error}`;
-}
+  * { box-sizing: border-box; }
+  body { margin:0; background: var(--bg); color: var(--ink); font-family: var(--font-body); -webkit-font-smoothing: antialiased; }
 
-async function telegram(token, method, payload) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 12000);
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload || {}),
-      signal: ctrl.signal,
+  nav { display:flex; justify-content:space-between; align-items:center; padding:18px 32px; border-bottom:1px solid var(--line); }
+  nav .nav-links { display:flex; gap:24px; }
+  nav .logout-link { cursor:pointer; }
+  nav a { color: var(--muted); text-decoration:none; font-size:13px; font-weight:500; padding-bottom:4px; border-bottom:2px solid transparent; }
+  nav a.active { color: var(--ink); border-bottom-color: var(--accent); }
+
+  .masthead { padding: 28px 32px 8px; }
+  .wordmark { font-family: var(--font-display); font-weight:700; font-size:24px; margin:0; letter-spacing:-0.02em; }
+  .wordmark span { color: var(--accent); }
+  .tagline { font-size:13px; color: var(--muted); margin:4px 0 0; }
+
+  .block { margin: 20px 32px; padding: 20px 22px; background: var(--panel); border: 1px solid var(--line); }
+  .block-title { font-family: var(--font-display); font-weight:600; font-size:15px; margin-bottom:4px; }
+  .block-sub { font-size:12px; color: var(--muted); margin:0 0 16px; line-height:1.5; }
+
+  .grid { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; }
+  .field { flex:1; min-width:180px; }
+  .field label { display:block; font-size:12px; color: var(--muted); margin-bottom:6px; }
+  .field input, .field select {
+    width:100%; background:#0d0e10; border:1px solid var(--line); color: var(--ink);
+    padding:9px 10px; font-family: var(--font-body); font-size:13px;
+  }
+  .full { flex-basis:100%; }
+
+  button { font-family: var(--font-body); }
+  .btn { background: var(--accent); color:#1a1204; border:none; font-weight:600; font-size:13px; padding:10px 18px; cursor:pointer; }
+  .btn.secondary { background:transparent; color: var(--ink); border:1px solid var(--line); }
+  .btn.danger { background:transparent; color: var(--bad); border:1px solid var(--bad); }
+  .btn.small { padding:6px 10px; font-size:12px; }
+  .btn:disabled { opacity:0.5; cursor:not-allowed; }
+
+  .dest-list { display:flex; flex-direction:column; gap:1px; background:var(--line); margin-bottom:16px; }
+  .dest-row { background:#0d0e10; padding:10px 14px; display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+  .dest-name { font-size:13px; font-weight:600; }
+  .dest-meta { font-size:11.5px; color: var(--muted); }
+  .dest-actions { display:flex; gap:8px; }
+
+  details { margin: 0 0 14px; font-size:12.5px; color: var(--muted); }
+  details summary { cursor:pointer; color: var(--accent); }
+  details ol { margin:8px 0 0 18px; padding:0; line-height:1.6; }
+
+  .groups-box { display:flex; flex-wrap:wrap; gap:6px 16px; padding-top:4px; max-height:220px; overflow-y:auto; }
+  .check { display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; }
+
+  .queue-info { margin-top:12px; font-size:12.5px; color: var(--muted); min-height:18px; }
+  .controls { display:flex; gap:10px; margin-top:14px; flex-wrap:wrap; align-items:center; }
+  .status-box { margin-top:14px; padding:12px 14px; background:#0d0e10; border:1px solid var(--line); font-size:13px; min-height:44px; }
+  .status-box .big { font-family: var(--font-display); font-size:18px; font-weight:600; }
+  .status-box.running { border-color: var(--good); }
+  .warn { margin-top:12px; font-size:12px; color: var(--accent); line-height:1.5; }
+
+  .log { max-height:260px; overflow:auto; font-size:12.5px; line-height:1.7; color: var(--muted); }
+  .log .ok { color: var(--good); }
+  .log .err { color: var(--bad); }
+  .msg { font-size:12px; color: var(--muted); margin-top:8px; min-height:16px; }
+  .hidden { display:none !important; }
+  select option { background:#14161a; color:#e8e8e8; }
+  .status-box.alert { border-color: var(--accent); animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { background:#2a2108; } }
+</style>
+</head>
+<body>
+
+  <nav>
+    <div class="nav-links">
+      <a href="index.html">Painel geral</a>
+      <a href="marketplaces.html">Marketplaces</a>
+      <a href="watchlist.html">Lista de vigilância</a>
+      <a href="generator.html">Gerador de Link</a>
+      <a href="coupons.html">Cupons</a>
+      <a href="dispatcher.html" class="active">Disparador</a>
+    </div>
+    <a class="logout-link" id="logoutLink">Sair</a>
+  </nav>
+
+  <div class="masthead">
+    <h1 class="wordmark">Disparador<span>.</span></h1>
+    <p class="tagline">Envia as promoções que já têm o seu link de afiliado, uma de cada vez, no intervalo que você escolher</p>
+  </div>
+
+  <!-- 1. Destinos -->
+  <div class="block">
+    <div class="block-title">1. Destinos</div>
+    <p class="block-sub">Telegram envia sozinho. WhatsApp não tem API oficial para postar em grupo: nele o sistema só prepara a mensagem e você toca em enviar.</p>
+
+    <div class="dest-list" id="destList"></div>
+
+    <details>
+      <summary>Como conectar um canal ou grupo do Telegram (5 minutos)</summary>
+      <ol>
+        <li>No Telegram, abra o <b>@BotFather</b>, mande <code>/newbot</code>, escolha um nome e copie o <b>token</b> que ele devolver.</li>
+        <li>Crie um canal ou grupo (ou use um que já exista) e <b>adicione o bot</b> nele. Em canal, o bot precisa ser <b>administrador</b> com permissão de postar.</li>
+        <li>Em <b>Chat</b>, use <code>@nome_do_canal</code> (canal público) ou o id numérico (grupo/canal privado).</li>
+        <li>Preencha abaixo, clique em <b>Adicionar destino</b> e depois em <b>Testar</b>.</li>
+      </ol>
+    </details>
+
+    <div class="grid">
+      <div class="field">
+        <label>Tipo</label>
+        <select id="newPlatform">
+          <option value="telegram">Telegram (automático)</option>
+          <option value="whatsapp_manual">WhatsApp (assistido)</option>
+        </select>
+      </div>
+      <div class="field"><label>Nome</label><input type="text" id="newName" placeholder="Ex: Achadinhos Beleza" /></div>
+      <div class="field tg-only"><label>Chat (@canal ou id)</label><input type="text" id="newChat" placeholder="@meucanal" /></div>
+      <div class="field tg-only"><label>Token do bot</label><input type="password" id="newToken" placeholder="123456:ABC..." /></div>
+      <div class="field" style="max-width:150px;"><label>Limite por 24h</label><input type="number" id="newLimit" value="60" min="1" max="200" /></div>
+      <button class="btn" id="addDestBtn">Adicionar destino</button>
+    </div>
+    <div class="msg" id="destMsg"></div>
+  </div>
+
+  <!-- 2. Envio -->
+  <div class="block">
+    <div class="block-title">2. Envio</div>
+    <p class="block-sub">Só entram na fila promoções que têm link de afiliado, que a busca viu nas últimas 24 horas (e o sistema confere o preço de novo na hora de enviar), e que ainda não foram enviadas a esse destino nas últimas 2 semanas. Vão primeiro as de maior desconto.</p>
+
+    <div class="grid">
+      <div class="field"><label>Destino</label><select id="destSelect"></select></div>
+      <div class="field">
+        <label>Marketplace</label>
+        <select id="mpSelect">
+          <option value="">Todos</option>
+          <option value="shopee">Shopee</option>
+          <option value="netshoes">Netshoes</option>
+          <option value="riachuelo">Riachuelo</option>
+          <option value="mercadolivre">Mercado Livre</option>
+          <option value="magalu">Magalu</option>
+          <option value="amazon">Amazon</option>
+        </select>
+      </div>
+      <div class="field" style="max-width:150px;"><label>Intervalo (min)</label><input type="number" id="interval" value="5" min="2" /></div>
+      <div class="field" style="max-width:170px;"><label>Parar após (envios)</label><input type="number" id="maxSends" value="20" min="1" max="200" /></div>
+      <div class="field full"><label>Linha final da mensagem (opcional — ex.: "Siga o canal para mais ofertas")</label><input type="text" id="footer" value="" /></div>
+      <div class="field full">
+        <label>Grupos / nichos que podem ser enviados</label>
+        <div class="groups-box" id="groupBox"></div>
+      </div>
+    </div>
+
+    <div class="queue-info" id="queueInfo"></div>
+
+    <div class="controls">
+      <button class="btn secondary" id="queueBtn">Atualizar fila</button>
+      <button class="btn secondary" id="verifyBtn">🔍 Verificar fila</button>
+      <button class="btn secondary" id="testBtn">Enviar teste</button>
+      <button class="btn" id="startBtn">▶ Iniciar disparo</button>
+      <button class="btn danger hidden" id="stopBtn">■ Parar</button>
+      <button class="btn hidden" id="waStartBtn">🔔 Iniciar alertas do WhatsApp</button>
+      <button class="btn danger hidden" id="waStopBtn">■ Parar alertas</button>
+      <button class="btn secondary hidden" id="waBtn">📱 Abrir próximo agora</button>
+    </div>
+
+    <div class="status-box" id="statusBox">Parado.</div>
+    <button class="btn hidden" id="waOpenBtn" style="width:100%;margin-top:10px;padding:18px;font-size:16px;">📱 ABRIR NO WHATSAPP E ENVIAR</button>
+    <div class="warn" id="runWarn">O disparo fica salvo no servidor: você pode recarregar a página, trocar de aba ou publicar uma atualização que ele continua do ponto onde estava. Os envios são executados enquanto alguma página do painel estiver aberta ou se você configurar o relógio externo (cron-job.org) — veja as instruções.</div>
+  </div>
+
+  <!-- 3. Registro -->
+  <div class="block">
+    <div class="block-title">3. Registro desta sessão</div>
+    <div class="log" id="log"></div>
+  </div>
+
+  <script src="dispatcher.js?v=20261015d"></script>
+  <script>
+    document.getElementById('logoutLink').addEventListener('click', async () => {
+      await fetch('/api/auth/session', { method: 'DELETE' });
+      window.location.href = '/login.html';
     });
-    const data = await r.json().catch(() => ({}));
-    if (!data.ok) {
-      const err = new Error(data.description || `Telegram respondeu ${r.status}`);
-      err.status = data.error_code || r.status;
-      err.retryAfter = data.parameters && data.parameters.retry_after;
-      throw err;
-    }
-    return data.result;
-  } catch (e) {
-    if (e.name === 'AbortError') throw new Error('O Telegram demorou demais para responder.');
-    throw e;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function friendlyTelegramError(err) {
-  const m = String(err.message || '');
-  if (/unauthorized|not found/i.test(m) && err.status === 401) return 'Token do bot inv\u00e1lido. Copie de novo no @BotFather.';
-  if (/chat not found/i.test(m)) return 'Chat n\u00e3o encontrado. Confira o @canal (ou id) e se o bot foi adicionado ao canal/grupo.';
-  if (/not enough rights|have no rights|administrator|forbidden/i.test(m)) return 'O bot n\u00e3o tem permiss\u00e3o para postar. Em canal, torne o bot administrador com permiss\u00e3o de postar.';
-  return m;
-}
-
-// ---------------- mensagens (v-rias varia--es) ----------------
-
-const OPENERS = ['\ud83d\udd25', '\ud83d\uded2', '\ud83d\udc40', '\ud83d\udca5', '\u26a1', '\ud83d\ude0d'];
-
-function pick(arr, n) { return arr[Math.abs(n) % arr.length]; }
-
-// Monta o texto. "turn" gira entre os modelos, ent-o duas mensagens seguidas nunca saem iguais.
-// Tom: quem est- compartilhando achou uma oferta boa. Nada de aviso t-cnico/-link de afiliado- no texto.
-function buildMessage(p, turn, footer) {
-  const emoji = pick(OPENERS, turn + p.title.length);
-  const title = esc(p.title);
-  const link = esc(p.affiliate_url);
-  const { price, listPrice, coupon, finalPrice } = p.view;
-  const off = p.view.discount ? Math.round(p.view.discount) : null;
-  const hasList = listPrice && listPrice > price;
-  const now = coupon ? finalPrice : price;
-
-  const priceLine = hasList
-    ? `\ud83d\udcb0 De <s>R$ ${money(listPrice)}</s> por <b>R$ ${money(now)}</b>${off ? ` (${off}% OFF)` : ''}`
-    : `\ud83d\udcb0 Por apenas <b>R$ ${money(now)}</b>${off ? ` (${off}% OFF)` : ''}`;
-  const couponLine = coupon ? `\ud83c\udf9f\ufe0f Use o cupom <b>${esc(coupon)}</b> no carrinho` : null;
-  const storeLine = coupon ? `\ud83d\udcb3 Pre\u00e7o na loja: R$ ${money(price)}` : null;
-
-  const templates = [
-    () => [`${emoji} <b>Olha o que a gente encontrou!</b>`, '', title, '', priceLine, couponLine, '', `\ud83d\uded2 Aproveite: ${link}`],
-    () => [`${emoji} <b>Oferta boa demais pra deixar passar</b>`, '', title, '', priceLine, couponLine, '', `\ud83d\udc49 ${link}`],
-    () => [`\u2705 <b>Separamos essa pra voc\u00ea</b>`, '', title, priceLine, storeLine, couponLine, '', `Garanta aqui \ud83d\udc47`, link],
-    () => [`${emoji} <b>Achado do dia</b>`, title, '', priceLine, couponLine, '', `\ud83d\uded2 ${link}`],
-    () => [`${emoji} <b>Pre\u00e7o bom apareceu!</b>`, '', title, '', priceLine, couponLine, '', `Corre ver: ${link}`],
-    () => [`\u2b50 <b>Recomenda\u00e7\u00e3o do dia</b>`, '', title, '', priceLine, couponLine, '', `\ud83d\udc49 Confira aqui: ${link}`],
-  ];
-
-  const lines = templates[Math.abs(turn) % templates.length]().filter((l) => l !== null && l !== undefined);
-  const cleaned = [];
-  for (const l of lines) { if (l === '' && (cleaned.length === 0 || cleaned[cleaned.length - 1] === '')) continue; cleaned.push(l); }
-  // Rodap- opcional - mas nunca deixa sair aviso de "afiliado".
-  const safeFooter = footer && !/afiliad/i.test(footer) ? footer : '';
-  if (safeFooter) cleaned.push('', esc(safeFooter));
-  return cleaned.join('\n');
-}
-
-// Vers-o sem HTML para o WhatsApp (que n-o entende <b>/<s>).
-function toPlain(html) {
-  return html.replace(/<\/?(b|s)>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
-}
-
-
-// ---------------- valida--o antes de enviar ----------------
-
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
-const DEAD_RE = /o produto n[\u00e3a]o existe|produto n[\u00e3a]o encontrado|p[\u00e1a]gina n[\u00e3a]o encontrada|produto indispon[\u00edi]vel|product (does not exist|not found)/i;
-const BADLINK_RE = /invalid publisher code|partnership status/i;
-
-// Abre o link como um cliente abriria e procura sinais claros de problema.
-// S- reprova quando o sinal - claro; se o site bloquear/der erro de rede, segue (inconclusivo).
-async function checkLink(url) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 8000);
-  try {
-    const r = await fetch(url, { redirect: 'follow', signal: ctrl.signal, headers: { 'User-Agent': UA, 'Accept-Language': 'pt-BR,pt;q=0.9', Accept: 'text/html,*/*' } });
-    if (r.status === 404 || r.status === 410) return { ok: false, kind: 'dead', reason: `a p\u00e1gina do produto n\u00e3o existe mais (erro ${r.status})` };
-    const text = (await r.text().catch(() => '')).slice(0, 40000);
-    if (BADLINK_RE.test(text)) return { ok: false, kind: 'badlink', reason: 'a rede de afiliados recusou o link (ID/parceria inv\u00e1lidos)' };
-    if (DEAD_RE.test(text)) return { ok: false, kind: 'dead', reason: 'a loja informa que o produto n\u00e3o existe' };
-    return { ok: true };
-  } catch { return { ok: true, inconclusive: true }; }
-  finally { clearTimeout(timer); }
-}
-
-function shopeeIds(url) {
-  const u = String(url || '');
-  let m = u.match(/\/product\/(\d+)\/(\d+)/) || u.match(/-i\.(\d+)\.(\d+)/);
-  return m ? { shopId: m[1], itemId: m[2] } : null;
-}
-
-let shopeeCreds;
-async function getShopeeCreds() {
-  if (shopeeCreds !== undefined) return shopeeCreds;
-  const { data: mp } = await supabaseAdmin.from('marketplaces').select('id').eq('slug', 'shopee').maybeSingle();
-  if (!mp) return (shopeeCreds = null);
-  const { data: c } = await supabaseAdmin.from('marketplace_credentials').select('client_id, client_secret').eq('marketplace_id', mp.id).maybeSingle();
-  return (shopeeCreds = c && c.client_id && c.client_secret ? c : null);
-}
-
-// Confirma na API oficial da Shopee que o an-ncio ainda existe e qual o pre-o de hoje.
-async function checkShopee(p) {
-  const ids = shopeeIds(p.original_url);
-  const creds = await getShopeeCreds();
-  if (!ids || !creds) return { ok: true, inconclusive: true };
-  try {
-    const node = await getProductOffer(creds.client_id, creds.client_secret, ids.itemId);
-    if (!node) return { ok: false, kind: 'dead', reason: 'a Shopee n\u00e3o devolve mais esse an\u00fancio (produto removido)' };
-    const live = Number(String(node.priceMin).replace(',', '.'));
-    return { ok: true, livePrice: Number.isFinite(live) && live > 0 ? live : null };
-  } catch { return { ok: true, inconclusive: true }; }
-}
-
-// Retorna { ok, kind, reason, livePrice }
-async function validatePromotion(p) {
-  const slug = p.marketplaces && p.marketplaces.slug;
-  if (slug === 'shopee') {
-    const sh = await checkShopee(p);
-    if (!sh.ok) return sh;
-    if (sh.livePrice && Number(p.current_price) > 0 && sh.livePrice > Number(p.current_price) * 1.05) {
-      return { ok: false, kind: 'stale', reason: `o pre\u00e7o subiu (de R$ ${money(p.current_price)} para R$ ${money(sh.livePrice)})` };
-    }
-  }
-  return checkLink(p.affiliate_url);
-}
-
-async function ignorePromotion(p, why) {
-  await supabaseAdmin.from('promotions').update({ status: 'IGNORED' }).eq('id', p.id);
-  await supabaseAdmin.from('integration_logs').insert({ marketplace_id: null, level: 'warn', message: `Disparador removeu da fila "${String(p.title).slice(0, 60)}": ${why}` }).then(() => {}, () => {});
-}
-
-// ---------------- fila ----------------
-
-async function getDestination(id) {
-  const { data, error } = await supabaseAdmin.from('dispatch_destinations').select('*').eq('id', id).maybeSingle();
-  if (error) throw new Error(dbError(error));
-  return data;
-}
-
-async function loadQueue(destId, body) {
-  const groupIds = Array.isArray(body.group_ids) ? body.group_ids : [];
-  const since = isoAgo(QUEUE_DAYS_SEEN * DAY);
-
-  let q = supabaseAdmin
-    .from('promotions')
-    .select('id, title, image_url, original_url, current_price, previous_price, discount_rate, source, status, affiliate_url, watch_group_id, last_seen_at, detected_at, marketplaces(slug, name)')
-    .not('affiliate_url', 'is', null)
-    .neq('status', 'IGNORED')
-    .gt('current_price', 0)
-    .or(`last_seen_at.gte.${since},and(last_seen_at.is.null,detected_at.gte.${since})`)
-    .order('discount_rate', { ascending: false, nullsFirst: false })
-    .limit(600);
-  const { data, error } = await q;
-  if (error) throw new Error(dbError(error));
-
-  const { data: logs, error: logErr } = await supabaseAdmin
-    .from('dispatch_log').select('promotion_id').eq('destination_id', destId).gte('sent_at', isoAgo(NO_REPEAT_DAYS * DAY));
-  if (logErr) throw new Error(dbError(logErr));
-  const already = new Set((logs || []).map((l) => l.promotion_id));
-
-  const wantNone = groupIds.includes('none');
-  const mp = body.marketplace || null;
-
-  return (data || []).filter((p) => {
-    if (already.has(p.id)) return false;
-    if (!/^https?:\/\//i.test(p.affiliate_url || '')) return false;
-    if (mp && (!p.marketplaces || p.marketplaces.slug !== mp)) return false;
-    if (groupIds.length) {
-      if (p.watch_group_id) { if (!groupIds.includes(p.watch_group_id)) return false; }
-      else if (!wantNone) return false;
-    }
-    return true;
-  });
-}
-
-async function netshoesCoupons() {
-  if (couponCache.list && Date.now() - couponCache.at < COUPON_CACHE_MS) return couponCache.list;
-  try {
-    const ctx = await getNetshoesContext(supabaseAdmin);
-    if (ctx.error) return null;
-    const loaded = await loadNetshoesCoupons(ctx);
-    if (loaded.error) return null;
-    couponCache = { at: Date.now(), list: loaded.coupons || [] };
-    return couponCache.list;
-  } catch { return null; }
-}
-
-// Calcula o que vai aparecer na mensagem. Retorna null se a promo--o n-o vale mais (ex.: cupom venceu).
-async function buildView(p) {
-  const slug = p.marketplaces && p.marketplaces.slug;
-  let price = Number(p.current_price);
-  let listPrice = p.previous_price ? Number(p.previous_price) : null;
-  let coupon = null; let finalPrice = null;
-
-  if (slug === 'netshoes') {
-    const fromCoupon = p.source === 'netshoes_coupon';
-    // Em ofertas por cupom, current_price j- - o pre-o COM cupom e previous_price - o pre-o da loja.
-    const storePrice = fromCoupon ? Number(p.previous_price) : price;
-    const list = await netshoesCoupons();
-    const best = list && storePrice > 0 ? bestNetshoesCoupon(list, { title: p.title, price: storePrice, category: null }) : null;
-    if (best) {
-      coupon = best.coupon.code; finalPrice = r2(best.finalPrice); price = r2(storePrice);
-      listPrice = fromCoupon ? null : listPrice;
-    } else if (fromCoupon) {
-      return null; // a oferta dependia de um cupom que n\u00e3o consigo confirmar agora
-    }
-  }
-
-  const base = coupon ? finalPrice : price;
-  const ref = listPrice && listPrice > price ? listPrice : (coupon ? price : null);
-  const discount = ref && base < ref ? ((ref - base) / ref) * 100 : (p.discount_rate ? Number(p.discount_rate) : null);
-  return { price: r2(price), listPrice: listPrice ? r2(listPrice) : null, coupon, finalPrice, discount };
-}
-
-// ---------------- a--es ----------------
-
-async function createDestination(res, body) {
-  const platform = body.platform === 'whatsapp_manual' ? 'whatsapp_manual' : 'telegram';
-  const name = String(body.name || '').replace(/\s+/g, ' ').trim();
-  if (!name) return fail(res, 400, 'D\u00ea um nome ao destino (ex.: Achadinhos).');
-  const dailyLimit = Math.min(Math.max(parseInt(body.daily_limit, 10) || 60, 1), 200);
-
-  const row = { name: name.slice(0, 80), platform, daily_limit: dailyLimit, chat_id: null, bot_token: null };
-  let botUsername = null;
-
-  if (platform === 'telegram') {
-    const chat = String(body.chat_id || '').trim();
-    const token = String(body.bot_token || '').trim();
-    if (!chat) return fail(res, 400, 'Preencha o Chat (@nome_do_canal ou o id num\u00e9rico).');
-    if (!/^\d+:[\w-]{20,}$/.test(token)) return fail(res, 400, 'Token do bot com formato estranho. Ele parece com 123456789:ABCdef... (copie inteiro do @BotFather).');
-    try { botUsername = (await telegram(token, 'getMe')).username; }
-    catch (err) { return fail(res, 400, friendlyTelegramError(err)); }
-    row.chat_id = /^-?\d+$/.test(chat) || chat.startsWith('@') ? chat : `@${chat}`;
-    row.bot_token = token;
-  }
-
-  const { error } = await supabaseAdmin.from('dispatch_destinations').insert(row);
-  if (error) return fail(res, 500, dbError(error));
-  res.status(200).json({ ok: true, botUsername });
-}
-
-async function listDestinations(res) {
-  const { data, error } = await supabaseAdmin.from('dispatch_destinations').select('id, name, platform, chat_id, daily_limit, created_at').order('created_at');
-  if (error) return fail(res, 500, dbError(error));
-  const since = isoAgo(DAY);
-  const [counts, payload] = await Promise.all([
-    Promise.all((data || []).map((d) => supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true })
-      .eq('destination_id', d.id).eq('skipped', false).gte('sent_at', since).then((r) => r.count || 0, () => 0))),
-    jobsPayload(),
-  ]);
-  const out = (data || []).map((d, i) => ({ ...d, sentLast24h: counts[i] }));
-  res.status(200).json({ destinations: out, jobs: payload.jobs, now: payload.now });
-}
-
-async function sendTest(res, body) {
-  const dest = await getDestination(body.destination_id);
-  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
-  const text = '\u2705 Teste do Radar de Promo\u00e7\u00f5es: se voc\u00ea est\u00e1 lendo isso, o destino est\u00e1 funcionando.';
-  if (dest.platform === 'whatsapp_manual') return res.status(200).json({ ok: true, manual: true, message: text });
-  try { await telegram(dest.bot_token, 'sendMessage', { chat_id: dest.chat_id, text }); }
-  catch (err) { return fail(res, 400, friendlyTelegramError(err)); }
-  res.status(200).json({ ok: true });
-}
-
-async function queue(res, body) {
-  const dest = await getDestination(body.destination_id);
-  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
-  const list = await loadQueue(dest.id, body);
-  if (!list.length) return res.status(200).json({ count: 0 });
-  const n = list[0];
-  res.status(200).json({
-    count: list.length,
-    next: { title: n.title, price: Number(n.current_price), discount: n.discount_rate ? Number(n.discount_rate) : null, marketplace: n.marketplaces ? n.marketplaces.name : null },
-  });
-}
-
-
-// Confere os pr-ximos da fila SEM enviar nada. Quem n-o existe mais - removido (vai para "Ignoradas").
-async function verifyQueue(res, body) {
-  const dest = await getDestination(body.destination_id);
-  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
-  const list = await loadQueue(dest.id, body);
-  const sample = list.slice(0, 12);
-  const out = { total: list.length, checked: 0, ok: 0, removed: [], warnings: [] };
-  for (const p of sample) {
-    const check = await validatePromotion(p);
-    out.checked += 1;
-    if (check.ok) { out.ok += 1; continue; }
-    if (check.kind === 'badlink') { out.warnings.push(check.reason); break; }
-    if (check.kind === 'dead') await ignorePromotion(p, check.reason);
-    out.removed.push({ title: p.title, reason: check.reason });
-  }
-  res.status(200).json(out);
-}
-
-async function sendNext(res, body) {
-  const dest = await getDestination(body.destination_id);
-  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
-
-  // limite di-rio e trava anti-duplo-clique
-  const { count: sent24 } = await supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true })
-    .eq('destination_id', dest.id).eq('skipped', false).gte('sent_at', isoAgo(DAY));
-  if ((sent24 || 0) >= dest.daily_limit) return fail(res, 429, `Limite de ${dest.daily_limit} envios em 24h atingido para "${dest.name}".`, { code: 'daily_limit' });
-
-  const { data: last } = await supabaseAdmin.from('dispatch_log').select('sent_at').eq('destination_id', dest.id).eq('skipped', false)
-    .order('sent_at', { ascending: false }).limit(1);
-  if (last && last[0] && Date.now() - new Date(last[0].sent_at).getTime() < MIN_GAP_SECONDS * 1000) {
-    return fail(res, 429, 'Envio muito r\u00e1pido, aguardando alguns segundos.', { code: 'too_fast' });
-  }
-
-  const list = await loadQueue(dest.id, body);
-  let chosen = null; let view = null; let tries = 0;
-  const skippedInfo = [];
-  for (const p of list) {
-    if (tries >= 8) break;
-    tries += 1;
-    // 1) o produto/link ainda existe e funciona?
-    const check = await validatePromotion(p);
-    if (!check.ok) {
-      if (check.kind === 'badlink') {
-        return fail(res, 409, `Parei por seguran\u00e7a: ${check.reason}. Confira o ID de afiliado em Marketplaces antes de continuar.`, { code: 'bad_link' });
-      }
-      if (check.kind === 'dead') await ignorePromotion(p, check.reason);
-      await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: `pulada: ${check.reason}` });
-      skippedInfo.push({ title: p.title, reason: check.reason });
-      continue;
-    }
-    // 2) pre-o/cupom de agora
-    const v = await buildView(p);
-    if (v) { chosen = p; view = v; break; }
-    await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: 'pulada: cupom n\u00e3o confirmado' });
-    skippedInfo.push({ title: p.title, reason: 'o cupom dessa oferta n\u00e3o est\u00e1 mais v\u00e1lido' });
-  }
-  if (!chosen) return res.status(200).json({ empty: true, skipped: skippedInfo });
-
-  chosen.view = view;
-  const { count: total } = await supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true }).eq('destination_id', dest.id);
-  const html = buildMessage(chosen, total || 0, String(body.footer || '').slice(0, 120));
-  const remaining = Math.max(list.length - tries, 0);
-  const slugName = chosen.marketplaces ? chosen.marketplaces.name : null;
-
-  if (dest.platform === 'whatsapp_manual') {
-    const plain = toPlain(html);
-    await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: plain });
-    return res.status(200).json({ ok: true, manual: true, message: plain, promotion: { title: chosen.title, coupon: view.coupon }, remaining, skipped: skippedInfo });
-  }
-
-  try {
-    let done = false;
-    if (chosen.image_url && /^https:\/\//i.test(chosen.image_url) && html.length <= 1000) {
-      try {
-        await telegram(dest.bot_token, 'sendPhoto', { chat_id: dest.chat_id, photo: chosen.image_url, caption: html, parse_mode: 'HTML' });
-        done = true;
-      } catch (e) { if (e.status === 429) throw e; /* imagem recusada: manda s\u00f3 o texto */ }
-    }
-    if (!done) await telegram(dest.bot_token, 'sendMessage', { chat_id: dest.chat_id, text: html, parse_mode: 'HTML', disable_web_page_preview: false });
-  } catch (err) {
-    if (err.status === 429) return fail(res, 429, 'Telegram pediu para ir mais devagar.', { code: 'rate_limited', retryAfter: err.retryAfter || 60 });
-    return fail(res, 502, friendlyTelegramError(err));
-  }
-
-  await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: toPlain(html) });
-  res.status(200).json({ ok: true, sent: { title: chosen.title, marketplace: slugName, coupon: view.coupon }, remaining, skipped: skippedInfo });
-}
-
-
-// ---------------- disparo continuo (estado no servidor) ----------------
-
-const CLAIM_STALE_MS = 150 * 1000;
-
-function fakeRes() {
-  return { code: 200, body: null, status(c) { this.code = c; return this; }, json(b) { this.body = b; return this; } };
-}
-
-async function jobsPayload() {
-  const now = new Date().toISOString();
-  const { data, error } = await supabaseAdmin.from('dispatch_jobs').select('*');
-  if (error) return { jobs: [], now, jobsError: error.message };
-  return { jobs: data || [], now };
-}
-
-async function startJob(res, body) {
-  const dest = await getDestination(body.destination_id);
-  if (!dest) return fail(res, 404, 'Destino nao encontrado.');
-  const isTelegram = dest.platform === 'telegram';
-  const interval = Math.max(parseInt(body.interval_min, 10) || 0, isTelegram ? 2 : 1);
-  const maxSends = Math.min(Math.max(parseInt(body.max_sends, 10) || 20, 1), 500);
-  const footer = String(body.footer || '').slice(0, 120);
-  const nowIso = new Date().toISOString();
-  const row = {
-    destination_id: dest.id, mode: isTelegram ? 'auto' : 'assisted', status: 'running',
-    interval_min: interval, max_sends: maxSends, sent_count: 0, next_run_at: nowIso, claimed_at: null,
-    filters: { group_ids: Array.isArray(body.group_ids) ? body.group_ids : [], marketplace: body.marketplace || null, footer },
-    pending: null, last_event: 'Disparo iniciado.', last_error: null, error_streak: 0, updated_at: nowIso,
-  };
-  const { error } = await supabaseAdmin.from('dispatch_jobs').upsert(row, { onConflict: 'destination_id' });
-  if (error) return fail(res, 500, dbError(error));
-  res.status(200).json(await jobsPayload());
-}
-
-async function stopJob(res, body) {
-  const { error } = await supabaseAdmin.from('dispatch_jobs')
-    .update({ status: 'stopped', pending: null, claimed_at: null, last_event: 'Parado por voce.', updated_at: new Date().toISOString() })
-    .eq('destination_id', body.destination_id);
-  if (error) return fail(res, 500, dbError(error));
-  res.status(200).json(await jobsPayload());
-}
-
-// WhatsApp assistido: a pessoa abriu o WhatsApp -> conta como enviado e recomeca a contagem.
-async function ackJob(res, body) {
-  const { data: job, error } = await supabaseAdmin.from('dispatch_jobs').select('*').eq('destination_id', body.destination_id).maybeSingle();
-  if (error) return fail(res, 500, dbError(error));
-  if (job && job.pending) {
-    const sent = job.sent_count + 1;
-    const done = sent >= job.max_sends;
-    await supabaseAdmin.from('dispatch_jobs').update({
-      pending: null, sent_count: sent, status: done ? 'stopped' : 'running',
-      next_run_at: new Date(Date.now() + job.interval_min * 60000).toISOString(),
-      last_event: done ? `Meta de ${job.max_sends} envios atingida.` : `Aberto no WhatsApp: ${String(job.pending.title || '').slice(0, 60)}`,
-      last_error: null, updated_at: new Date().toISOString(),
-    }).eq('id', job.id);
-  }
-  res.status(200).json(await jobsPayload());
-}
-
-async function processJob(job) {
-  const nowIso = () => new Date().toISOString();
-  const finish = (patch) => supabaseAdmin.from('dispatch_jobs').update({ claimed_at: null, updated_at: nowIso(), ...patch }).eq('id', job.id);
-  let r;
-  try {
-    const dest = await getDestination(job.destination_id);
-    if (!dest) { await finish({ status: 'stopped', last_error: 'Destino removido.' }); return; }
-    const f = job.filters || {};
-    const fr = fakeRes();
-    await sendNext(fr, { destination_id: dest.id, group_ids: f.group_ids || [], marketplace: f.marketplace || null, footer: f.footer || '' });
-    r = { status: fr.code, json: fr.body || {} };
-  } catch (e) {
-    r = { status: 500, json: { error: e.message || 'erro inesperado' } };
-  }
-
-  const j = r.json;
-  const skippedTxt = j.skipped && j.skipped.length ? ` (${j.skipped.length} pulada(s) por problema no produto)` : '';
-
-  if (r.status === 200 && j.empty) {
-    await finish({ status: 'stopped', pending: null, last_event: 'A fila acabou: nao ha mais promocoes validas para esse filtro.' + skippedTxt });
-    return;
-  }
-  if (r.status === 200) {
-    if (job.mode === 'assisted') {
-      await finish({
-        pending: { message: j.message, title: j.promotion.title, coupon: j.promotion.coupon, remaining: j.remaining, prepared_at: nowIso() },
-        last_event: 'Promocao pronta para enviar.' + skippedTxt, last_error: null, error_streak: 0,
-      });
-      return;
-    }
-    const sent = job.sent_count + 1;
-    const done = sent >= job.max_sends;
-    const t = (j.sent && j.sent.title ? j.sent.title : '').slice(0, 70);
-    await finish({
-      sent_count: sent, status: done ? 'stopped' : 'running',
-      next_run_at: new Date(Date.now() + job.interval_min * 60000).toISOString(),
-      last_event: (done ? `Meta de ${job.max_sends} envios atingida. ` : '') + `Enviado: ${t}${j.sent && j.sent.coupon ? ` (cupom ${j.sent.coupon})` : ''}${skippedTxt}`,
-      last_error: null, error_streak: 0,
-    });
-    return;
-  }
-  // erros
-  const code = j.code;
-  const msg = j.error || 'Falha ao enviar.';
-  if (code === 'daily_limit' || code === 'bad_link') { await finish({ status: 'stopped', pending: null, last_error: msg }); return; }
-  if (code === 'rate_limited') { await finish({ next_run_at: new Date(Date.now() + ((j.retryAfter || 60) + 1) * 1000).toISOString(), last_error: msg }); return; }
-  const streak = (job.error_streak || 0) + 1;
-  if (streak >= 30) { await finish({ status: 'stopped', error_streak: streak, last_error: `${msg} (parei apos 30 falhas seguidas)` }); return; }
-  await finish({ next_run_at: new Date(Date.now() + 60000).toISOString(), error_streak: streak, last_error: msg });
-}
-
-// Roda os disparos que ja estao na hora. Pode ser chamado pela pagina aberta ou por um "relogio" externo.
-async function tickJobs() {
-  const nowIso = new Date().toISOString();
-  const { data: due, error } = await supabaseAdmin.from('dispatch_jobs').select('*')
-    .eq('status', 'running').is('pending', null).lte('next_run_at', nowIso).limit(3);
-  if (error) throw new Error(dbError(error));
-  const work = [];
-  for (const j of due || []) {
-    const stale = new Date(Date.now() - CLAIM_STALE_MS).toISOString();
-    // "trava" atomica: so quem conseguir marcar o claimed_at executa (evita envio duplicado)
-    const { data: claimed } = await supabaseAdmin.from('dispatch_jobs').update({ claimed_at: nowIso })
-      .eq('id', j.id).eq('status', 'running').lte('next_run_at', nowIso)
-      .or(`claimed_at.is.null,claimed_at.lt.${stale}`).select().maybeSingle();
-    if (claimed) work.push(processJob(claimed));
-  }
-  await Promise.all(work);
-}
-
-module.exports = async function handler(req, res) {
-  try {
-    if (req.method === 'GET') {
-      if (req.query && req.query.tick) { await tickJobs(); return res.status(200).json({ ok: true }); }
-      return await listDestinations(res);
-    }
-    if (req.method !== 'POST') return fail(res, 405, 'M\u00e9todo n\u00e3o permitido.');
-
-    const body = req.body || {};
-    switch (body.action) {
-      case 'create_destination': return await createDestination(res, body);
-      case 'delete_destination': {
-        const { error } = await supabaseAdmin.from('dispatch_destinations').delete().eq('id', body.id);
-        if (error) return fail(res, 500, dbError(error));
-        return res.status(200).json({ ok: true });
-      }
-      case 'test': return await sendTest(res, body);
-      case 'queue': return await queue(res, body);
-      case 'verify': return await verifyQueue(res, body);
-      case 'job_start': return await startJob(res, body);
-      case 'job_stop': return await stopJob(res, body);
-      case 'job_ack': return await ackJob(res, body);
-      case 'tick': await tickJobs(); return res.status(200).json(await jobsPayload());
-      case 'send_next': return await sendNext(res, body);
-      default: return fail(res, 400, 'A\u00e7\u00e3o inv\u00e1lida.');
-    }
-  } catch (err) {
-    console.error('dispatch error', err);
-    fail(res, 500, err.message || 'Erro inesperado no disparador.');
-  }
-};
+  </script>
+</body>
+</html>
