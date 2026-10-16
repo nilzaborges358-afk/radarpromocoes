@@ -182,7 +182,591 @@
     <div class="log" id="log"></div>
   </div>
 
-  <script src="dispatcher.js?v=20261015d"></script>
+  <div id="ver" style="font-size:11px;color:#8a8a8a;margin:14px 18px 24px;">Disparador: o script NÃO carregou (atualize com Ctrl+F5; se continuar, me avise).</div>
+
+  <script>
+(function(){ var v=document.getElementById('ver'); if(v) v.textContent='Disparador v2026-10-16.5 - script carregado'; })();
+const $ = (id) => document.getElementById(id);
+const MIN_INTERVAL = 2; // minutos \u2014 abaixo disso vira spam
+
+let destinations = [];
+let groups = [];
+let jobs = [];
+let serverOffset = 0; // diferenca entre o relogio do servidor e o do computador
+let pollTimer = null;
+let uiTimer = null;
+let ticking = false;
+let lastTickErr = '';
+let lastSeen = {};
+let alarmKey = null;
+let audioCtx = null;
+let waAlarmTimer = null;
+let waTitleTimer = null;
+const WA_MIN_INTERVAL = 1; // minutos (WhatsApp assistido: quem envia e voce)
+
+function escapeHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str == null ? '' : String(str);
+  return d.innerHTML;
+}
+
+async function api(body) {
+  const res = await fetch('/api/dispatch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.error || 'Falha na requisi\u00e7\u00e3o');
+    err.code = data.code;
+    err.retryAfter = data.retryAfter;
+    throw err;
+  }
+  return data;
+}
+
+function log(text, kind) {
+  const line = document.createElement('div');
+  if (kind) line.className = kind;
+  line.textContent = `${new Date().toLocaleTimeString('pt-BR')}  ${text}`;
+  const box = $('log');
+  box.prepend(line);
+  while (box.children.length > 60) box.removeChild(box.lastChild);
+}
+
+// ---------- erros vis-veis ----------
+// Se algo quebrar, a mensagem aparece na tela (em vez de campos em branco sem explica--o).
+function showPageError(msg) {
+  const el = $('destMsg');
+  if (el) el.textContent = `Erro na p\u00e1gina: ${msg}. Atualize com Ctrl+F5; se continuar, me mande esta mensagem.`;
+}
+window.addEventListener('error', (e) => showPageError(e.message));
+window.addEventListener('unhandledrejection', (e) => showPageError((e.reason && e.reason.message) || String(e.reason)));
+
+// ---------- carregar dados ----------
+
+async function fetchJson(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) throw new Error(data.error || `Erro ${res.status}`);
+    return data;
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('o servidor demorou mais de 15s para responder');
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Destinos e grupos carregam de forma independente: se um falhar, o outro continua aparecendo.
+async function loadAll() {
+  // Nunca deixa os campos em branco enquanto carrega.
+  if (!$('destSelect').options.length) $('destSelect').innerHTML = '<option value="">Carregando destinos...</option>';
+  if (!$('groupBox').children.length) $('groupBox').innerHTML = '<span class="dest-meta">Carregando grupos...</span>';
+  const [d, g] = await Promise.allSettled([fetchJson('/api/dispatch'), fetchJson('/api/groups')]);
+
+  if (d.status === 'fulfilled') {
+    destinations = d.value.destinations || [];
+    jobs = d.value.jobs || [];
+    if (d.value.now) serverOffset = new Date(d.value.now).getTime() - Date.now();
+    $('destMsg').textContent = '';
+  } else {
+    destinations = [];
+    $('destMsg').textContent = `Erro ao carregar destinos: ${d.reason.message} (j\u00e1 rodou o SQL 0002_disparador.sql no Supabase? Est\u00e1 logado?)`;
+  }
+
+  if (g.status === 'fulfilled') groups = g.value.groups || [];
+  else { groups = []; $('queueInfo').textContent = `Erro ao carregar grupos: ${g.reason.message}`; }
+
+  renderDestinations(d.status === 'rejected' ? d.reason.message : null);
+  renderGroups();
+  restoreSettings();
+  applyJobToUI();
+  updateModeUI();
+  jobs.forEach((j) => { lastSeen[j.id] = jobSig(j); });
+  renderJob();
+  ensurePolling();
+}
+
+function renderDestinations(loadError) {
+  // O seletor da etapa 2 - montado primeiro, independente da lista da etapa 1.
+  const sel = $('destSelect');
+  const prev = sel.value;
+  if (destinations.length) {
+    sel.innerHTML = destinations.map((d) => `<option value="${d.id}">${escapeHtml(d.name)}${d.platform === 'whatsapp_manual' ? ' (WhatsApp)' : ' (Telegram)'}</option>`).join('');
+    if (destinations.some((d) => d.id === prev)) sel.value = prev;
+  } else {
+    sel.innerHTML = `<option value="">${loadError ? 'Erro ao carregar destinos' : 'Nenhum destino \u2014 adicione na etapa 1'}</option>`;
+  }
+
+  const list = $('destList');
+  if (!destinations.length) {
+    list.innerHTML = '<div class="dest-row"><span class="dest-meta">Nenhum destino ainda. Adicione um abaixo.</span></div>';
+  } else {
+    list.innerHTML = destinations.map((d) => `
+      <div class="dest-row">
+        <div>
+          <div class="dest-name">${escapeHtml(d.name)}</div>
+          <div class="dest-meta">${d.platform === 'telegram' ? `Telegram \u00b7 ${escapeHtml(d.chat_id)}` : 'WhatsApp (assistido)'} \u00b7 enviados em 24h: ${d.sentLast24h}/${d.daily_limit}</div>
+        </div>
+        <div class="dest-actions">
+          <button class="btn secondary small" data-test="${d.id}">Testar</button>
+          <button class="btn danger small" data-del="${d.id}">Remover</button>
+        </div>
+      </div>`).join('');
+    list.querySelectorAll('[data-test]').forEach((b) => b.addEventListener('click', () => testDestination(b.dataset.test)));
+    list.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', () => removeDestination(b.dataset.del)));
+  }
+
+}
+
+// Nomes iguais viram UM grupo s-. O valor da caixinha guarda todos os ids do grupo (separados por v-rgula).
+function mergedGroups() {
+  const map = new Map();
+  groups.forEach((g) => {
+    const key = String(g.name || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!map.has(key)) map.set(key, { name: String(g.name || '').replace(/\s+/g, ' ').trim(), ids: [] });
+    map.get(key).ids.push(g.id);
+    const cleaned = String(g.name || '').replace(/\s+/g, ' ').trim();
+    if (!/[A-Z\u00c0-\u00de]/.test(map.get(key).name) && /[A-Z\u00c0-\u00de]/.test(cleaned)) map.get(key).name = cleaned;
+  });
+  return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+}
+
+function renderGroups() {
+  const options = [...mergedGroups().map((g) => ({ id: g.ids.join(','), name: g.name })), { id: 'none', name: 'Sem grupo' }];
+  $('groupBox').innerHTML = options.map((g) => `
+    <label class="check"><input type="checkbox" class="grp" value="${escapeHtml(g.id)}" checked /> ${escapeHtml(g.name)}</label>`).join('');
+}
+
+// ---------- configura--es lembradas no navegador (nada sens-vel) ----------
+
+function saveSettings() {
+  localStorage.setItem('dispatcher', JSON.stringify({
+    dest: $('destSelect').value, mp: $('mpSelect').value, interval: $('interval').value,
+    maxSends: $('maxSends').value, footer: $('footer').value, groups: filters().group_ids,
+  }));
+}
+
+function checkGroups(ids) {
+  const set = new Set(ids || []);
+  document.querySelectorAll('.grp').forEach((c) => { c.checked = c.value.split(',').some((id) => set.has(id)); });
+}
+
+function restoreSettings() {
+  try {
+    const s = JSON.parse(localStorage.getItem('dispatcher') || '{}');
+    if (s.dest && destinations.some((d) => d.id === s.dest)) $('destSelect').value = s.dest;
+    if (s.mp !== undefined) $('mpSelect').value = s.mp;
+    if (s.interval) $('interval').value = s.interval;
+    if (s.maxSends) $('maxSends').value = s.maxSends;
+    if (s.footer !== undefined && !/afiliad/i.test(s.footer)) $('footer').value = s.footer;
+    if (Array.isArray(s.groups) && s.groups.length) checkGroups(s.groups);
+  } catch { /* ignora */ }
+}
+
+// Se ja existe um disparo rodando (ou parado) para o destino escolhido, mostra os filtros DELE.
+function applyJobToUI() {
+  const job = selectedJob(false);
+  if (!job) return;
+  const f = job.filters || {};
+  $('interval').value = job.interval_min;
+  $('maxSends').value = job.max_sends;
+  $('mpSelect').value = f.marketplace || '';
+  $('footer').value = f.footer || '';
+  checkGroups(f.group_ids || []);
+}
+
+function selectedDest() {
+  return destinations.find((d) => d.id === $('destSelect').value) || null;
+}
+
+function updateModeUI() {
+  const dest = selectedDest();
+  const manual = !!dest && dest.platform === 'whatsapp_manual';
+  const busy = !!selectedJob(false);
+  $('startBtn').classList.toggle('hidden', busy || manual);
+  $('stopBtn').classList.toggle('hidden', !busy || manual);
+  $('waStartBtn').classList.toggle('hidden', !manual || busy);
+  $('waStopBtn').classList.toggle('hidden', !manual || !busy);
+  $('waBtn').classList.toggle('hidden', !manual || busy);
+  ['destSelect', 'mpSelect', 'interval', 'maxSends', 'footer', 'testBtn', 'queueBtn', 'verifyBtn'].forEach((id) => { $(id).disabled = busy && id !== 'destSelect' ? true : false; });
+  document.querySelectorAll('.grp').forEach((c) => { c.disabled = busy; });
+}
+
+function filters() {
+  const group_ids = [...document.querySelectorAll('.grp:checked')].flatMap((c) => c.value.split(',')).filter(Boolean);
+  return { group_ids, marketplace: $('mpSelect').value || null, footer: $('footer').value.trim() };
+}
+
+// ---------- destinos ----------
+
+async function addDestination() {
+  const btn = $('addDestBtn');
+  btn.disabled = true;
+  $('destMsg').textContent = '';
+  try {
+    const data = await api({
+      action: 'create_destination',
+      platform: $('newPlatform').value,
+      name: $('newName').value,
+      chat_id: $('newChat').value,
+      bot_token: $('newToken').value,
+      daily_limit: $('newLimit').value,
+    });
+    ['newName', 'newChat', 'newToken'].forEach((id) => { $(id).value = ''; });
+    $('destMsg').textContent = data.botUsername ? `Destino criado. Bot reconhecido: @${data.botUsername}. Clique em "Testar".` : 'Destino criado.';
+    await loadAll();
+  } catch (err) {
+    $('destMsg').textContent = `Erro: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function removeDestination(id) {
+  if (!confirm('Remover esse destino? O hist\u00f3rico de envios dele tamb\u00e9m some.')) return;
+  await api({ action: 'delete_destination', id });
+  await loadAll();
+}
+
+// Abre o WhatsApp numa aba aberta no clique (sen-o o navegador bloqueia o pop-up).
+function openWhatsAppTab() {
+  return window.open('', '_blank');
+}
+// O link wa.me pode abrir o aplicativo do Windows, que costuma estragar emojis (viram "-").
+// Por isso: (1) abre direto o WhatsApp Web no navegador e (2) copia a mensagem para a -rea de
+// transfer-ncia - se algo vier sem emoji, basta colar com Ctrl+V.
+function whatsappUrl(message) {
+  return `https://web.whatsapp.com/send?text=${encodeURIComponent(message)}`;
+}
+function copyMessage(message) {
+  try { navigator.clipboard.writeText(message); } catch { /* sem permiss\u00e3o: segue s\u00f3 com o link */ }
+}
+function fillWhatsAppTab(tab, message) {
+  copyMessage(message);
+  const url = whatsappUrl(message);
+  if (tab) tab.location = url; else window.open(url, '_blank');
+}
+
+async function testDestination(id) {
+  const dest = destinations.find((d) => d.id === id);
+  const tab = dest && dest.platform === 'whatsapp_manual' ? openWhatsAppTab() : null;
+  try {
+    const r = await api({ action: 'test', destination_id: id });
+    if (r.manual) fillWhatsAppTab(tab, r.message);
+    log(`Teste enviado para "${dest ? dest.name : ''}".`, 'ok');
+    $('destMsg').textContent = 'Teste enviado \u2014 confira no destino.';
+  } catch (err) {
+    if (tab) tab.close();
+    log(`Teste falhou: ${err.message}`, 'err');
+    $('destMsg').textContent = `Erro: ${err.message}`;
+  }
+}
+
+// ---------- fila ----------
+
+async function refreshQueue() {
+  const dest = selectedDest();
+  if (!dest) { $('queueInfo').textContent = 'Crie um destino primeiro.'; return; }
+  $('queueInfo').textContent = 'Consultando a fila...';
+  try {
+    const f = filters();
+    const r = await api({ action: 'queue', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace });
+    if (!r.count) {
+      $('queueInfo').textContent = 'Fila vazia: nenhuma promo\u00e7\u00e3o com link de afiliado, vista nas \u00faltimas 24 horas, que ainda n\u00e3o tenha ido para esse destino. Rode uma busca no Painel geral.';
+    } else {
+      const n = r.next;
+      $('queueInfo').textContent = `Na fila: ${r.count}. Pr\u00f3xima: ${n.title.slice(0, 70)} \u2014 R$ ${Number(n.price).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${n.discount ? ` (${Math.round(n.discount)}% OFF)` : ''}${n.marketplace ? ` \u00b7 ${n.marketplace}` : ''}`;
+      if (r.newestSeenAt) {
+        const hours = Math.floor((Date.now() - new Date(r.newestSeenAt).getTime()) / 3600000);
+        if (hours >= 6) $('queueInfo').textContent += ` \u26a0\ufe0f A busca mais recente dessas promo\u00e7\u00f5es foi h\u00e1 ${hours}h: rode uma busca no Painel geral antes de disparar, para garantir pre\u00e7os de hoje.`;
+      }
+    }
+  } catch (err) {
+    $('queueInfo').textContent = `Erro: ${err.message}`;
+  }
+}
+
+// ---------- disparo cont-nuo (o estado fica salvo no servidor) ----------
+// Recarregar a p-gina, trocar de aba ou publicar uma atualiza--o N-O zera nada:
+// contador, hor-rio do pr-ximo envio e total enviado ficam no banco.
+
+function selectedJob(includeStopped) {
+  const d = selectedDest();
+  if (!d) return null;
+  const list = jobs.filter((j) => j.destination_id === d.id);
+  const running = list.find((j) => j.status === 'running');
+  return running || (includeStopped ? list[0] || null : null);
+}
+
+const serverNow = () => Date.now() + serverOffset;
+const jobSig = (j) => `${j.sent_count}|${j.status}|${j.last_event || ''}|${j.last_error || ''}`;
+
+function applyJobs(data) {
+  if (data.now) serverOffset = new Date(data.now).getTime() - Date.now();
+  jobs = data.jobs || [];
+  jobs.forEach((j) => {
+    const sig = jobSig(j);
+    if (lastSeen[j.id] !== undefined && lastSeen[j.id] !== sig) {
+      if (j.last_error) log(`\u26a0\ufe0f ${j.last_error}`, 'err');
+      else if (j.last_event) log(j.last_event, 'ok');
+    }
+    lastSeen[j.id] = sig;
+  });
+  updateModeUI();
+  renderJob();
+  ensurePolling();
+}
+
+// Pergunta ao servidor se tem envio na hora (e o servidor executa). Roda enquanto houver disparo ativo.
+async function tickServer() {
+  if (ticking) return;
+  ticking = true;
+  try {
+    applyJobs(await api({ action: 'tick' }));
+    lastTickErr = '';
+  } catch (err) {
+    if (err.message !== lastTickErr) { lastTickErr = err.message; log(`\u26a0\ufe0f Sem resposta do servidor (${err.message}). Tentando de novo...`, 'err'); }
+  } finally {
+    ticking = false;
+  }
+}
+
+function ensurePolling() {
+  const any = jobs.some((j) => j.status === 'running');
+  if (any && !pollTimer) { pollTimer = setInterval(tickServer, 10000); tickServer(); }
+  if (!any && pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (!uiTimer) uiTimer = setInterval(renderJob, 1000);
+}
+
+function renderJob() {
+  const box = $('statusBox');
+  const openBtn = $('waOpenBtn');
+  const job = selectedJob(true);
+  if (!job) { openBtn.classList.add('hidden'); return; }
+
+  if (job.status !== 'running') {
+    box.classList.remove('running', 'alert');
+    box.innerHTML = `<b>Parado.</b> ${escapeHtml(job.last_event || '')}${job.last_error ? `<br>\u26a0\ufe0f ${escapeHtml(job.last_error)}` : ''}<br>Enviados nesta rodada: ${job.sent_count}/${job.max_sends}`;
+    openBtn.classList.add('hidden');
+    alarmKey = null; stopAlarm();
+    return;
+  }
+
+  if (job.pending) {
+    box.classList.remove('running'); box.classList.add('alert');
+    box.innerHTML = `<span class="big">\ud83d\udd14 PRONTA PARA ENVIAR</span><br>${escapeHtml(String(job.pending.title || '').slice(0, 90))}${job.pending.coupon ? ` \u00b7 cupom <b>${escapeHtml(job.pending.coupon)}</b>` : ''}<br>Restam ${job.pending.remaining} na fila. Aperte o bot\u00e3o (ou Enter), escolha o grupo e envie.`;
+    openBtn.classList.remove('hidden');
+    if (alarmKey !== job.pending.prepared_at) {
+      alarmKey = job.pending.prepared_at;
+      startAlarm(String(job.pending.title || ''));
+      try { navigator.clipboard.writeText(job.pending.message); } catch { /* ignora */ }
+    }
+    return;
+  }
+
+  alarmKey = null; stopAlarm();
+  openBtn.classList.add('hidden');
+  box.classList.remove('alert'); box.classList.add('running');
+  const remaining = new Date(job.next_run_at).getTime() - serverNow();
+  const progress = `Enviados: ${job.sent_count}/${job.max_sends}`;
+  if (remaining > 0) {
+    const m = String(Math.floor(remaining / 60000)).padStart(2, '0');
+    const s = String(Math.floor((remaining % 60000) / 1000)).padStart(2, '0');
+    box.innerHTML = `<span class="big">Pr\u00f3ximo envio em ${m}:${s}</span><br>${progress}${job.last_event ? `<br>${escapeHtml(job.last_event)}` : ''}`;
+  } else {
+    box.innerHTML = `<span class="big">${job.mode === 'assisted' ? 'Preparando e conferindo o produto...' : 'Enviando...'}</span><br>${progress}`;
+  }
+}
+
+async function startRun() {
+  const dest = selectedDest();
+  if (!dest) { alert('Crie e selecione um destino.'); return; }
+  const manual = dest.platform === 'whatsapp_manual';
+  const interval = parseInt($('interval').value, 10);
+  const maxSends = parseInt($('maxSends').value, 10) || 20;
+  const f = filters();
+  const minInterval = manual ? WA_MIN_INTERVAL : MIN_INTERVAL;
+  if (!interval || interval < minInterval) { alert(`O intervalo m\u00ednimo \u00e9 ${minInterval} minuto(s).`); return; }
+  if (!f.group_ids.length) { alert('Marque pelo menos um grupo.'); return; }
+  const aviso = manual
+    ? 'A cada intervalo o sistema prepara a promo\u00e7\u00e3o e toca o alerta; voc\u00ea s\u00f3 abre e envia.'
+    : 'O disparo fica salvo no servidor: pode recarregar a p\u00e1gina ou trocar de aba.';
+  if (!confirm(`Enviar 1 promo\u00e7\u00e3o a cada ${interval} min para "${dest.name}", at\u00e9 ${maxSends} envios.\n\n${aviso}\n\nCome\u00e7ar?`)) return;
+
+  unlockAudio();
+  try { if (manual && 'Notification' in window && Notification.permission === 'default') await Notification.requestPermission(); } catch { /* ignora */ }
+  saveSettings();
+  try {
+    applyJobs(await api({ action: 'job_start', destination_id: dest.id, interval_min: interval, max_sends: maxSends, group_ids: f.group_ids, marketplace: f.marketplace, footer: f.footer }));
+    log(`Disparo iniciado: 1 promo\u00e7\u00e3o a cada ${interval} min, at\u00e9 ${maxSends} envios.`, 'ok');
+    if (manual) beep();
+  } catch (err) {
+    log(`\u26a0\ufe0f ${err.message}`, 'err');
+    alert(err.message);
+  }
+}
+
+async function stopRun() {
+  const job = selectedJob(false);
+  if (!job) return;
+  try {
+    applyJobs(await api({ action: 'job_stop', destination_id: job.destination_id }));
+    log('Disparo parado por voc\u00ea.');
+  } catch (err) { log(`\u26a0\ufe0f ${err.message}`, 'err'); }
+}
+
+// ---------- WhatsApp assistido ----------
+
+async function openNextWhatsApp() {
+  const dest = selectedDest();
+  if (!dest) return;
+  const f = filters();
+  const tab = openWhatsAppTab();
+  try {
+    const r = await api({ action: 'send_next', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace, footer: f.footer });
+    logSkipped(r.skipped);
+    if (r.empty) {
+      if (tab) tab.close();
+      $('statusBox').textContent = 'Fila vazia para esse filtro.';
+      return;
+    }
+    fillWhatsAppTab(tab, r.message);
+    $('statusBox').innerHTML = `<b>Preparado:</b> ${escapeHtml(r.promotion.title.slice(0, 80))}${r.promotion.coupon ? ` \u00b7 cupom <b>${escapeHtml(r.promotion.coupon)}</b>` : ''}<br>Restam ${r.remaining} na fila. Escolha o grupo no WhatsApp e toque em enviar.`;
+    log(`\ud83d\udcf1 Preparado para WhatsApp: ${r.promotion.title.slice(0, 70)}`, 'ok');
+    loadAll();
+  } catch (err) {
+    if (tab) tab.close();
+    $('statusBox').textContent = `Erro: ${err.message}`;
+    log(`\u26a0\ufe0f ${err.message}`, 'err');
+  }
+}
+
+
+function logSkipped(list) {
+  (list || []).forEach((x) => log(`\u23ed\ufe0f Pulada: ${String(x.title).slice(0, 60)} \u2014 ${x.reason}`, 'err'));
+}
+
+// ---------- verificar fila (sem enviar) ----------
+
+async function verifyQueueUI() {
+  const dest = selectedDest();
+  if (!dest) { $('queueInfo').textContent = 'Crie um destino primeiro.'; return; }
+  $('queueInfo').textContent = 'Conferindo os pr\u00f3ximos produtos (abrindo cada link)... pode levar at\u00e9 1 minuto.';
+  $('verifyBtn').disabled = true;
+  try {
+    const f = filters();
+    const r = await api({ action: 'verify', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace });
+    let msg = `Conferidos ${r.checked} de ${r.total} na fila: ${r.ok} ok`;
+    if (r.removed.length) msg += `, ${r.removed.length} removidos (produto n\u00e3o existe mais)`;
+    if (r.warnings.length) msg += `. \u26a0\ufe0f ${r.warnings[0]}`;
+    $('queueInfo').textContent = msg + '.';
+    r.removed.forEach((x) => log(`\ud83d\uddd1\ufe0f Removida: ${String(x.title).slice(0, 60)} \u2014 ${x.reason}`, 'err'));
+  } catch (err) {
+    $('queueInfo').textContent = `Erro: ${err.message}`;
+  } finally {
+    $('verifyBtn').disabled = false;
+  }
+}
+
+// ---------- WhatsApp com alerta (semi-autom-tico) ----------
+// O WhatsApp n-o permite postar em grupo por API. Aqui o sistema prepara a mensagem no tempo certo,
+// toca um alarme + notifica--o, e voc- s- abre, escolhe o grupo e envia (1 toque).
+
+function beep() {
+  // Som suave: dois toques graves e curtos, tipo "gota" (sem aquele bipe agudo de alerta).
+  try {
+    if (!audioCtx) return;
+    const t0 = audioCtx.currentTime;
+    [[392, 0], [523.25, 0.32]].forEach(([freq, delay]) => { // sol -> do
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.type = 'sine'; o.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, t0 + delay);
+      g.gain.exponentialRampToValueAtTime(0.12, t0 + delay + 0.04);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + delay + 1.1);
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(t0 + delay); o.stop(t0 + delay + 1.2);
+    });
+  } catch { /* sem \u00e1udio: segue */ }
+}
+
+function startAlarm(title) {
+  stopAlarm();
+  beep();
+  waAlarmTimer = setInterval(beep, 20000); // repete a cada 20s at\u00e9 voc\u00ea abrir
+  const original = document.title;
+  let on = false;
+  waTitleTimer = setInterval(() => { on = !on; document.title = on ? '\ud83d\udd14 ENVIAR AGORA!' : original; }, 800);
+  waTitleTimer.original = original;
+  try {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      const n = new Notification('\ud83d\udcf1 Promo\u00e7\u00e3o pronta para enviar', { body: title.slice(0, 100), requireInteraction: true });
+      n.onclick = () => { window.focus(); n.close(); };
+    }
+  } catch { /* ignora */ }
+}
+
+function stopAlarm() {
+  if (waAlarmTimer) clearInterval(waAlarmTimer);
+  if (waTitleTimer) { clearInterval(waTitleTimer); document.title = waTitleTimer.original || document.title; }
+  waAlarmTimer = null; waTitleTimer = null;
+}
+
+function unlockAudio() {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  } catch { /* sem \u00e1udio */ }
+}
+// O navegador s- libera som depois de um clique. Qualquer clique na p-gina j- destrava.
+['pointerdown', 'keydown'].forEach((ev) => document.addEventListener(ev, unlockAudio, { passive: true }));
+
+async function waOpenPending() {
+  const job = selectedJob(false);
+  if (!job || !job.pending) return;
+  const msg = job.pending.message;
+  copyMessage(msg);
+  window.open(whatsappUrl(msg), '_blank'); // dentro do clique, sen\u00e3o o navegador bloqueia
+  stopAlarm(); alarmKey = null;
+  $('waOpenBtn').classList.add('hidden');
+  log(`\ud83d\udcf1 Aberto no WhatsApp: ${String(job.pending.title || '').slice(0, 70)} (mensagem tamb\u00e9m copiada: Ctrl+V se faltar emoji)`, 'ok');
+  try { applyJobs(await api({ action: 'job_ack', destination_id: job.destination_id })); }
+  catch (err) { log(`\u26a0\ufe0f ${err.message}`, 'err'); }
+}
+
+document.addEventListener('keydown', (e) => {
+  const job = selectedJob(false);
+  if (job && job.pending && e.key === 'Enter' && document.activeElement && !['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(document.activeElement.tagName)) {
+    e.preventDefault(); waOpenPending();
+  }
+});
+
+// ---------- eventos ----------
+
+$('newPlatform').addEventListener('change', () => {
+  document.querySelectorAll('.tg-only').forEach((el) => el.classList.toggle('hidden', $('newPlatform').value !== 'telegram'));
+});
+$('addDestBtn').addEventListener('click', addDestination);
+$('destSelect').addEventListener('change', () => { applyJobToUI(); updateModeUI(); renderJob(); saveSettings(); $('queueInfo').textContent = ''; });
+$('queueBtn').addEventListener('click', refreshQueue);
+$('testBtn').addEventListener('click', () => { const d = selectedDest(); if (d) testDestination(d.id); });
+$('startBtn').addEventListener('click', startRun);
+$('stopBtn').addEventListener('click', stopRun);
+$('waBtn').addEventListener('click', openNextWhatsApp);
+$('waStartBtn').addEventListener('click', startRun);
+$('waStopBtn').addEventListener('click', stopRun);
+$('waOpenBtn').addEventListener('click', waOpenPending);
+$('verifyBtn').addEventListener('click', verifyQueueUI);
+
+loadAll();
+
+</script>
   <script>
     document.getElementById('logoutLink').addEventListener('click', async () => {
       await fetch('/api/auth/session', { method: 'DELETE' });
