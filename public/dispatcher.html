@@ -160,6 +160,8 @@
 
     <div class="queue-info" id="queueInfo"></div>
 
+    <label class="queue-info" style="display:flex;align-items:center;gap:8px;cursor:pointer;"><input type="checkbox" id="waCopyOnly" checked /> WhatsApp: só copiar a mensagem (eu colo no WhatsApp Web que já deixo aberto, sem abrir aba nova)</label>
+
     <div class="controls">
       <button class="btn secondary" id="queueBtn">Atualizar fila</button>
       <button class="btn secondary" id="verifyBtn">🔍 Verificar fila</button>
@@ -172,7 +174,8 @@
     </div>
 
     <div class="status-box" id="statusBox">Parado.</div>
-    <button class="btn hidden" id="waOpenBtn" style="width:100%;margin-top:10px;padding:18px;font-size:16px;">📱 ABRIR NO WHATSAPP E ENVIAR</button>
+    <button class="btn hidden" id="waOpenBtn" style="width:100%;margin-top:10px;padding:18px;font-size:16px;">📱 COPIAR / ABRIR NO WHATSAPP</button>
+    <div class="queue-info hidden" id="waHint" style="color:#7bd88f;margin-top:10px;"></div>
     <div class="warn" id="runWarn">O disparo fica salvo no servidor: você pode recarregar a página, trocar de aba ou publicar uma atualização que ele continua do ponto onde estava. Os envios são executados enquanto alguma página do painel estiver aberta ou se você configurar o relógio externo (cron-job.org) — veja as instruções.</div>
   </div>
 
@@ -185,7 +188,7 @@
   <div id="ver" style="font-size:11px;color:#8a8a8a;margin:14px 18px 24px;">Disparador: o script NÃO carregou (atualize com Ctrl+F5; se continuar, me avise).</div>
 
   <script>
-(function(){ var v=document.getElementById('ver'); if(v) v.textContent='Disparador v2026-10-16.6 - script carregado'; })();
+(function(){ var v=document.getElementById('ver'); if(v) v.textContent='Disparador v2026-10-16.7 - script carregado'; })();
 const $ = (id) => document.getElementById(id);
 const MIN_INTERVAL = 2; // minutos \u2014 abaixo disso vira spam
 
@@ -199,6 +202,7 @@ let ticking = false;
 let lastTickErr = '';
 let lastSeen = {};
 let alarmKey = null;
+let localPending = null; // mensagem preparada pelo bot\u00e3o "Abrir pr\u00f3ximo agora" (fora do disparo cont\u00ednuo)
 let audioCtx = null;
 let waAlarmTimer = null;
 let waTitleTimer = null;
@@ -372,7 +376,7 @@ function renderGroups() {
 function saveSettings() {
   localStorage.setItem('dispatcher', JSON.stringify({
     dest: $('destSelect').value, mp: $('mpSelect').value, interval: $('interval').value,
-    maxSends: $('maxSends').value, footer: $('footer').value, groups: filters().group_ids,
+    maxSends: $('maxSends').value, footer: $('footer').value, groups: filters().group_ids, copyOnly: $('waCopyOnly').checked,
   }));
 }
 
@@ -390,6 +394,7 @@ function restoreSettings() {
     if (s.maxSends) $('maxSends').value = s.maxSends;
     if (s.footer !== undefined && !/afiliad/i.test(s.footer)) $('footer').value = s.footer;
     if (Array.isArray(s.groups) && s.groups.length) checkGroups(s.groups);
+    if (s.copyOnly !== undefined) $('waCopyOnly').checked = !!s.copyOnly;
   } catch { /* ignora */ }
 }
 
@@ -468,9 +473,31 @@ function openWhatsAppTab() {
 function whatsappUrl(message) {
   return `https://web.whatsapp.com/send?text=${encodeURIComponent(message)}`;
 }
-function copyMessage(message) {
-  try { navigator.clipboard.writeText(message); } catch { /* sem permiss\u00e3o: segue s\u00f3 com o link */ }
+async function copyMessage(message) {
+  try { await navigator.clipboard.writeText(message); return true; } catch { /* tenta o m\u00e9todo antigo */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = message; ta.style.cssText = 'position:fixed;opacity:0;';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch { return false; }
 }
+
+// Aviso verde logo abaixo do bot-o; se a c-pia autom-tica falhar, mostra o texto para copiar na m-o.
+function showHint(text, fallbackMessage) {
+  const el = $('waHint');
+  el.classList.remove('hidden');
+  el.textContent = text;
+  if (fallbackMessage) {
+    const ta = document.createElement('textarea');
+    ta.readOnly = true; ta.value = fallbackMessage;
+    ta.style.cssText = 'width:100%;height:150px;margin-top:8px;background:#0e1013;color:#e8e8e8;border:1px solid #333;border-radius:6px;padding:8px;';
+    el.appendChild(ta); ta.focus(); ta.select();
+  }
+}
+
 function fillWhatsAppTab(tab, message) {
   copyMessage(message);
   const url = whatsappUrl(message);
@@ -479,14 +506,15 @@ function fillWhatsAppTab(tab, message) {
 
 async function testDestination(id) {
   const dest = destinations.find((d) => d.id === id);
-  const tab = dest && dest.platform === 'whatsapp_manual' ? openWhatsAppTab() : null;
   try {
     const r = await api({ action: 'test', destination_id: id });
-    if (r.manual) fillWhatsAppTab(tab, r.message);
-    log(`Teste enviado para "${dest ? dest.name : ''}".`, 'ok');
-    $('destMsg').textContent = 'Teste enviado \u2014 confira no destino.';
+    if (r.manual) {
+      const copied = await copyMessage(r.message);
+      showHint(copied ? 'Mensagem de teste copiada! Cole (Ctrl+V) em qualquer conversa do WhatsApp e confira se todos os emojis aparecem.' : 'N\u00e3o consegui copiar sozinho. Copie o texto abaixo e cole no WhatsApp:', copied ? null : r.message);
+    }
+    log(`Teste preparado para "${dest ? dest.name : ''}".`, 'ok');
+    $('destMsg').textContent = r.manual ? 'Teste copiado \u2014 cole no WhatsApp.' : 'Teste enviado \u2014 confira no destino.';
   } catch (err) {
-    if (tab) tab.close();
     log(`Teste falhou: ${err.message}`, 'err');
     $('destMsg').textContent = `Erro: ${err.message}`;
   }
@@ -572,12 +600,12 @@ function renderJob() {
   const box = $('statusBox');
   const openBtn = $('waOpenBtn');
   const job = selectedJob(true);
-  if (!job) { openBtn.classList.add('hidden'); return; }
+  if (!job) { if (!localPending) openBtn.classList.add('hidden'); return; }
 
   if (job.status !== 'running') {
     box.classList.remove('running', 'alert');
     box.innerHTML = `<b>Parado.</b> ${escapeHtml(job.last_event || '')}${job.last_error ? `<br>\u26a0\ufe0f ${escapeHtml(job.last_error)}` : ''}<br>Enviados nesta rodada: ${job.sent_count}/${job.max_sends}`;
-    openBtn.classList.add('hidden');
+    if (!localPending) openBtn.classList.add('hidden');
     alarmKey = null; stopAlarm();
     return;
   }
@@ -651,23 +679,25 @@ async function openNextWhatsApp() {
   const dest = selectedDest();
   if (!dest) return;
   const f = filters();
-  const tab = openWhatsAppTab();
+  const btn = $('waBtn');
+  btn.disabled = true;
+  $('statusBox').textContent = 'Preparando e conferindo o produto...';
   try {
     const r = await api({ action: 'send_next', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace, footer: f.footer });
     logSkipped(r.skipped);
-    if (r.empty) {
-      if (tab) tab.close();
-      $('statusBox').textContent = 'Fila vazia para esse filtro.';
-      return;
-    }
-    fillWhatsAppTab(tab, r.message);
-    $('statusBox').innerHTML = `<b>Preparado:</b> ${escapeHtml(r.promotion.title.slice(0, 80))}${r.promotion.coupon ? ` \u00b7 cupom <b>${escapeHtml(r.promotion.coupon)}</b>` : ''}<br>Restam ${r.remaining} na fila. Escolha o grupo no WhatsApp e toque em enviar.`;
+    if (r.empty) { $('statusBox').textContent = 'Fila vazia para esse filtro.'; return; }
+    localPending = { message: r.message, title: r.promotion.title, coupon: r.promotion.coupon, remaining: r.remaining };
+    const box = $('statusBox');
+    box.classList.add('alert');
+    box.innerHTML = `<span class="big">PRONTA PARA ENVIAR</span><br>${escapeHtml(r.promotion.title.slice(0, 90))}${r.promotion.coupon ? ` \u00b7 cupom <b>${escapeHtml(r.promotion.coupon)}</b>` : ''}<br>Restam ${r.remaining} na fila. Aperte o bot\u00e3o abaixo (ou Enter).`;
+    $('waOpenBtn').classList.remove('hidden');
     log(`\ud83d\udcf1 Preparado para WhatsApp: ${r.promotion.title.slice(0, 70)}`, 'ok');
     loadAll();
   } catch (err) {
-    if (tab) tab.close();
     $('statusBox').textContent = `Erro: ${err.message}`;
     log(`\u26a0\ufe0f ${err.message}`, 'err');
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -753,20 +783,33 @@ function unlockAudio() {
 
 async function waOpenPending() {
   const job = selectedJob(false);
-  if (!job || !job.pending) return;
-  const msg = job.pending.message;
-  copyMessage(msg);
-  window.open(whatsappUrl(msg), '_blank'); // dentro do clique, sen\u00e3o o navegador bloqueia
+  const fromJob = !!(job && job.pending);
+  const pending = fromJob ? job.pending : localPending;
+  if (!pending) return;
+  const msg = pending.message;
+  const copyOnly = $('waCopyOnly').checked;
+  if (!copyOnly) window.open(whatsappUrl(msg), '_blank'); // dentro do clique, sen\u00e3o o navegador bloqueia
+  const copied = await copyMessage(msg);
   stopAlarm(); alarmKey = null;
+  localPending = null;
   $('waOpenBtn').classList.add('hidden');
-  log(`\ud83d\udcf1 Aberto no WhatsApp: ${String(job.pending.title || '').slice(0, 70)} (mensagem tamb\u00e9m copiada: Ctrl+V se faltar emoji)`, 'ok');
-  try { applyJobs(await api({ action: 'job_ack', destination_id: job.destination_id })); }
-  catch (err) { log(`\u26a0\ufe0f ${err.message}`, 'err'); }
+  $('statusBox').classList.remove('alert');
+  showHint(
+    copied
+      ? (copyOnly ? 'Mensagem copiada! V\u00e1 ao WhatsApp, abra o grupo, cole com Ctrl+V e envie.' : 'WhatsApp aberto e mensagem copiada. Escolha o grupo; se faltar emoji ou texto, cole com Ctrl+V.')
+      : 'N\u00e3o consegui copiar sozinho. Copie o texto abaixo e cole no grupo:',
+    copied ? null : msg,
+  );
+  log(`\ud83d\udcf1 Pronta no WhatsApp: ${String(pending.title || '').slice(0, 70)}`, 'ok');
+  if (fromJob) {
+    try { applyJobs(await api({ action: 'job_ack', destination_id: job.destination_id })); }
+    catch (err) { log(`\u26a0\ufe0f ${err.message}`, 'err'); }
+  }
 }
 
 document.addEventListener('keydown', (e) => {
   const job = selectedJob(false);
-  if (job && job.pending && e.key === 'Enter' && document.activeElement && !['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(document.activeElement.tagName)) {
+  if (((job && job.pending) || localPending) && e.key === 'Enter' && document.activeElement && !['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(document.activeElement.tagName)) {
     e.preventDefault(); waOpenPending();
   }
 });
@@ -787,6 +830,7 @@ $('waStartBtn').addEventListener('click', startRun);
 $('waStopBtn').addEventListener('click', stopRun);
 $('waOpenBtn').addEventListener('click', waOpenPending);
 $('verifyBtn').addEventListener('click', verifyQueueUI);
+$('waCopyOnly').addEventListener('change', saveSettings);
 
 loadAll();
 
