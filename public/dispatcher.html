@@ -295,6 +295,7 @@ async function loadAll() {
   if (d.status === 'fulfilled') {
     destinations = d.value.destinations || [];
     jobs = d.value.jobs || [];
+    if (d.value.version && $('ver')) $('ver').textContent += ` | API ${d.value.version}`;
     if (d.value.now) serverOffset = new Date(d.value.now).getTime() - Date.now();
     $('destMsg').textContent = '';
   } else {
