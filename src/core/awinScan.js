@@ -1,6 +1,7 @@
 const awinClient = require('../integrations/awin/client');
 const { getAwinContext, loadAwinCoupons } = require('./awin');
 const { bestNetshoesCoupon } = require('./coupons');
+const { loadRecentIndex } = require('./dedupe');
 
 // Busca de promoções da Riachuelo (Awin). Segue as MESMAS regras da Netshoes:
 //  - promoção = preço atual abaixo do preço "normal" (o maior entre o preço "de" do feed e a
@@ -169,6 +170,10 @@ async function scanRiachuelo(req, res, h) {
     const couponCtx = { list: couponList, left: AWIN_COUPON_MAX_PER_SCAN, deals: 0 };
 
     const seenUrls = new Set();
+    // Produtos já salvos nos últimos 14 dias (evita o mesmo produto repetido com outro link).
+    const recent = await loadRecentIndex(supabaseAdmin, marketplaceId);
+    const dedupeCtx = { index: recent.index };
+    let duplicates = 0;
     const errors = [];
     let found = 0; let withDiscount = 0; let itemsSeen = 0; let done = 0; let skipped = 0; let nextTask = 0;
     const totals = { withSale: 0, maxDiscount: 0, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0, changed: 0, oldestMs: 0, matchedKeywords: 0 };
@@ -185,10 +190,11 @@ async function scanRiachuelo(req, res, h) {
           const rest = shuffle(task.matches.filter((m) => !(m._feedDrop > 0)));
           const items = [...withDrop, ...rest].slice(0, AWIN_PER_KEYWORD);
           itemsSeen += items.length;
-          const r = await processAwinItems(items, ctx, task.group, seenUrls, couponCtx, h);
+          const r = await processAwinItems(items, ctx, task.group, seenUrls, couponCtx, h, dedupeCtx);
           done += 1;
           found += r.found; withDiscount += r.withDiscount;
           const s = r.stats;
+          duplicates += s.duplicates || 0;
           totals.withSale += s.withSale; totals.maxDiscount = Math.max(totals.maxDiscount, s.maxDiscount);
           totals.withHistory += s.withHistory; totals.newlyTracked += s.newlyTracked; totals.withFeedDiscount += s.withFeedDiscount;
           totals.parsedItems += s.parsedItems; totals.changed += s.changed;
@@ -222,6 +228,7 @@ async function scanRiachuelo(req, res, h) {
         : `${feedDiag} Nenhum produto está abaixo do preço normal (queda mínima de ${AWIN_MIN_DROP_PCT}%) nem tem cupom que valha para ele. ${diag}${couponDiag}`);
     }
     if (found > 0) parts.push(`${feedDiag}${couponNote ? ` Aviso: não consegui ler os cupons da Riachuelo (${couponNote}).` : ''}${couponCtx.deals ? ` ${couponCtx.deals} das ofertas vieram de cupom ativo.` : ''}`);
+    if (duplicates) parts.push(`${duplicates} produto(s) repetido(s) foram descartados.`);
     if (noMatch.length && itemsSeen > 0) parts.push(`${noMatch.length} palavra(s)-chave não casaram com nenhum produto: ${noMatch.slice(0, 5).join(', ')}.`);
     if (totals.historyError) parts.push(`Histórico de preços indisponível (${totals.historyError}). Rode o arquivo 0003_promotion_price_history.sql no Supabase.`);
     if (skipped) parts.push(`${skipped} palavra(s)-chave ficaram para a próxima busca (limite de tempo).`);
@@ -242,10 +249,10 @@ async function scanRiachuelo(req, res, h) {
 }
 
 // Mesma regra de decisão do processNetshoesItems, trocando só a origem dos dados e o link de afiliado.
-async function processAwinItems(items, ctx, group, seenUrls, couponCtx, h) {
+async function processAwinItems(items, ctx, group, seenUrls, couponCtx, h, dedupeCtx) {
   const { supabaseAdmin, parsePrice, chunk, median } = h;
   const marketplaceId = ctx.marketplaceId;
-  const stats = { withSale: 0, maxDiscount: 0, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0, changed: 0, oldestMs: 0 };
+  const stats = { withSale: 0, maxDiscount: 0, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0, changed: 0, oldestMs: 0, duplicates: 0 };
 
   const parsed = [];
   for (const item of items) {
@@ -356,9 +363,12 @@ async function processAwinItems(items, ctx, group, seenUrls, couponCtx, h) {
   const now = new Date().toISOString();
   const toInsert = [];
   const updates = [];
+  candidates.sort((a, b) => a.price - b.price); // entre repetidos, o mais barato entra primeiro
   for (const c of candidates) {
     const existing = existingByUrl.get(c.productUrl);
     if (existing) { updates.push({ existing, c }); continue; }
+    if (dedupeCtx && dedupeCtx.index.findSimilar(c.title)) { stats.duplicates += 1; continue; }
+    if (dedupeCtx) dedupeCtx.index.add(c.title, { title: c.title, current_price: c.price, original_url: c.productUrl });
     toInsert.push({
       marketplace_id: marketplaceId,
       watch_group_id: group.id,
