@@ -4,6 +4,7 @@ const netshoesClient = require('../../src/integrations/netshoes/client');
 const { supabaseAdmin } = require('../../src/core/database/supabaseClient');
 const { loadNetshoesCoupons, bestNetshoesCoupon } = require('../../src/core/coupons');
 const { scanRiachuelo } = require('../../src/core/awinScan');
+const { loadRecentIndex } = require('../../src/core/dedupe');
 
 const MIN_DISCOUNT_PCT = 10; // era 15 — baixei pra achar mais resultado em categorias mais de nicho
 
@@ -309,6 +310,10 @@ async function scanNetshoes(req, res) {
     const selectedRows = groupsParam ? (allGroups || []).filter((g) => groupsParam.includes(g.id)) : allGroups;
     const groups = mergeGroupsByName(selectedRows);
 
+    // Produtos já salvos nos últimos 14 dias (para não repetir o mesmo produto de outro vendedor).
+    const recent = await loadRecentIndex(supabaseAdmin, marketplace.id);
+    const dedupeCtx = { index: recent.index };
+
     if (groups.length === 0) {
       res.status(200).json({
         ok: true,
@@ -344,7 +349,7 @@ async function scanNetshoes(req, res) {
     let skipped = 0;
     let loggedErrors = 0;
     let nextTask = 0;
-    const totals = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0, changed: 0, rose: 0, oldestMs: 0 };
+    const totals = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0, changed: 0, rose: 0, oldestMs: 0, duplicates: 0 };
 
     async function worker() {
       while (nextTask < tasks.length) {
@@ -356,7 +361,7 @@ async function scanNetshoes(req, res) {
           done += 1;
           itemsSeen += items.length;
           if (!items.length && items.rawSample && emptySamples.length < 1) emptySamples.push(`"${task.keyword}": ${items.rawSample}`);
-          const result = await processNetshoesItems(items, marketplace.id, task.group, publisherId, mid, seenUrls, couponCtx);
+          const result = await processNetshoesItems(items, marketplace.id, task.group, publisherId, mid, seenUrls, couponCtx, dedupeCtx);
           found += result.found;
           withDiscount += result.withDiscount;
           totals.withSale += result.stats.withSale;
@@ -368,6 +373,7 @@ async function scanNetshoes(req, res) {
           totals.parsedItems += result.stats.parsedItems;
           totals.changed += result.stats.changed;
           totals.rose += result.stats.rose;
+          totals.duplicates += result.stats.duplicates;
           if (result.stats.oldestMs && (!totals.oldestMs || result.stats.oldestMs < totals.oldestMs)) totals.oldestMs = result.stats.oldestMs;
           if (!totals.historyError && result.stats.historyError) totals.historyError = result.stats.historyError;
         } catch (err) {
@@ -413,6 +419,7 @@ async function scanNetshoes(req, res) {
         parts.push(`A Netshoes devolveu ${itemsSeen} produto(s) pela busca de palavra-chave (a busca traz produtos do catálogo, não só os em promoção), mas nenhum está abaixo do preço normal (queda mínima de ${NETSHOES_MIN_DROP_PCT}%) nem tem cupom que valha para ele. ${diag}${couponDiag}`);
       }
     }
+    if (totals.duplicates) parts.push(`${totals.duplicates} produto(s) repetido(s) (mesmo produto, outro anúncio) foram descartados.`);
     if (found > 0 && couponNote) parts.push(`Aviso: não consegui ler os cupons da Netshoes (${couponNote}).`);
     if (found > 0 && couponCtx.deals) parts.push(`${couponCtx.deals} das ofertas vieram de cupom ativo da Netshoes.`);
     if (totals.historyError) parts.push(`Histórico de preços indisponível (${totals.historyError}). Rode o arquivo 0003_promotion_price_history.sql no Supabase; enquanto isso a comparação usa só o preço "de" da Netshoes.`);
@@ -471,8 +478,8 @@ function median(values) {
 //   preço normal = mediana dos preços registrados nos últimos 7 dias
 //                  (se o produto ainda não tem histórico: o preço "de" da Netshoes)
 //   é promoção quando preço atual < preço normal em pelo menos NETSHOES_MIN_DROP_PCT.
-async function processNetshoesItems(items, marketplaceId, group, publisherId, mid, seenUrls, couponCtx) {
-  const stats = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0, changed: 0, rose: 0, oldestMs: 0 };
+async function processNetshoesItems(items, marketplaceId, group, publisherId, mid, seenUrls, couponCtx, dedupeCtx) {
+  const stats = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0, changed: 0, rose: 0, oldestMs: 0, duplicates: 0 };
 
   // 1) Lê os itens (um por link, mesmo que apareça em mais de uma palavra-chave)
   const parsed = [];
@@ -602,11 +609,17 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
   const toInsert = [];
   const updates = [];
 
+  // Do mais barato para o mais caro: entre anúncios repetidos do mesmo produto, o mais barato entra primeiro.
+  candidates.sort((a, b) => a.price - b.price);
+
   for (const c of candidates) {
     const existing = existingByUrl.get(c.productUrl);
     if (existing) {
       updates.push({ existing, c });
     } else {
+      // Mesmo produto (outro vendedor/anúncio) já salvo ou já aceito nesta busca? Descarta.
+      if (dedupeCtx && dedupeCtx.index.findSimilar(c.title)) { stats.duplicates += 1; continue; }
+      if (dedupeCtx) dedupeCtx.index.add(c.title, { title: c.title, current_price: c.price, original_url: c.productUrl });
       toInsert.push({
         marketplace_id: marketplaceId,
         watch_group_id: group.id,
@@ -676,11 +689,16 @@ async function scanShopee(req, res) {
     const selectedRows = groupsParam ? (allGroups || []).filter((g) => groupsParam.includes(g.id)) : allGroups;
     const groups = mergeGroupsByName(selectedRows);
 
+    // Produtos já salvos nos últimos 14 dias: a Shopee devolve o MESMO produto em vários anúncios
+    // (um por vendedor, cada um com link diferente) — comparar só o link não pega isso.
+    const recent = await loadRecentIndex(supabaseAdmin, marketplace.id);
+    const dedupeCtx = { index: recent.index };
+
     let found = 0;
     let skipped = 0;
     const errors = [];
     const seenUrls = new Set();
-    const totals = { checked: 0, updated: 0, listedOnly: 0, withHistory: 0, trackedNow: 0, maxDrop: 0, changed: 0, historyError: null };
+    const totals = { checked: 0, updated: 0, listedOnly: 0, withHistory: 0, trackedNow: 0, maxDrop: 0, changed: 0, duplicates: 0, historyError: null };
 
     for (const group of groups || []) {
       try {
@@ -700,7 +718,7 @@ async function scanShopee(req, res) {
           const sortType = SHOPEE_SORT_ROTATION[Math.floor(Math.random() * SHOPEE_SORT_ROTATION.length)];
           const page = 1 + Math.floor(Math.random() * 3);
           const offers = await searchProductOffers(creds.client_id, creds.client_secret, keyword, { limit: perKeywordLimit, sortType, page });
-          const r = await processShopeeOffers(offers, marketplace.id, group, keyword, creds, seenUrls);
+          const r = await processShopeeOffers(offers, marketplace.id, group, keyword, creds, seenUrls, dedupeCtx);
           found += r.found;
           totals.updated += r.updated;
           totals.checked += r.checked;
@@ -708,6 +726,7 @@ async function scanShopee(req, res) {
           totals.withHistory += r.withHistory;
           totals.trackedNow += r.trackedNow;
           totals.changed += r.changed;
+          totals.duplicates += r.duplicates;
           totals.maxDrop = Math.max(totals.maxDrop, r.maxDrop);
           if (!totals.historyError && r.historyError) totals.historyError = r.historyError;
         }
@@ -733,6 +752,7 @@ async function scanShopee(req, res) {
     } else if (found === 0 && totals.checked > 0) {
       parts.push(`A Shopee devolveu ${totals.checked} produto(s), mas nenhum caiu de preço de verdade (queda mínima de ${SHOPEE_MIN_DROP_PCT}% contra o que já vi nos últimos ${NETSHOES_HISTORY_DAYS} dias)${SHOPEE_ACCEPT_LISTED_DISCOUNT ? ` nem tinha desconto de tabela de pelo menos ${SHOPEE_LISTED_MIN_PCT}%` : `. Em ${totals.listedOnly} havia só "desconto" de preço de tabela, que a Shopee informa sem prova de promoção, e por isso foram ignorados`}. ${totals.trackedNow} passaram a ser acompanhados agora e ${totals.withHistory} já tinham histórico (${totals.changed} com preço diferente do histórico). Rode a busca de novo nos próximos dias.`);
     }
+    if (totals.duplicates) parts.push(`${totals.duplicates} produto(s) repetido(s) (mesmo produto vendido por outro vendedor) foram descartados.`);
     if (totals.historyError) parts.push(`Histórico de preços indisponível (${totals.historyError}): sem ele não dá para provar queda de preço, então nada foi salvo como promoção.`);
     if (skipped) parts.push(`${skipped} palavra(s)-chave ficaram para a próxima busca (limite de tempo).`);
 
@@ -769,8 +789,8 @@ function titleMatchesKeyword(title, keyword) {
 //   preço normal = mediana dos preços que o sistema registrou nos últimos 7 dias
 //   é promoção quando o preço atual está abaixo dele em pelo menos SHOPEE_MIN_DROP_PCT.
 // O priceDiscountRate da Shopee (preço de tabela) NÃO conta como prova — ver comentário no topo do arquivo.
-async function processShopeeOffers(offers, marketplaceId, group, keyword, creds, seenUrls) {
-  const stats = { found: 0, updated: 0, checked: 0, listedOnly: 0, withHistory: 0, trackedNow: 0, maxDrop: 0, changed: 0, historyError: null };
+async function processShopeeOffers(offers, marketplaceId, group, keyword, creds, seenUrls, dedupeCtx) {
+  const stats = { found: 0, updated: 0, checked: 0, listedOnly: 0, withHistory: 0, trackedNow: 0, maxDrop: 0, changed: 0, duplicates: 0, historyError: null };
 
   // 1) Lê as ofertas (descarta título sem relação com a busca e links repetidos)
   const parsed = [];
@@ -869,6 +889,8 @@ async function processShopeeOffers(offers, marketplaceId, group, keyword, creds,
   }
 
   const now = new Date().toISOString();
+  // Do mais barato para o mais caro: entre anúncios repetidos do mesmo produto, o mais barato entra primeiro.
+  candidates.sort((a, b) => a.price - b.price);
   for (const c of candidates) {
     const existing = existingByUrl.get(c.productUrl);
     if (existing) {
@@ -886,6 +908,11 @@ async function processShopeeOffers(offers, marketplaceId, group, keyword, creds,
       stats.updated += 1;
       continue;
     }
+
+    // Mesmo produto (outro vendedor/anúncio) já salvo ou já aceito nesta busca? Descarta.
+    // (checa e registra no mesmo trecho, sem esperar nada no meio — assim duas buscas simultâneas não passam juntas)
+    if (dedupeCtx && dedupeCtx.index.findSimilar(c.title)) { stats.duplicates += 1; continue; }
+    if (dedupeCtx) dedupeCtx.index.add(c.title, { title: c.title, current_price: c.price, original_url: c.productUrl });
 
     let affiliateUrl = null;
     try {
