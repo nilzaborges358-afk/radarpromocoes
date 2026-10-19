@@ -91,6 +91,7 @@ function init() {
   });
 
   document.getElementById('scanBtn').addEventListener('click', openScanModal);
+  document.getElementById('dedupeBtn').addEventListener('click', cleanDuplicates);
   document.getElementById('scanModalCancel').addEventListener('click', closeScanModal);
   document.getElementById('scanModalConfirm').addEventListener('click', confirmScan);
   document.getElementById('scanSelectAll').addEventListener('click', () => setAllScanGroups(true));
@@ -240,14 +241,20 @@ function render() {
   if (groupIds) base = base.filter((p) => p.watch_group_id && groupIds.has(p.watch_group_id));
   base = applyDateFilter(base);
 
-  // Contadores só mostram número quando há promoção de fato na tela; acompanham os filtros em tempo real.
-  const hasResults = base.length > 0;
-  document.getElementById('countAll').textContent = hasResults ? base.length : '–';
-  document.getElementById('countPending').textContent = hasResults ? base.filter((p) => p.status === 'PENDING').length : '–';
-  document.getElementById('countAffiliated').textContent = hasResults ? base.filter((p) => p.status === 'AFFILIATED').length : '–';
+  // O mesmo produto vendido por vários vendedores aparece UMA vez só (a mais barata, ou a que você já afiliou),
+  // com um aviso de quantos anúncios iguais existem. As ignoradas ficam só na aba "Ignoradas".
+  const ignored = base.filter((p) => p.status === 'IGNORED');
+  const visible = collapseDuplicates(base.filter((p) => p.status !== 'IGNORED'));
 
-  let list = base;
-  if (currentStatus !== 'ALL') list = list.filter((p) => p.status === currentStatus);
+  // Contadores só mostram número quando há promoção de fato na tela; acompanham os filtros em tempo real.
+  const hasResults = visible.length > 0;
+  document.getElementById('countAll').textContent = hasResults ? visible.length : '–';
+  document.getElementById('countPending').textContent = hasResults ? visible.filter((p) => p.status === 'PENDING').length : '–';
+  document.getElementById('countAffiliated').textContent = hasResults ? visible.filter((p) => p.status === 'AFFILIATED').length : '–';
+
+  let list = visible;
+  if (currentStatus === 'IGNORED') list = ignored;
+  else if (currentStatus !== 'ALL') list = visible.filter((p) => p.status === currentStatus);
 
   if (list.length === 0) {
     grid.innerHTML = '';
@@ -356,6 +363,7 @@ function renderCard(promo) {
       </div>
       <div class="card-body">
         <div class="card-title">${escapeHtml(promo.title)}</div>
+        ${promo._dupCount ? `<div class="dup-note">+${promo._dupCount} anúncio${promo._dupCount > 1 ? 's' : ''} igual${promo._dupCount > 1 ? 'is' : ''} de outro${promo._dupCount > 1 ? 's' : ''} vendedor${promo._dupCount > 1 ? 'es' : ''} (mostrando o mais barato)</div>` : ''}
         <div class="price-row">
           <span class="price-current">R$ ${formatPrice(promo.current_price)}</span>
           ${promo.previous_price ? `<span class="price-previous">R$ ${formatPrice(promo.previous_price)}</span>` : ''}
@@ -497,6 +505,77 @@ async function confirmScan() {
   } finally {
     confirmBtn.disabled = false;
     confirmBtn.textContent = 'Buscar';
+  }
+}
+
+// ---------- produtos repetidos ----------
+// Mesma regra do servidor (src/core/dedupe.js): palavras que importam do título + números (300ml, kit 4...).
+// Se mudar uma, mude a outra.
+const DD_STOP = new Set(['de', 'da', 'do', 'das', 'dos', 'e', 'com', 'sem', 'para', 'pra', 'em', 'a', 'o', 'as', 'os', 'um', 'uma',
+  'por', 'no', 'na', 'nos', 'nas', 'ou', 'ao', 'aos', 'que', 'mais', 'muito', 'super', 'ate',
+  'original', 'originais', 'promocao', 'oferta', 'ofertas', 'lancamento', 'novo', 'nova', 'novos', 'novas',
+  'frete', 'gratis', 'envio', 'imediato', 'imediata', 'rapido', 'rapida', 'full', 'barato', 'barata',
+  'qualidade', 'premium', 'top', 'melhor', 'pronta', 'pronto', 'entrega', 'brasil', 'oficial',
+  'unidade', 'unidades', 'unid', 'und', 'peca', 'pecas', 'pcs', 'pc', 'par', 'pares', 'jogo']);
+
+function ddTokenize(title) {
+  const clean = String(title || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const words = new Set();
+  const nums = new Set();
+  clean.split(' ').forEach((raw) => {
+    if (!raw) return;
+    if (/\d/.test(raw)) { nums.add(raw.replace(/^x(?=\d)|(?<=\d)x$/g, '')); return; }
+    if (raw.length < 3 || DD_STOP.has(raw)) return;
+    words.add(raw.length > 4 && raw.endsWith('s') ? raw.slice(0, -1) : raw);
+  });
+  return { words, nums };
+}
+
+function ddSimilar(a, b) {
+  if (!a.words.size || !b.words.size) return false;
+  if (a.nums.size !== b.nums.size) return false;
+  for (const n of a.nums) if (!b.nums.has(n)) return false;
+  let shared = 0;
+  a.words.forEach((w) => { if (b.words.has(w)) shared += 1; });
+  if (!shared) return false;
+  const jaccard = shared / (a.words.size + b.words.size - shared);
+  const overlap = shared / Math.min(a.words.size, b.words.size);
+  return (shared >= 2 && jaccard >= 0.6) || (shared >= 4 && overlap >= 0.8);
+}
+
+// Junta os anúncios do MESMO produto (dentro do mesmo marketplace). Fica o já afiliado; senão o mais barato.
+function collapseDuplicates(list) {
+  const groups = [];
+  list.forEach((p) => {
+    const tok = ddTokenize(p.title);
+    const g = groups.find((x) => x.mp === p.marketplace_id && ddSimilar(tok, x.tok));
+    if (!g) { groups.push({ mp: p.marketplace_id, tok, rep: p, extra: 0 }); return; }
+    g.extra += 1;
+    const better = (p.status === 'AFFILIATED' && g.rep.status !== 'AFFILIATED')
+      || ((p.status === 'AFFILIATED') === (g.rep.status === 'AFFILIATED') && Number(p.current_price) < Number(g.rep.current_price));
+    if (better) g.rep = p;
+  });
+  return groups.map((g) => (g.extra ? { ...g.rep, _dupCount: g.extra } : g.rep));
+}
+
+async function cleanDuplicates() {
+  if (!confirm('Marcar como IGNORADAS as promoções repetidas (mesmo produto, vários vendedores)?\n\nFica uma de cada: a que você já afiliou ou, se não houver, a mais barata. Quem já está afiliada não é mexida.')) return;
+  const btn = document.getElementById('dedupeBtn');
+  const out = document.getElementById('scanResult');
+  btn.disabled = true;
+  out.classList.remove('error');
+  out.textContent = 'Procurando repetidos...';
+  try {
+    const res = await fetch('/api/promotions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'dedupe' }) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    out.textContent = `Limpeza feita: ${data.checked} promoção(ões) conferidas, ${data.ignored} repetida(s) marcada(s) como ignorada(s).`;
+    await loadPromotions();
+  } catch (err) {
+    out.classList.add('error');
+    out.textContent = `Não consegui limpar: ${err.message}`;
+  } finally {
+    btn.disabled = false;
   }
 }
 
