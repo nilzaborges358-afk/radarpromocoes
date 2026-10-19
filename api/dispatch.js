@@ -1,4 +1,4 @@
-const VERSION = 'dispatch-v2026-10-16.6';
+const VERSION = 'dispatch-v2026-10-17.1';
 
 // Carregamento protegido: se alguma peca faltar no deploy, a API responde dizendo QUAL (em vez de cair com erro 500).
 let supabaseAdmin = null;
@@ -7,10 +7,13 @@ try { supabaseAdmin = require('../src/core/database/supabaseClient').supabaseAdm
 catch (e) { LOAD_ERROR = `Nao consegui carregar o banco (src/core/database/supabaseClient.js): ${e.message}`; }
 function coupons() { try { return require('../src/core/coupons'); } catch { return {}; } }
 function shopeeClient() { try { return require('../src/integrations/shopee/client'); } catch { return {}; } }
+function dedupeLib() { try { return require('../src/core/dedupe'); } catch { return null; } }
 
 // Disparador de promo--es (Telegram autom-tico / WhatsApp assistido).
 // GET  /api/dispatch                      -> lista destinos
-// POST /api/dispatch { action: ... }      -> create_destination | delete_destination | test | queue | verify | send_next | job_start | job_stop | job_ack | tick
+// POST /api/dispatch { action: ... }      -> create_destination | delete_destination | test | queue | verify | send_next | job_start | job_stop | job_ack | tick | bot_poll | bot_ack
+// Modo ROBO (WhatsApp 100% automatico): o servidor prepara a mensagem na hora certa e o robo que roda no
+// notebook (robo-whatsapp) busca em bot_poll, envia no WhatsApp e confirma em bot_ack.
 // Precisa das tabelas dispatch_destinations e dispatch_log (SQL em supabase/migrations/0002_disparador.sql).
 
 const QUEUE_DAYS_SEEN = 1;     // so promocoes vistas pela busca nas ultimas 24h (precos de hoje)
@@ -136,6 +139,11 @@ function toPlain(html) {
   return html.replace(/<\/?(b|s)>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 }
 
+// Versao para WhatsApp: negrito vira *texto* e riscado vira ~texto~ (o WhatsApp entende os dois).
+function toWhatsApp(html) {
+  return html.replace(/<\/?b>/g, '*').replace(/<\/?s>/g, '~').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
 
 // ---------------- valida--o antes de enviar ----------------
 
@@ -235,14 +243,14 @@ async function loadQueue(destId, body) {
   if (error) throw new Error(dbError(error));
 
   const { data: logs, error: logErr } = await supabaseAdmin
-    .from('dispatch_log').select('promotion_id').eq('destination_id', destId).gte('sent_at', isoAgo(NO_REPEAT_DAYS * DAY));
+    .from('dispatch_log').select('promotion_id, skipped').eq('destination_id', destId).gte('sent_at', isoAgo(NO_REPEAT_DAYS * DAY));
   if (logErr) throw new Error(dbError(logErr));
   const already = new Set((logs || []).map((l) => l.promotion_id));
 
   const wantNone = groupIds.includes('none');
   const mp = body.marketplace || null;
 
-  return (data || []).filter((p) => {
+  let list = (data || []).filter((p) => {
     if (already.has(p.id)) return false;
     if (!/^https?:\/\//i.test(p.affiliate_url || '')) return false;
     if (mp && (!p.marketplaces || p.marketplaces.slug !== mp)) return false;
@@ -252,6 +260,29 @@ async function loadQueue(destId, body) {
     }
     return true;
   });
+
+  // Promocoes com queda de preco COMPROVADA saem antes das que so tem "desconto de tabela" informado
+  // pela Shopee (preco de tabela inflado e comum). Dentro de cada faixa, maior desconto primeiro.
+  const rank = (p) => (p.source === 'shopee_listed_price' ? 1 : 0);
+  list = list.map((p, i) => ({ p, i })).sort((a, b) => (rank(a.p) - rank(b.p)) || (a.i - b.i)).map((x) => x.p);
+
+  // Mesmo PRODUTO (outro vendedor, outro link) nao pode sair duas vezes:
+  //  1) nao repete produto parecido com algo ja ENVIADO a este destino nas ultimas 2 semanas;
+  //  2) entre parecidos na propria fila, fica so o mais barato.
+  const dd = dedupeLib();
+  if (dd && list.length) {
+    const sentIds = (logs || []).filter((l) => !l.skipped).map((l) => l.promotion_id).filter(Boolean);
+    if (sentIds.length) {
+      const sentIndex = new dd.SimilarIndex();
+      for (let i = 0; i < sentIds.length; i += 100) {
+        const { data: sentRows } = await supabaseAdmin.from('promotions').select('id, title').in('id', sentIds.slice(i, i + 100));
+        (sentRows || []).forEach((r) => sentIndex.add(r.title, r));
+      }
+      if (sentIndex.size) list = list.filter((p) => !sentIndex.findSimilar(p.title));
+    }
+    list = dd.keepCheapestOfEach(list, (p) => p.title, (p) => Number(p.current_price));
+  }
+  return list;
 }
 
 async function netshoesCoupons() {
@@ -303,7 +334,8 @@ async function createDestination(res, body) {
   if (!name) return fail(res, 400, 'D\u00ea um nome ao destino (ex.: Achadinhos).');
   const dailyLimit = Math.min(Math.max(parseInt(body.daily_limit, 10) || 60, 1), 200);
 
-  const row = { name: name.slice(0, 80), platform, daily_limit: dailyLimit, chat_id: null, bot_token: null };
+  // No WhatsApp, chat_id guarda o NOME do grupo (usado pelo robo). No Telegram, o @canal/id.
+  const row = { name: name.slice(0, 80), platform, daily_limit: dailyLimit, chat_id: platform === 'whatsapp_manual' ? (String(body.chat_id || '').replace(/\s+/g, ' ').trim().slice(0, 120) || null) : null, bot_token: null };
   let botUsername = null;
 
   if (platform === 'telegram') {
@@ -323,7 +355,12 @@ async function createDestination(res, body) {
 }
 
 async function listDestinations(res) {
-  const { data, error } = await supabaseAdmin.from('dispatch_destinations').select('id, name, platform, chat_id, daily_limit, created_at').order('created_at');
+  // bot_seen_at e criado pelo SQL 0004; se ele ainda nao foi rodado, cai para a consulta antiga.
+  let q = await supabaseAdmin.from('dispatch_destinations').select('id, name, platform, chat_id, daily_limit, created_at, bot_seen_at').order('created_at');
+  if (q.error && /bot_seen_at/i.test(String(q.error.message || ''))) {
+    q = await supabaseAdmin.from('dispatch_destinations').select('id, name, platform, chat_id, daily_limit, created_at').order('created_at');
+  }
+  const { data, error } = q;
   if (error) return fail(res, 500, dbError(error));
   const since = isoAgo(DAY);
   const [counts, payload] = await Promise.all([
@@ -332,7 +369,7 @@ async function listDestinations(res) {
     jobsPayload(),
   ]);
   const out = (data || []).map((d, i) => ({ ...d, sentLast24h: counts[i] }));
-  res.status(200).json({ destinations: out, jobs: payload.jobs, now: payload.now, version: VERSION });
+  res.status(200).json({ destinations: out, jobs: payload.jobs, now: payload.now, botSeenAt: payload.botSeenAt || null, version: VERSION });
 }
 
 async function sendTest(res, body) {
@@ -377,19 +414,18 @@ async function verifyQueue(res, body) {
   res.status(200).json(out);
 }
 
-async function sendNext(res, body) {
-  const dest = await getDestination(body.destination_id);
-  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
-
-  // limite di-rio e trava anti-duplo-clique
+// Escolhe e confere a proxima promocao (sem enviar nada). Devolve:
+//  { error: { status, message, extra } } | { empty: true, skipped } | { chosen, view, html, remaining, skippedInfo }
+async function prepareNext(dest, body) {
+  // limite diario e trava anti-duplo-clique
   const { count: sent24 } = await supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true })
     .eq('destination_id', dest.id).eq('skipped', false).gte('sent_at', isoAgo(DAY));
-  if ((sent24 || 0) >= dest.daily_limit) return fail(res, 429, `Limite de ${dest.daily_limit} envios em 24h atingido para "${dest.name}".`, { code: 'daily_limit' });
+  if ((sent24 || 0) >= dest.daily_limit) return { error: { status: 429, message: `Limite de ${dest.daily_limit} envios em 24h atingido para "${dest.name}".`, extra: { code: 'daily_limit' } } };
 
   const { data: last } = await supabaseAdmin.from('dispatch_log').select('sent_at').eq('destination_id', dest.id).eq('skipped', false)
     .order('sent_at', { ascending: false }).limit(1);
   if (last && last[0] && Date.now() - new Date(last[0].sent_at).getTime() < MIN_GAP_SECONDS * 1000) {
-    return fail(res, 429, 'Envio muito r\u00e1pido, aguardando alguns segundos.', { code: 'too_fast' });
+    return { error: { status: 429, message: 'Envio muito r\u00e1pido, aguardando alguns segundos.', extra: { code: 'too_fast' } } };
   }
 
   const list = await loadQueue(dest.id, body);
@@ -402,7 +438,7 @@ async function sendNext(res, body) {
     const check = await validatePromotion(p);
     if (!check.ok) {
       if (check.kind === 'badlink') {
-        return fail(res, 409, `Parei por seguran\u00e7a: ${check.reason}. Confira o ID de afiliado em Marketplaces antes de continuar.`, { code: 'bad_link' });
+        return { error: { status: 409, message: `Parei por seguran\u00e7a: ${check.reason}. Confira o ID de afiliado em Marketplaces antes de continuar.`, extra: { code: 'bad_link' } } };
       }
       if (check.kind === 'dead') await ignorePromotion(p, check.reason);
       await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: `pulada: ${check.reason}` });
@@ -421,22 +457,33 @@ async function sendNext(res, body) {
       p.discount_rate = prev ? Math.round(((prev - check.livePrice) / prev) * 10000) / 100 : p.discount_rate;
       supabaseAdmin.from('promotions').update({ current_price: p.current_price, discount_rate: p.discount_rate, last_seen_at: new Date().toISOString() }).eq('id', p.id).then(() => {}, () => {});
     }
-    // 2) pre-o/cupom de agora
+    // 2) preco/cupom de agora
     const v = await buildView(p);
     if (v) { chosen = p; view = v; break; }
     await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: 'pulada: cupom n\u00e3o confirmado' });
     skippedInfo.push({ title: p.title, reason: 'o cupom dessa oferta n\u00e3o est\u00e1 mais v\u00e1lido' });
   }
-  if (!chosen) return res.status(200).json({ empty: true, skipped: skippedInfo });
+  if (!chosen) return { empty: true, skipped: skippedInfo };
 
   chosen.view = view;
   const { count: total } = await supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true }).eq('destination_id', dest.id);
   const html = buildMessage(chosen, total || 0, String(body.footer || '').slice(0, 120));
-  const remaining = Math.max(list.length - tries, 0);
+  return { chosen, view, html, remaining: Math.max(list.length - tries, 0), skippedInfo };
+}
+
+async function sendNext(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+
+  const prep = await prepareNext(dest, body);
+  if (prep.error) return fail(res, prep.error.status, prep.error.message, prep.error.extra);
+  if (prep.empty) return res.status(200).json({ empty: true, skipped: prep.skipped });
+
+  const { chosen, view, html, remaining, skippedInfo } = prep;
   const slugName = chosen.marketplaces ? chosen.marketplaces.name : null;
 
   if (dest.platform === 'whatsapp_manual') {
-    const plain = toPlain(html);
+    const plain = toWhatsApp(html);
     await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: plain });
     return res.status(200).json({ ok: true, manual: true, message: plain, promotion: { title: chosen.title, coupon: view.coupon }, remaining, skipped: skippedInfo });
   }
@@ -463,6 +510,32 @@ async function sendNext(res, body) {
 // ---------------- disparo continuo (estado no servidor) ----------------
 
 const CLAIM_STALE_MS = 150 * 1000;
+const BOT_PENDING_MAX_MS = 10 * 60 * 1000; // mensagem entregue ao robo e nao confirmada ha mais que isso: descarta
+
+// ---- horario de funcionamento (hora de Brasilia = UTC-3, sem horario de verao desde 2019) ----
+const BRT_OFFSET_MS = -3 * 3600 * 1000;
+function parseHour(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = parseInt(v, 10);
+  return Number.isInteger(n) && n >= 0 && n <= 23 ? n : null;
+}
+function inWindow(f, ms = Date.now()) {
+  const from = Number.isInteger(f.hour_from) ? f.hour_from : null;
+  const to = Number.isInteger(f.hour_to) ? f.hour_to : null;
+  if (from === null || to === null || from === to) return true; // sem limite
+  const h = new Date(ms + BRT_OFFSET_MS).getUTCHours();
+  return from < to ? (h >= from && h < to) : (h >= from || h < to);
+}
+function nextWindowStart(f, ms = Date.now()) {
+  const brt = new Date(ms + BRT_OFFSET_MS);
+  let start = Date.UTC(brt.getUTCFullYear(), brt.getUTCMonth(), brt.getUTCDate(), f.hour_from, 0, 0) - BRT_OFFSET_MS;
+  if (start <= ms) start += 24 * 3600 * 1000;
+  return start;
+}
+// Intervalo com variacao de +-15%: mensagens em horario "redondo" demais chamam atencao do WhatsApp.
+function jitteredMs(minutes) {
+  return Math.max(Math.round(minutes * 60000 * (0.85 + Math.random() * 0.3)), 90 * 1000);
+}
 
 function fakeRes() {
   return { code: 200, body: null, status(c) { this.code = c; return this; }, json(b) { this.body = b; return this; } };
@@ -472,25 +545,52 @@ async function jobsPayload() {
   const now = new Date().toISOString();
   const { data, error } = await supabaseAdmin.from('dispatch_jobs').select('*');
   if (error) return { jobs: [], now, jobsError: error.message };
-  return { jobs: data || [], now };
+  // ultima vez que o robo do WhatsApp consultou o servidor (coluna criada pelo SQL 0004; sem ela, fica null)
+  let botSeenAt = null;
+  try {
+    const r = await supabaseAdmin.from('dispatch_destinations').select('bot_seen_at').not('bot_seen_at', 'is', null).order('bot_seen_at', { ascending: false }).limit(1);
+    if (!r.error && r.data && r.data[0]) botSeenAt = r.data[0].bot_seen_at;
+  } catch { /* sem a coluna: segue */ }
+  return { jobs: data || [], now, botSeenAt };
 }
 
 async function startJob(res, body) {
   const dest = await getDestination(body.destination_id);
   if (!dest) return fail(res, 404, 'Destino nao encontrado.');
   const isTelegram = dest.platform === 'telegram';
-  const interval = Math.max(parseInt(body.interval_min, 10) || 0, isTelegram ? 2 : 1);
+  // WhatsApp: 'bot' = robo envia sozinho; qualquer outra coisa = assistido (voce toca em enviar).
+  const mode = isTelegram ? 'auto' : (body.mode === 'bot' ? 'bot' : 'assisted');
+  const interval = Math.max(parseInt(body.interval_min, 10) || 0, (isTelegram || mode === 'bot') ? 2 : 1);
   const maxSends = Math.min(Math.max(parseInt(body.max_sends, 10) || 20, 1), 500);
   const footer = String(body.footer || '').slice(0, 120);
+  const filters = {
+    group_ids: Array.isArray(body.group_ids) ? body.group_ids : [],
+    marketplace: body.marketplace || null,
+    footer,
+    hour_from: parseHour(body.hour_from),
+    hour_to: parseHour(body.hour_to),
+  };
+  if (mode === 'bot') {
+    const waGroup = String(body.wa_group || dest.chat_id || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    if (!waGroup) return fail(res, 400, 'Informe o nome do grupo do WhatsApp (exatamente como aparece no WhatsApp) para o robo saber onde enviar.');
+    filters.wa_group = waGroup;
+    // guarda o nome no destino, para ja vir preenchido da proxima vez
+    if (waGroup !== dest.chat_id) await supabaseAdmin.from('dispatch_destinations').update({ chat_id: waGroup }).eq('id', dest.id);
+  }
   const nowIso = new Date().toISOString();
   const row = {
-    destination_id: dest.id, mode: isTelegram ? 'auto' : 'assisted', status: 'running',
+    destination_id: dest.id, mode, status: 'running',
     interval_min: interval, max_sends: maxSends, sent_count: 0, next_run_at: nowIso, claimed_at: null,
-    filters: { group_ids: Array.isArray(body.group_ids) ? body.group_ids : [], marketplace: body.marketplace || null, footer },
-    pending: null, last_event: 'Disparo iniciado.', last_error: null, error_streak: 0, updated_at: nowIso,
+    filters,
+    pending: null, last_event: mode === 'bot' ? 'Disparo iniciado. Aguardando o robo buscar a primeira mensagem.' : 'Disparo iniciado.', last_error: null, error_streak: 0, updated_at: nowIso,
   };
   const { error } = await supabaseAdmin.from('dispatch_jobs').upsert(row, { onConflict: 'destination_id' });
-  if (error) return fail(res, 500, dbError(error));
+  if (error) {
+    if (mode === 'bot' && /check constraint|violates/i.test(String(error.message || ''))) {
+      return fail(res, 500, 'O banco ainda nao aceita o modo robo. Rode o SQL 0004_robo_whatsapp.sql no Supabase (SQL Editor) e tente de novo.');
+    }
+    return fail(res, 500, dbError(error));
+  }
   res.status(200).json(await jobsPayload());
 }
 
@@ -527,6 +627,11 @@ async function processJob(job) {
     const dest = await getDestination(job.destination_id);
     if (!dest) { await finish({ status: 'stopped', last_error: 'Destino removido.' }); return; }
     const f = job.filters || {};
+    if (!inWindow(f)) {
+      const start = nextWindowStart(f);
+      await finish({ next_run_at: new Date(start).toISOString(), last_event: `Fora do horario (${f.hour_from}h-${f.hour_to}h): retomo as ${f.hour_from}h.`, last_error: null });
+      return;
+    }
     const fr = fakeRes();
     await sendNext(fr, { destination_id: dest.id, group_ids: f.group_ids || [], marketplace: f.marketplace || null, footer: f.footer || '' });
     r = { status: fr.code, json: fr.body || {} };
@@ -574,7 +679,7 @@ async function processJob(job) {
 async function tickJobs() {
   const nowIso = new Date().toISOString();
   const { data: due, error } = await supabaseAdmin.from('dispatch_jobs').select('*')
-    .eq('status', 'running').is('pending', null).lte('next_run_at', nowIso).limit(3);
+    .eq('status', 'running').neq('mode', 'bot').is('pending', null).lte('next_run_at', nowIso).limit(3);
   if (error) throw new Error(dbError(error));
   const work = [];
   for (const j of due || []) {
@@ -588,9 +693,158 @@ async function tickJobs() {
   await Promise.all(work);
 }
 
+
+// ---------------- WhatsApp 100% automatico (robo no notebook) ----------------
+// O robo consulta bot_poll de tempos em tempos. Se ha um envio na hora, o servidor escolhe e confere a
+// promocao, grava no registro (assim ela nunca se repete) e entrega a mensagem pronta; o robo envia no
+// WhatsApp e confirma com bot_ack. Sem o robo ligado nada e enviado — o disparo apenas espera.
+
+function botDeliver(job) {
+  const p = job.pending;
+  return { job_id: job.id, group: p.group, message: p.message, image_url: p.image_url || null, title: p.title };
+}
+
+async function prepareForBot(job) {
+  const nowIso = () => new Date().toISOString();
+  const release = (patch) => supabaseAdmin.from('dispatch_jobs').update({ claimed_at: null, updated_at: nowIso(), ...patch }).eq('id', job.id);
+  try {
+    const dest = await getDestination(job.destination_id);
+    if (!dest) { await release({ status: 'stopped', last_error: 'Destino removido.' }); return null; }
+    const f = job.filters || {};
+    const group = String(f.wa_group || dest.chat_id || '').trim();
+    if (!group) { await release({ status: 'stopped', last_error: 'Falta o nome do grupo do WhatsApp.' }); return null; }
+
+    const prep = await prepareNext(dest, { group_ids: f.group_ids || [], marketplace: f.marketplace || null, footer: f.footer || '' });
+    if (prep.error) {
+      const code = prep.error.extra && prep.error.extra.code;
+      if (code === 'daily_limit' || code === 'bad_link') { await release({ status: 'stopped', pending: null, last_error: prep.error.message }); return null; }
+      await release({ next_run_at: new Date(Date.now() + 60000).toISOString(), last_error: prep.error.message });
+      return null;
+    }
+    const skippedTxt = prep.skipped && prep.skipped.length ? ` (${prep.skipped.length} pulada(s) por problema no produto)` : '';
+    if (prep.empty) {
+      await release({ status: 'stopped', pending: null, last_event: 'A fila acabou: nao ha mais promocoes validas para esse filtro.' + skippedTxt });
+      return null;
+    }
+
+    const message = toWhatsApp(prep.html);
+    // Registra JA, antes do robo enviar: se o robo cair no meio, a promocao nao se repete depois.
+    const { data: logRow } = await supabaseAdmin.from('dispatch_log')
+      .insert({ destination_id: dest.id, promotion_id: prep.chosen.id, skipped: false, message }).select('id').maybeSingle();
+    const imageUrl = prep.chosen.image_url && /^https:\/\//i.test(prep.chosen.image_url) ? prep.chosen.image_url : null;
+    const pending = {
+      log_id: logRow ? logRow.id : null, message, image_url: imageUrl, title: prep.chosen.title,
+      coupon: prep.view.coupon || null, remaining: prep.remaining, group, prepared_at: nowIso(),
+    };
+    await release({ pending, last_event: `Entregue ao robo: ${String(prep.chosen.title).slice(0, 60)}${skippedTxt}`, last_error: null });
+    return botDeliver({ id: job.id, pending });
+  } catch (e) {
+    await release({ next_run_at: new Date(Date.now() + 60000).toISOString(), last_error: e.message || 'erro inesperado' });
+    return null;
+  }
+}
+
+async function botPoll(res) {
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  // "estou vivo": a tela mostra se o robo esta conectado (coluna do SQL 0004; se faltar, so ignora)
+  await supabaseAdmin.from('dispatch_destinations').update({ bot_seen_at: nowIso }).eq('platform', 'whatsapp_manual');
+
+  const { data: jobs, error } = await supabaseAdmin.from('dispatch_jobs').select('*')
+    .eq('status', 'running').eq('mode', 'bot').order('next_run_at', { ascending: true });
+  if (error) return fail(res, 500, dbError(error));
+
+  let sleep = 60; // segundos ate o robo voltar a perguntar (no maximo 60, para reagir rapido a um novo "Iniciar")
+  for (const job of jobs || []) {
+    const f = job.filters || {};
+
+    // 1) mensagem ja entregue e ainda sem confirmacao (robo reiniciou no meio): entrega de novo
+    if (job.pending && job.pending.message) {
+      const age = nowMs - new Date(job.pending.prepared_at).getTime();
+      if (age < BOT_PENDING_MAX_MS) return res.status(200).json(botDeliver(job));
+      await supabaseAdmin.from('dispatch_jobs').update({
+        pending: null, claimed_at: null, next_run_at: new Date(nowMs + jitteredMs(job.interval_min)).toISOString(),
+        last_event: 'O robo nao confirmou o envio anterior; segui para o proximo.', updated_at: nowIso,
+      }).eq('id', job.id);
+      continue;
+    }
+
+    // 2) ainda nao e a hora
+    const due = new Date(job.next_run_at).getTime();
+    if (due > nowMs) { sleep = Math.min(sleep, Math.max(Math.ceil((due - nowMs) / 1000), 5)); continue; }
+
+    // 3) fora do horario escolhido: espera a janela abrir
+    if (!inWindow(f, nowMs)) {
+      await supabaseAdmin.from('dispatch_jobs').update({
+        next_run_at: new Date(nextWindowStart(f, nowMs)).toISOString(),
+        last_event: `Fora do horario (${f.hour_from}h-${f.hour_to}h): retomo as ${f.hour_from}h.`, updated_at: nowIso,
+      }).eq('id', job.id);
+      continue;
+    }
+
+    // 4) "trava" atomica: so uma consulta prepara o envio (evita mensagem em dobro)
+    const stale = new Date(nowMs - CLAIM_STALE_MS).toISOString();
+    const { data: claimed } = await supabaseAdmin.from('dispatch_jobs').update({ claimed_at: nowIso })
+      .eq('id', job.id).eq('status', 'running').is('pending', null).lte('next_run_at', nowIso)
+      .or(`claimed_at.is.null,claimed_at.lt.${stale}`).select().maybeSingle();
+    if (!claimed) continue;
+
+    const out = await prepareForBot(claimed);
+    if (out) return res.status(200).json(out);
+  }
+  res.status(200).json({ idle: true, sleep });
+}
+
+// O robo avisa o resultado do envio.
+async function botAck(res, body) {
+  const { data: job, error } = await supabaseAdmin.from('dispatch_jobs').select('*').eq('id', body.job_id).maybeSingle();
+  if (error) return fail(res, 500, dbError(error));
+  if (!job || !job.pending) return res.status(200).json({ ok: true });
+  const p = job.pending;
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+
+  if (body.ok) {
+    const sent = job.sent_count + 1;
+    const done = sent >= job.max_sends;
+    await supabaseAdmin.from('dispatch_jobs').update({
+      pending: null, claimed_at: null, sent_count: sent, status: done ? 'stopped' : 'running',
+      next_run_at: new Date(nowMs + jitteredMs(job.interval_min)).toISOString(),
+      last_event: (done ? `Meta de ${job.max_sends} envios atingida. ` : '') + `Enviado: ${String(p.title || '').slice(0, 70)}${p.coupon ? ` (cupom ${p.coupon})` : ''}`,
+      last_error: null, error_streak: 0, updated_at: nowIso,
+    }).eq('id', job.id);
+    return res.status(200).json({ ok: true });
+  }
+
+  // falhou
+  const reason = String(body.error || 'falha desconhecida').slice(0, 200);
+  const fatal = body.fatal === true; // grupo nao encontrado / WhatsApp desconectado: nao adianta tentar de novo
+  if (p.log_id) {
+    // erro do robo (nao do produto): em falha fatal a promocao volta a ficar disponivel; nas demais, fica marcada como pulada
+    if (fatal) await supabaseAdmin.from('dispatch_log').delete().eq('id', p.log_id);
+    else await supabaseAdmin.from('dispatch_log').update({ skipped: true, message: `falhou no robo: ${reason}` }).eq('id', p.log_id);
+  }
+  const streak = (job.error_streak || 0) + 1;
+  const stop = fatal || streak >= 5;
+  await supabaseAdmin.from('dispatch_jobs').update({
+    pending: null, claimed_at: null, status: stop ? 'stopped' : 'running',
+    next_run_at: new Date(nowMs + 2 * 60000).toISOString(), error_streak: streak,
+    last_error: stop && !fatal ? `${reason} (parei apos 5 falhas seguidas)` : reason, updated_at: nowIso,
+  }).eq('id', job.id);
+  res.status(200).json({ ok: true });
+}
+
 module.exports = async function handler(req, res) {
   if (LOAD_ERROR) return res.status(500).json({ error: LOAD_ERROR, version: VERSION });
   try {
+    // Chave do robo (DISPATCH_BOT_KEY, definida na Vercel): quem chega so com a chave (sem login no painel)
+    // pode apenas consultar/confirmar envios — nada de listar destinos, ler tokens ou mexer em disparos.
+    const botKey = process.env.DISPATCH_BOT_KEY;
+    const viaKey = !!botKey && req.headers['x-bot-key'] === botKey;
+    if (viaKey && !(req.method === 'POST' && req.body && (req.body.action === 'bot_poll' || req.body.action === 'bot_ack'))) {
+      return fail(res, 403, 'A chave do robo so pode usar bot_poll e bot_ack.');
+    }
+
     if (req.method === 'GET') {
       if (req.query && req.query.tick) { await tickJobs(); return res.status(200).json({ ok: true }); }
       return await listDestinations(res);
@@ -612,6 +866,8 @@ module.exports = async function handler(req, res) {
       case 'job_stop': return await stopJob(res, body);
       case 'job_ack': return await ackJob(res, body);
       case 'tick': await tickJobs(); return res.status(200).json(await jobsPayload());
+      case 'bot_poll': return await botPoll(res);
+      case 'bot_ack': return await botAck(res, body);
       case 'send_next': return await sendNext(res, body);
       default: return fail(res, 400, 'A\u00e7\u00e3o inv\u00e1lida.');
     }
