@@ -3,6 +3,7 @@
 // - a própria tela de login
 // - login/logout do painel
 // - o webhook do Mercado Livre (chamado pelo servidor do ML, sem cookie)
+// - o robo do WhatsApp (chave DISPATCH_BOT_KEY no cabecalho x-bot-key, so em /api/dispatch)
 // - o CALLBACK do OAuth do Mercado Livre (também chamado pelo navegador vindo
 //   de outro domínio — auth.mercadolivre.com.br — então o cookie "Strict" não
 //   viaja junto). Só o callback (quando vem com ?code=) é liberado; iniciar
@@ -17,7 +18,7 @@ export const config = {
   matcher: '/:path*',
 };
 
-function isPublicPath(url) {
+function isPublicPath(url, request) {
   if (STRICT_PUBLIC_PATHS.includes(url.pathname)) return true;
   // Só libera o callback de verdade (precisa do "code" que o Mercado Livre gera) —
   // iniciar o login do zero continua exigindo sessão válida no painel.
@@ -26,6 +27,11 @@ function isPublicPath(url) {
   // DISPATCH_CRON_KEY (Environment Variable da Vercel). Sem a variavel, nada e liberado.
   const cronKey = process.env.DISPATCH_CRON_KEY;
   if (cronKey && url.pathname === '/api/dispatch' && url.searchParams.has('tick') && url.searchParams.get('key') === cronKey) return true;
+  // Robo do WhatsApp (roda no notebook, sem login no painel): passa so com a chave secreta
+  // DISPATCH_BOT_KEY no cabecalho x-bot-key, e so em /api/dispatch. Dentro de /api/dispatch a chave
+  // so libera as acoes bot_poll e bot_ack (o proprio dispatch.js recusa qualquer outra coisa).
+  const botKey = process.env.DISPATCH_BOT_KEY;
+  if (botKey && url.pathname === '/api/dispatch' && request.headers.get('x-bot-key') === botKey) return true;
   return false;
 }
 
@@ -61,7 +67,7 @@ async function isValidSession(token, secret) {
 export default async function middleware(request) {
   const url = new URL(request.url);
 
-  if (isPublicPath(url)) {
+  if (isPublicPath(url, request)) {
     return;
   }
 
