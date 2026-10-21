@@ -16,8 +16,9 @@ const ML_HISTORY_DAYS = 7;
 // Descoberta automática por palavra-chave (catálogo do ML): quantos produtos pedir por palavra, de
 // quantas "páginas" sortear (variedade a cada busca) e o teto total por busca.
 const ML_DISCOVERY_PAGE_SIZE = 10;
-const ML_DISCOVERY_MAX_PAGE = 3;
-const ML_DISCOVERY_MAX_CANDIDATES = 60;
+const ML_DISCOVERY_MAX_PAGE = 5;
+const ML_DISCOVERY_MAX_CANDIDATES = 200;
+const ML_DISCOVERY_CONCURRENCY = 8;
 const ML_DISCOVERY_MIN_DISCOUNT_PCT = 10;
 
 const MIN_DISCOUNT_PCT = 10; // era 15 — baixei pra achar mais resultado em categorias mais de nicho
@@ -285,14 +286,12 @@ async function discoverMlPromotions({ groups, ctx, startedAt, disc }) {
   // 2) confere preço de cada candidato; só vira promoção se o ML mostra preço "de" maior com desconto mínimo
   const list = [...candidates.values()].slice(0, ML_DISCOVERY_MAX_CANDIDATES);
   disc.candidates = list.length;
-  for (const batch of chunk(list, ML_CONCURRENCY)) {
+  for (const batch of chunk(list, ML_DISCOVERY_CONCURRENCY)) {
     if (Date.now() - startedAt > SCAN_BUDGET_MS) break;
     await Promise.all(
       batch.map(async (cand) => {
         try {
-          const snap = await mlClient.getItemSnapshot({
-            id: cand.id, kind: 'catalog', token: ctx.token, url: `https://www.mercadolivre.com.br/p/${cand.id}`,
-          });
+          const snap = await mlClient.getItemSnapshot({ id: cand.id, kind: 'catalog', token: ctx.token });
           disc.checked += 1;
           if (!snap.regularPrice || snap.regularPrice <= snap.price) return;
           const pct = ((snap.regularPrice - snap.price) / snap.regularPrice) * 100;
