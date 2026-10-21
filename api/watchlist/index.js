@@ -32,13 +32,14 @@ module.exports = async function handler(req, res) {
         return;
       }
 
-      // Links curtos (meli.la, /sec/) são abertos até o link final; links de catálogo (/p/MLB...)
-      // e de anúncio (MLB-123..., ?wid=) são reconhecidos. Antes só o formato MLB+9 dígitos passava.
-      const finalUrl = await mlClient.resolveShortUrl(String(url).trim());
-      const parsed = mlClient.parseMlLink(finalUrl) || mlClient.parseMlLink(url);
+      // Abre links curtos (meli.la) — que levam à página /social/ do divulgador — e reconhece links de
+      // catálogo (/p/MLB...), de anúncio (MLB-123..., ?wid=) e de User Product (/up/MLBU...).
+      const resolved = await mlClient.resolveMlUrl(String(url).trim());
+      const parsed = resolved.parsed;
+      const finalUrl = resolved.url;
       if (!parsed) {
         res.status(400).json({
-          error: 'Não consegui identificar o código do produto (MLB...) nesse link. Cole o link completo da página do produto no Mercado Livre.',
+          error: `Não consegui identificar o produto nesse link${resolved.note ? ` (${resolved.note})` : ''}. Abra o link no navegador, espere a página do produto carregar e cole a URL completa que aparece na barra de endereço.`,
         });
         return;
       }
@@ -61,8 +62,10 @@ module.exports = async function handler(req, res) {
         return;
       }
 
-      // Em link de catálogo, guarda o código do ANÚNCIO vencedor (é ele que tem preço e promoção).
-      const itemId = snap.itemId || parsed.id;
+      // Link de catálogo: guarda o código do CATÁLOGO (o scan segue o anúncio vencedor do momento, que muda).
+      // Link de anúncio: guarda o código do anúncio.
+      const isCatalog = parsed.kind === 'catalog';
+      const itemId = isCatalog ? parsed.id : snap.itemId || parsed.id;
 
       const { data: product, error } = await supabaseAdmin
         .from('products')
@@ -72,7 +75,7 @@ module.exports = async function handler(req, res) {
             source_item_id: itemId,
             title: snap.title || 'Produto do Mercado Livre',
             image_url: snap.thumbnail,
-            permalink: snap.permalink || finalUrl,
+            permalink: isCatalog ? `https://www.mercadolivre.com.br/p/${parsed.id}` : snap.permalink || finalUrl,
             seller_nickname: snap.sellerNickname,
             watch_group_id: watch_group_id || null,
             last_checked_at: new Date().toISOString(),
