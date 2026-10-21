@@ -13,6 +13,12 @@ const { loadRecentIndex } = require('../../src/core/dedupe');
 const ML_CONCURRENCY = 4;
 const ML_MIN_DROP_PCT = 5;
 const ML_HISTORY_DAYS = 7;
+// Descoberta automática por palavra-chave (catálogo do ML): quantos produtos pedir por palavra, de
+// quantas "páginas" sortear (variedade a cada busca) e o teto total por busca.
+const ML_DISCOVERY_PAGE_SIZE = 10;
+const ML_DISCOVERY_MAX_PAGE = 3;
+const ML_DISCOVERY_MAX_CANDIDATES = 60;
+const ML_DISCOVERY_MIN_DISCOUNT_PCT = 10;
 
 const MIN_DISCOUNT_PCT = 10; // era 15 — baixei pra achar mais resultado em categorias mais de nicho
 
@@ -131,13 +137,20 @@ async function scanMercadoLivre(req, res) {
       ? (allProducts || []).filter((p) => groupsParam.includes(p.watch_group_id || 'none'))
       : allProducts || [];
 
-    if (products.length === 0) {
+    // Grupos marcados no painel (menos "Sem grupo") com palavras-chave = busca automática de promoções.
+    const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
+    const selectedGroups = groupsParam
+      ? (allGroups || []).filter((g) => groupsParam.includes(g.id))
+      : allGroups || [];
+    const discoveryGroups = mergeGroupsByName(selectedGroups).filter((g) => g.keywords.length > 0);
+
+    if (products.length === 0 && discoveryGroups.length === 0) {
       res.status(200).json({
         ok: true,
         productsChecked: 0,
         promotionsFound: 0,
         errors: [],
-        note: 'Nenhum produto do Mercado Livre na lista de vigilância (ou nenhum nos grupos marcados). Adicione links em /watchlist.html — o ML não permite buscar por categoria.',
+        note: 'Nada para buscar: não há produtos na lista de vigilância do Mercado Livre nem grupos com palavras-chave marcados.',
       });
       return;
     }
@@ -183,6 +196,13 @@ async function scanMercadoLivre(req, res) {
       );
     }
 
+    // ----- Descoberta automática por palavra-chave (o ML bloqueia /sites/MLB/search; usa o catálogo) -----
+    const disc = { searched: 0, candidates: 0, checked: 0, found: 0, searchErrors: [], statuses: {} };
+    if (discoveryGroups.length > 0 && Date.now() - startedAt < SCAN_BUDGET_MS) {
+      await discoverMlPromotions({ groups: discoveryGroups, ctx, startedAt, disc });
+      stats.found += disc.found;
+    }
+
     if (stats.errors.length) {
       await supabaseAdmin.from('integration_logs').insert({
         marketplace_id: marketplace.id,
@@ -196,6 +216,21 @@ async function scanMercadoLivre(req, res) {
     const via = Object.entries(stats.via).map(([k, v]) => `${v} via ${k}`).join(', ');
     if (via) notes.push(`Leitura: ${via}.`);
     if (stats.skipped) notes.push(`${stats.skipped} produto(s) ficaram para a próxima busca (tempo máximo do servidor).`);
+    if (discoveryGroups.length > 0) {
+      if (disc.searched > 0) {
+        notes.push(
+          `Busca automática: ${disc.searched} palavra(s) pesquisada(s) no catálogo, ${disc.candidates} produto(s) avaliado(s), ${disc.found} promoção(ões) nova(s).`
+        );
+      }
+      if (disc.searchErrors.length > 0) {
+        const all403 = disc.searched === 0 && (disc.statuses[403] || 0) > 0;
+        notes.push(
+          all403
+            ? 'A busca por palavra-chave no catálogo do ML também respondeu 403 para o seu app — nesse caso o ML não libera descoberta automática e só resta a lista de vigilância (ou pedir liberação em Suporte → Acessos → Desbloqueio/Forbidden).'
+            : `Busca automática com erro: ${disc.searchErrors[0]}`
+        );
+      }
+    }
     if (stats.errors.length && stats.checked === 0 && (stats.statuses[403] || 0) > 0) {
       notes.push(
         'O Mercado Livre respondeu 403 (bloqueio) para todas as consultas. Confira no DevCenter do ML se o app NÃO tem lista de IPs permitidos (a Vercel usa IPs variáveis), reconecte a conta em /api/auth/mercadolivre e, se persistir, abra pedido em Suporte → Acessos → Desbloqueio/Forbidden.'
@@ -209,13 +244,102 @@ async function scanMercadoLivre(req, res) {
 
     res.status(200).json({
       ok: true,
-      productsChecked: stats.checked,
+      productsChecked: stats.checked + disc.checked,
       promotionsFound: stats.found,
       errors: stats.errors,
       note: notes.join(' ') || undefined,
     });
   } catch (err) {
     res.status(500).json({ error: `Erro no servidor: ${err.message}` });
+  }
+}
+
+async function discoverMlPromotions({ groups, ctx, startedAt, disc }) {
+  // 1) palavras-chave -> produtos de catálogo (página sorteada para variar a cada busca)
+  const candidates = new Map(); // id -> { id, title, group }
+  const tasks = [];
+  for (const g of groups) for (const kw of g.keywords) tasks.push({ group: g, kw });
+  for (const batch of chunk(tasks, 3)) {
+    if (Date.now() - startedAt > SCAN_BUDGET_MS * 0.5) break; // metade do tempo para buscar, metade para conferir preços
+    await Promise.all(
+      batch.map(async ({ group, kw }) => {
+        const offset = Math.floor(Math.random() * ML_DISCOVERY_MAX_PAGE) * ML_DISCOVERY_PAGE_SIZE;
+        try {
+          const list = await mlClient.searchCatalogProducts({
+            q: kw, token: ctx.token, limit: ML_DISCOVERY_PAGE_SIZE, offset,
+          });
+          disc.searched += 1;
+          for (const r of list) if (!candidates.has(r.id)) candidates.set(r.id, { ...r, group });
+        } catch (err) {
+          disc.searchErrors.push(`"${kw}": ${err.message}`);
+          if (err.status) disc.statuses[err.status] = (disc.statuses[err.status] || 0) + 1;
+        }
+      })
+    );
+  }
+
+  // 2) confere preço de cada candidato; só vira promoção se o ML mostra preço "de" maior com desconto mínimo
+  const list = [...candidates.values()].slice(0, ML_DISCOVERY_MAX_CANDIDATES);
+  disc.candidates = list.length;
+  for (const batch of chunk(list, ML_CONCURRENCY)) {
+    if (Date.now() - startedAt > SCAN_BUDGET_MS) break;
+    await Promise.all(
+      batch.map(async (cand) => {
+        try {
+          const snap = await mlClient.getItemSnapshot({ id: cand.id, kind: 'catalog', token: ctx.token });
+          disc.checked += 1;
+          if (!snap.regularPrice || snap.regularPrice <= snap.price) return;
+          const pct = ((snap.regularPrice - snap.price) / snap.regularPrice) * 100;
+          if (pct < ML_DISCOVERY_MIN_DISCOUNT_PCT) return;
+
+          const { data: product } = await supabaseAdmin
+            .from('products')
+            .upsert(
+              {
+                marketplace_id: ctx.marketplaceId,
+                source_item_id: cand.id,
+                title: snap.title || cand.title || 'Produto do Mercado Livre',
+                image_url: snap.thumbnail,
+                permalink: `https://www.mercadolivre.com.br/p/${cand.id}`,
+                watch_group_id: cand.group.id,
+                last_checked_at: new Date().toISOString(),
+              },
+              { onConflict: 'marketplace_id,source_item_id' }
+            )
+            .select()
+            .single();
+          if (!product) return;
+
+          await supabaseAdmin.from('product_price_history').insert({ product_id: product.id, price: snap.price });
+
+          const { data: rows } = await supabaseAdmin
+            .from('promotions')
+            .select('id')
+            .eq('product_id', product.id)
+            .eq('current_price', snap.price)
+            .limit(1);
+          if (rows && rows[0]) return;
+
+          await supabaseAdmin.from('promotions').insert({
+            marketplace_id: ctx.marketplaceId,
+            product_id: product.id,
+            watch_group_id: cand.group.id,
+            title: product.title,
+            image_url: product.image_url,
+            original_url: product.permalink,
+            current_price: snap.price,
+            previous_price: snap.regularPrice,
+            discount_rate: Number(pct.toFixed(2)),
+            source: 'catalog_search',
+            status: 'PENDING',
+          });
+          disc.found += 1;
+        } catch (err) {
+          if (err.status) disc.statuses[err.status] = (disc.statuses[err.status] || 0) + 1;
+          if (disc.searchErrors.length < 3) disc.searchErrors.push(`${cand.id}: ${err.message}`);
+        }
+      })
+    );
   }
 }
 
