@@ -355,6 +355,9 @@ async function getItemSnapshot({ id, kind = 'item', token, url, needDetails = fa
       // (/products/{id}) já traz o preço do anúncio vencedor — usa ele direto, sem passar por /items.
       const bbSale = buyBox && buyBox.sale_price && typeof buyBox.sale_price === 'object' ? buyBox.sale_price : null;
       const bbPrice = toNumber(bbSale && bbSale.amount) ?? toNumber(buyBox && buyBox.price);
+      if (buyBox && !bbPrice) {
+        problems.push(`/products/${id}: anúncio vencedor sem preço legível (campos: ${Object.keys(buyBox).slice(0, 14).join(',')})`);
+      }
       if (bbPrice) {
         const bbRegular = toNumber(bbSale && bbSale.regular_amount) ?? toNumber(buyBox && buyBox.original_price);
         const pic = Array.isArray(data.pictures) && data.pictures[0] ? data.pictures[0].url || data.pictures[0].secure_url : null;
