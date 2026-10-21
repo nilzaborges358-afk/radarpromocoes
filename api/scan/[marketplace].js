@@ -290,7 +290,9 @@ async function discoverMlPromotions({ groups, ctx, startedAt, disc }) {
     await Promise.all(
       batch.map(async (cand) => {
         try {
-          const snap = await mlClient.getItemSnapshot({ id: cand.id, kind: 'catalog', token: ctx.token });
+          const snap = await mlClient.getItemSnapshot({
+            id: cand.id, kind: 'catalog', token: ctx.token, url: `https://www.mercadolivre.com.br/p/${cand.id}`,
+          });
           disc.checked += 1;
           if (!snap.regularPrice || snap.regularPrice <= snap.price) return;
           const pct = ((snap.regularPrice - snap.price) / snap.regularPrice) * 100;
