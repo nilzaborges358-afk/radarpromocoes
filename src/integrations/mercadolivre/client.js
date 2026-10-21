@@ -152,7 +152,15 @@ async function mlGetAny(path, accessToken) {
   const problems = [];
   if (accessToken) {
     try { return { data: await mlJson(path, accessToken), via: 'api_token' }; }
-    catch (err) { problems.push(`com token ${err.message}`); }
+    catch (err) {
+      problems.push(`com token ${err.message}`);
+      // 404/400 = o recurso não existe (ex.: produto sem ofertas); repetir sem token só gasta tempo.
+      if (err.status === 404 || err.status === 400) {
+        const e = new Error(`${path.split('?')[0]}: ${problems.join(' / ')}`);
+        e.status = err.status;
+        throw e;
+      }
+    }
   } else {
     problems.push('sem token da conta salvo');
   }
