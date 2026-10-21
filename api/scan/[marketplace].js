@@ -197,7 +197,7 @@ async function scanMercadoLivre(req, res) {
     }
 
     // ----- Descoberta automática por palavra-chave (o ML bloqueia /sites/MLB/search; usa o catálogo) -----
-    const disc = { searched: 0, candidates: 0, checked: 0, found: 0, searchErrors: [], statuses: {} };
+    const disc = { searched: 0, candidates: 0, checked: 0, found: 0, searchErrors: [], statuses: {}, reasons: {} };
     if (discoveryGroups.length > 0 && Date.now() - startedAt < SCAN_BUDGET_MS) {
       await discoverMlPromotions({ groups: discoveryGroups, ctx, startedAt, disc });
       stats.found += disc.found;
@@ -221,6 +221,10 @@ async function scanMercadoLivre(req, res) {
         notes.push(
           `Busca automática: ${disc.searched} palavra(s) pesquisada(s) no catálogo, ${disc.candidates} produto(s) avaliado(s), ${disc.found} promoção(ões) nova(s).`
         );
+      }
+      const topReasons = Object.entries(disc.reasons).sort((a, b) => b[1] - a[1]).slice(0, 3);
+      if (topReasons.length > 0) {
+        notes.push(`Motivos de produtos sem preço: ${topReasons.map(([m, n]) => `${n}× ${m}`).join(' | ')}`);
       }
       if (disc.searchErrors.length > 0) {
         const all403 = disc.searched === 0 && (disc.statuses[403] || 0) > 0;
@@ -336,7 +340,9 @@ async function discoverMlPromotions({ groups, ctx, startedAt, disc }) {
           disc.found += 1;
         } catch (err) {
           if (err.status) disc.statuses[err.status] = (disc.statuses[err.status] || 0) + 1;
-          if (disc.searchErrors.length < 3) disc.searchErrors.push(`${cand.id}: ${err.message}`);
+          // agrupa por motivo (sem o código do produto) para o relatório mostrar o padrão, não só o 1º erro
+          const reason = String(err.message).replace(/MLB\d+/g, 'MLB…').slice(0, 220);
+          disc.reasons[reason] = (disc.reasons[reason] || 0) + 1;
         }
       })
     );
