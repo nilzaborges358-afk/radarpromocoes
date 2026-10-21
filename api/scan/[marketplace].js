@@ -1,10 +1,18 @@
-const { getSalePrice } = require('../../src/integrations/mercadolivre/client');
+const mlClient = require('../../src/integrations/mercadolivre/client');
 const { searchProductOffers, generateShortLink } = require('../../src/integrations/shopee/client');
 const netshoesClient = require('../../src/integrations/netshoes/client');
 const { supabaseAdmin } = require('../../src/core/database/supabaseClient');
 const { loadNetshoesCoupons, bestNetshoesCoupon } = require('../../src/core/coupons');
 const { scanRiachuelo } = require('../../src/core/awinScan');
 const { loadRecentIndex } = require('../../src/core/dedupe');
+
+// Mercado Livre (lista de vigilância): a busca por categoria/palavra-chave do ML (/sites/MLB/search)
+// responde 403 para apps comuns, então o scan confere os PRODUTOS da lista de vigilância um a um.
+// Promoção = o ML informa preço "de" maior que o atual (sale_price) OU o preço atual caiu contra o
+// que o sistema já viu nos últimos 7 dias (mesmo método da Shopee/Netshoes).
+const ML_CONCURRENCY = 4;
+const ML_MIN_DROP_PCT = 5;
+const ML_HISTORY_DAYS = 7;
 
 const MIN_DISCOUNT_PCT = 10; // era 15 — baixei pra achar mais resultado em categorias mais de nicho
 
@@ -106,6 +114,7 @@ function mergeGroupsByName(rows) {
 
 async function scanMercadoLivre(req, res) {
   try {
+    const startedAt = Date.now();
     const { data: marketplace } = await supabaseAdmin
       .from('marketplaces')
       .select('id')
@@ -120,60 +129,135 @@ async function scanMercadoLivre(req, res) {
     const groupsParam = getGroupsParam(req);
     const products = groupsParam
       ? (allProducts || []).filter((p) => groupsParam.includes(p.watch_group_id || 'none'))
-      : allProducts;
+      : allProducts || [];
 
-    let found = 0;
-    const errors = [];
+    if (products.length === 0) {
+      res.status(200).json({
+        ok: true,
+        productsChecked: 0,
+        promotionsFound: 0,
+        errors: [],
+        note: 'Nenhum produto do Mercado Livre na lista de vigilância (ou nenhum nos grupos marcados). Adicione links em /watchlist.html — o ML não permite buscar por categoria.',
+      });
+      return;
+    }
 
-    for (const product of products || []) {
-      try {
-        found += await checkMlProduct(product, marketplace.id);
-      } catch (err) {
-        errors.push(`${product.source_item_id}: ${err.message}`);
-        await supabaseAdmin.from('integration_logs').insert({
-          marketplace_id: marketplace.id,
-          level: 'error',
-          message: `Falha ao checar ${product.source_item_id} (${product.title}): ${err.message}`,
-        });
+    // Token da sua conta, renovado se vencido (a doc do ML exige "Authorization: Bearer" nas chamadas).
+    const { token, reason: tokenReason } = await mlClient.getAccessToken(supabaseAdmin);
+
+    // Histórico dos últimos 7 dias de todos os produtos, numa consulta só (em lotes de 100 ids).
+    const since = new Date(Date.now() - ML_HISTORY_DAYS * 86400000).toISOString();
+    const history = new Map();
+    for (const ids of chunk(products.map((p) => p.id), 100)) {
+      const { data: rows } = await supabaseAdmin
+        .from('product_price_history')
+        .select('product_id, price')
+        .in('product_id', ids)
+        .gte('checked_at', since);
+      for (const r of rows || []) {
+        if (!history.has(r.product_id)) history.set(r.product_id, []);
+        history.get(r.product_id).push(Number(r.price));
       }
+    }
+
+    const ctx = { token, history, marketplaceId: marketplace.id };
+    const stats = { found: 0, checked: 0, skipped: 0, via: {}, statuses: {}, errors: [] };
+
+    for (const batch of chunk(products, ML_CONCURRENCY)) {
+      if (Date.now() - startedAt > SCAN_BUDGET_MS) {
+        stats.skipped += batch.length;
+        continue;
+      }
+      await Promise.all(
+        batch.map(async (product) => {
+          try {
+            const r = await checkMlProduct(product, ctx);
+            stats.checked += 1;
+            stats.found += r.found;
+            stats.via[r.source] = (stats.via[r.source] || 0) + 1;
+          } catch (err) {
+            stats.errors.push(`${product.source_item_id}: ${err.message}`);
+            for (const st of err.statuses || []) stats.statuses[st] = (stats.statuses[st] || 0) + 1;
+          }
+        })
+      );
+    }
+
+    if (stats.errors.length) {
+      await supabaseAdmin.from('integration_logs').insert({
+        marketplace_id: marketplace.id,
+        level: 'error',
+        message: `Scan ML: ${stats.errors.length} de ${products.length} produtos falharam. Exemplo: ${stats.errors[0]}`.slice(0, 900),
+      });
+    }
+
+    const notes = [];
+    if (!token) notes.push(`Sem token válido da sua conta do ML: ${tokenReason}.`);
+    const via = Object.entries(stats.via).map(([k, v]) => `${v} via ${k}`).join(', ');
+    if (via) notes.push(`Leitura: ${via}.`);
+    if (stats.skipped) notes.push(`${stats.skipped} produto(s) ficaram para a próxima busca (tempo máximo do servidor).`);
+    if (stats.errors.length && stats.checked === 0 && (stats.statuses[403] || 0) > 0) {
+      notes.push(
+        'O Mercado Livre respondeu 403 (bloqueio) para todas as consultas. Confira no DevCenter do ML se o app NÃO tem lista de IPs permitidos (a Vercel usa IPs variáveis), reconecte a conta em /api/auth/mercadolivre e, se persistir, abra pedido em Suporte → Acessos → Desbloqueio/Forbidden.'
+      );
+    }
+    if (stats.checked > 0 && stats.found === 0) {
+      notes.push(
+        `${stats.checked} produto(s) consultado(s), nenhum em promoção agora (sem preço "de" maior e sem queda de ${ML_MIN_DROP_PCT}% ou mais contra os últimos ${ML_HISTORY_DAYS} dias — a comparação com o histórico só passa a valer depois de algumas buscas).`
+      );
     }
 
     res.status(200).json({
       ok: true,
-      productsChecked: (products || []).length,
-      promotionsFound: found,
-      errors,
+      productsChecked: stats.checked,
+      promotionsFound: stats.found,
+      errors: stats.errors,
+      note: notes.join(' ') || undefined,
     });
   } catch (err) {
     res.status(500).json({ error: `Erro no servidor: ${err.message}` });
   }
 }
 
-async function checkMlProduct(product, marketplaceId) {
-  const salePrice = await getSalePrice(product.source_item_id);
+async function checkMlProduct(product, ctx) {
+  const snap = await mlClient.getItemSnapshot({
+    id: product.source_item_id,
+    kind: mlClient.kindFromStored(product.source_item_id, product.permalink),
+    token: ctx.token,
+    url: product.permalink,
+  });
 
   await supabaseAdmin
     .from('products')
     .update({ last_checked_at: new Date().toISOString() })
     .eq('id', product.id);
 
-  await supabaseAdmin.from('product_price_history').insert({ product_id: product.id, price: salePrice.amount });
+  await supabaseAdmin.from('product_price_history').insert({ product_id: product.id, price: snap.price });
 
-  const hasPromotion =
-    Boolean(salePrice.metadata?.promotion_id) ||
-    (salePrice.regular_amount && salePrice.regular_amount > salePrice.amount);
-  if (!hasPromotion) return 0;
+  // 1) O próprio ML marca promoção (preço "de" maior que o atual ou promotion_id).
+  const listedPromo = Boolean(snap.promotionId) || Boolean(snap.regularPrice && snap.regularPrice > snap.price);
 
-  const discountRate = salePrice.regular_amount
-    ? Number((((salePrice.regular_amount - salePrice.amount) / salePrice.regular_amount) * 100).toFixed(2))
+  // 2) Queda real contra o que o sistema já viu (precisa de pelo menos 2 registros anteriores).
+  const prior = ctx.history.get(product.id) || [];
+  const normal = prior.length >= 2 ? median(prior) : null;
+  const realDrop = Boolean(normal && snap.price < normal * (1 - ML_MIN_DROP_PCT / 100));
+
+  if (!listedPromo && !realDrop) return { found: 0, source: snap.source };
+
+  const previousPrice = snap.regularPrice && snap.regularPrice > snap.price ? snap.regularPrice : realDrop ? normal : null;
+  const discountRate = previousPrice
+    ? Number((((previousPrice - snap.price) / previousPrice) * 100).toFixed(2))
     : null;
 
-  const { data: existing } = await supabaseAdmin
+  // limit(1) em vez de maybeSingle(): com 2+ linhas iguais o maybeSingle dá erro, o código achava que
+  // "não existe" e gravava a promoção repetida de novo a cada busca.
+  const { data: existingRows } = await supabaseAdmin
     .from('promotions')
     .select('id, watch_group_id')
     .eq('product_id', product.id)
-    .eq('current_price', salePrice.amount)
-    .maybeSingle();
+    .eq('current_price', snap.price)
+    .limit(1);
+  const existing = existingRows && existingRows[0];
 
   if (existing) {
     await supabaseAdmin
@@ -183,24 +267,24 @@ async function checkMlProduct(product, marketplaceId) {
         last_seen_at: new Date().toISOString(),
       })
       .eq('id', existing.id);
-    return 0;
+    return { found: 0, source: snap.source };
   }
 
   await supabaseAdmin.from('promotions').insert({
-    marketplace_id: marketplaceId,
+    marketplace_id: ctx.marketplaceId,
     product_id: product.id,
     watch_group_id: product.watch_group_id || null,
-    title: product.title,
-    image_url: product.image_url,
-    original_url: product.permalink,
-    current_price: salePrice.amount,
-    previous_price: salePrice.regular_amount || null,
+    title: product.title || snap.title,
+    image_url: product.image_url || snap.thumbnail,
+    original_url: product.permalink || snap.permalink,
+    current_price: snap.price,
+    previous_price: previousPrice,
     discount_rate: discountRate,
     source: 'watchlist_check',
     status: 'PENDING',
   });
 
-  return 1;
+  return { found: 1, source: snap.source };
 }
 
 // ---------------- Amazon ----------------
