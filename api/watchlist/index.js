@@ -1,4 +1,4 @@
-const { extractItemIdFromUrl, authenticatedGet, publicGet } = require('../../src/integrations/mercadolivre/client');
+const mlClient = require('../../src/integrations/mercadolivre/client');
 const { supabaseAdmin } = require('../../src/core/database/supabaseClient');
 
 // GET    /api/watchlist            -> { groups, products }
@@ -32,45 +32,37 @@ module.exports = async function handler(req, res) {
         return;
       }
 
-      const itemId = extractItemIdFromUrl(url);
-      if (!itemId) {
+      // Links curtos (meli.la, /sec/) são abertos até o link final; links de catálogo (/p/MLB...)
+      // e de anúncio (MLB-123..., ?wid=) são reconhecidos. Antes só o formato MLB+9 dígitos passava.
+      const finalUrl = await mlClient.resolveShortUrl(String(url).trim());
+      const parsed = mlClient.parseMlLink(finalUrl) || mlClient.parseMlLink(url);
+      if (!parsed) {
         res.status(400).json({
-          error: 'Não consegui identificar o código do produto (MLB...) nesse link. Confira se é o link direto da página do produto.',
+          error: 'Não consegui identificar o código do produto (MLB...) nesse link. Cole o link completo da página do produto no Mercado Livre.',
         });
         return;
       }
 
-      const { data: creds } = await supabaseAdmin
-        .from('marketplace_credentials')
-        .select('access_token')
-        .eq('marketplace_id', marketplace.id)
-        .maybeSingle();
+      const { token, reason: tokenReason } = await mlClient.getAccessToken(supabaseAdmin);
 
-      // Tenta autenticado primeiro (é o que o Mercado Livre espera segundo a doc
-      // de "Permissões funcionais"); se falhar, tenta público como fallback.
-      let item;
-      let authError;
-      let publicError;
-      if (creds?.access_token) {
-        try {
-          item = await authenticatedGet(`/items/${itemId}`, creds.access_token);
-        } catch (err) {
-          authError = err.message;
-        }
-      }
-      if (!item) {
-        try {
-          item = await publicGet(`/items/${itemId}`);
-        } catch (err) {
-          publicError = err.message;
-        }
-      }
-      if (!item) {
+      let snap;
+      try {
+        snap = await mlClient.getItemSnapshot({
+          id: parsed.id,
+          kind: parsed.kind,
+          token,
+          url: finalUrl,
+          needDetails: true,
+        });
+      } catch (err) {
         res.status(400).json({
-          error: `Não consegui buscar esse produto no Mercado Livre. ${authError ? `Com token: ${authError}. ` : 'Sem token cadastrado. '}${publicError ? `Sem token: ${publicError}.` : ''}`,
+          error: `Não consegui ler esse produto no Mercado Livre. ${token ? '' : `Sem token da sua conta: ${tokenReason}. `}Detalhes: ${err.message}`,
         });
         return;
       }
+
+      // Em link de catálogo, guarda o código do ANÚNCIO vencedor (é ele que tem preço e promoção).
+      const itemId = snap.itemId || parsed.id;
 
       const { data: product, error } = await supabaseAdmin
         .from('products')
@@ -78,10 +70,10 @@ module.exports = async function handler(req, res) {
           {
             marketplace_id: marketplace.id,
             source_item_id: itemId,
-            title: item.title,
-            image_url: item.thumbnail,
-            permalink: item.permalink,
-            seller_nickname: item.seller?.nickname,
+            title: snap.title || 'Produto do Mercado Livre',
+            image_url: snap.thumbnail,
+            permalink: snap.permalink || finalUrl,
+            seller_nickname: snap.sellerNickname,
             watch_group_id: watch_group_id || null,
             last_checked_at: new Date().toISOString(),
           },
@@ -92,7 +84,18 @@ module.exports = async function handler(req, res) {
 
       if (error) throw new Error(error.message);
 
-      res.status(200).json({ ok: true, product });
+      // Primeiro ponto do histórico de preço (a comparação "caiu contra a última semana" precisa dele).
+      await supabaseAdmin.from('product_price_history').insert({ product_id: product.id, price: snap.price });
+
+      res.status(200).json({
+        ok: true,
+        product,
+        source: snap.source,
+        warning:
+          snap.source === 'page'
+            ? 'A API do Mercado Livre bloqueou a leitura; usei a página pública do produto. Funciona, mas pode falhar nas próximas buscas.'
+            : null,
+      });
       return;
     }
 
