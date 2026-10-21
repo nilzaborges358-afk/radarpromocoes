@@ -202,6 +202,54 @@ function parseMlLink(url) {
   return item ? { id: item, kind: 'item' } : null;
 }
 
+/** Primeiro link de produto dentro do HTML (catálogo /p/MLB..., depois ?wid=, depois anúncio MLB-123...). */
+function parseMlFromHtml(html) {
+  const s = String(html || '');
+  const catalog = s.match(/\/p\/(MLB\d{6,13})/i);
+  if (catalog) return { id: catalog[1].toUpperCase(), kind: 'catalog' };
+  const wid = s.match(/[?&;]wid=(MLB-?\d{6,13})/i);
+  if (wid) return { id: wid[1].replace('-', '').toUpperCase(), kind: 'item' };
+  const item = s.match(/MLB-?(\d{9,13})/i);
+  return item ? { id: `MLB${item[1]}`, kind: 'item' } : null;
+}
+
+/**
+ * Abre qualquer link colado (inclusive meli.la) e descobre o produto.
+ * Link curto de divulgador (meli.la) leva a mercadolivre.com.br/social/<perfil>?..., que NÃO tem o MLB
+ * na URL: o produto divulgado é o 1º link de produto do HTML dessa página.
+ * Devolve { url, parsed, note } — parsed é null quando não deu para identificar (note explica).
+ */
+async function resolveMlUrl(rawUrl) {
+  const input = String(rawUrl || '').trim();
+  let parsed = parseMlLink(input);
+  if (parsed) return { url: input, parsed, note: null };
+
+  let host = '';
+  try { host = new URL(input).hostname; } catch { return { url: input, parsed: null, note: 'o texto colado não é um link' }; }
+  const isMl = /(^|\.)meli\.la$/i.test(host) || /mercadoli[vb]re\./i.test(host);
+  if (!isMl) return { url: input, parsed: null, note: 'o link não é do Mercado Livre' };
+
+  try {
+    const res = await fetch(input, {
+      redirect: 'follow',
+      headers: { 'User-Agent': BROWSER_UA, 'Accept-Language': 'pt-BR,pt;q=0.9' },
+      signal: AbortSignal.timeout(9000),
+    });
+    const finalUrl = res.url || input;
+    parsed = parseMlLink(finalUrl);
+    if (parsed) return { url: finalUrl, parsed, note: null };
+    if (!res.ok) return { url: finalUrl, parsed: null, note: `o Mercado Livre respondeu HTTP ${res.status} ao abrir o link (bloqueia leitura vinda de servidor)` };
+    parsed = parseMlFromHtml(await res.text());
+    if (parsed) {
+      const url = parsed.kind === 'catalog' ? `https://www.mercadolivre.com.br/p/${parsed.id}` : finalUrl;
+      return { url, parsed, note: null };
+    }
+    return { url: finalUrl, parsed: null, note: 'abri o link mas não achei nenhum produto na página' };
+  } catch (err) {
+    return { url: input, parsed: null, note: `não consegui abrir o link (${err.message})` };
+  }
+}
+
 /** Para produtos já salvos: o permalink de catálogo (/p/MLB...) indica que o código salvo é de catálogo. */
 function kindFromStored(sourceItemId, permalink) {
   if (/\/up\/MLBU/i.test(String(permalink || '')) || /^MLBU/i.test(String(sourceItemId || ''))) return 'up';
@@ -302,6 +350,27 @@ async function getItemSnapshot({ id, kind = 'item', token, url, needDetails = fa
       buyBox = data && data.buy_box_winner ? data.buy_box_winner : null;
       itemId = buyBox && buyBox.item_id ? String(buyBox.item_id) : null;
       if (!itemId) problems.push(`/products/${id}: sem anúncio vencedor (buy_box_winner) no momento`);
+
+      // Anúncios de OUTROS vendedores costumam ser bloqueados em /items (403); a página de catálogo
+      // (/products/{id}) já traz o preço do anúncio vencedor — usa ele direto, sem passar por /items.
+      const bbSale = buyBox && buyBox.sale_price && typeof buyBox.sale_price === 'object' ? buyBox.sale_price : null;
+      const bbPrice = toNumber(bbSale && bbSale.amount) ?? toNumber(buyBox && buyBox.price);
+      if (bbPrice) {
+        const bbRegular = toNumber(bbSale && bbSale.regular_amount) ?? toNumber(buyBox && buyBox.original_price);
+        const pic = Array.isArray(data.pictures) && data.pictures[0] ? data.pictures[0].url || data.pictures[0].secure_url : null;
+        return {
+          source: 'api_catalog',
+          itemId,
+          title: data.name || data.title || null,
+          price: bbPrice,
+          regularPrice: bbRegular && bbRegular > bbPrice ? bbRegular : null,
+          promotionId: null,
+          promotionType: null,
+          thumbnail: pic ? String(pic).replace(/^http:/, 'https:') : null,
+          permalink: `https://www.mercadolivre.com.br/p/${id}`,
+          sellerNickname: null,
+        };
+      }
     } catch (err) { note(err); }
   }
 
@@ -363,6 +432,17 @@ async function getItemSnapshot({ id, kind = 'item', token, url, needDetails = fa
   throw err;
 }
 
+/**
+ * Descoberta por palavra-chave (substituto do /sites/MLB/search, que o ML bloqueia): busca produtos de
+ * CATÁLOGO ativos. Devolve [{ id, title }]. Endpoint documentado: GET /products/search?status=active&site_id=MLB&q=...
+ */
+async function searchCatalogProducts({ q, token, limit = 10, offset = 0, siteId = 'MLB' }) {
+  const path = `/products/search?status=active&site_id=${siteId}&q=${encodeURIComponent(q)}&limit=${limit}&offset=${offset}`;
+  const { data } = await mlGetAny(path, token);
+  const list = (data && (data.results || data.products)) || [];
+  return list.filter((r) => r && r.id).map((r) => ({ id: String(r.id).toUpperCase(), title: r.name || r.title || null }));
+}
+
 module.exports = {
   searchItemsByCategory,
   extractItemIdFromUrl,
@@ -373,6 +453,9 @@ module.exports = {
   publicGet,
   // novos
   resolveShortUrl,
+  resolveMlUrl,
+  parseMlFromHtml,
+  searchCatalogProducts,
   parseMlLink,
   kindFromStored,
   getAccessToken,
