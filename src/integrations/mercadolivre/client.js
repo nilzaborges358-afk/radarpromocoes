@@ -327,7 +327,13 @@ async function fetchPageSnapshot(url) {
   if (!image) { const i = html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/i); if (i) image = i[1]; }
   if (!price) { const pm = html.match(/"price"\s*:\s*"?(\d+(?:\.\d+)?)"?/); if (pm) price = toNumber(pm[1]); }
   if (!price) throw new Error('não consegui ler o preço na página do produto');
-  return { title: title || 'Produto do Mercado Livre', price, image };
+
+  // Preço "de antes" (riscado). O ML escreve "Antes: 299 reais com 90 centavos" no rótulo de acessibilidade.
+  let originalPrice = null;
+  const prev = html.match(/Antes:\s*([\d.]+)\s*reais?(?:\s*com\s*(\d{1,2})\s*centavos?)?/i);
+  if (prev) originalPrice = toNumber(prev[1].replace(/\./g, '')) + (prev[2] ? toNumber(prev[2]) / 100 : 0);
+  if (!originalPrice) { const op = html.match(/"original_price"\s*:\s*(\d+(?:\.\d+)?)/); if (op) originalPrice = toNumber(op[1]); }
+  return { title: title || 'Produto do Mercado Livre', price, image, originalPrice: originalPrice && originalPrice > price ? originalPrice : null };
 }
 
 /**
@@ -374,6 +380,37 @@ async function getItemSnapshot({ id, kind = 'item', token, url, needDetails = fa
           sellerNickname: null,
         };
       }
+      // Sem anúncio vencedor no /products/{id}: tenta a lista de ofertas do produto (menor preço).
+      if (!bbPrice) {
+        try {
+          const { data: li } = await mlGetAny(`/products/${id}/items?limit=20`, token);
+          const arr = Array.isArray(li) ? li : (li && (li.results || li.items)) || [];
+          const offers = arr
+            .map((x) => ({
+              itemId: x.item_id || x.id || null,
+              price: toNumber(x.sale_price && x.sale_price.amount) ?? toNumber(x.price),
+              regular: toNumber(x.sale_price && x.sale_price.regular_amount) ?? toNumber(x.original_price),
+            }))
+            .filter((x) => x.price);
+          if (offers.length) {
+            const best = offers.sort((a, b) => a.price - b.price)[0];
+            const pic = Array.isArray(data.pictures) && data.pictures[0] ? data.pictures[0].url || data.pictures[0].secure_url : null;
+            return {
+              source: 'api_catalog_items',
+              itemId: best.itemId ? String(best.itemId) : itemId,
+              title: data.name || data.title || null,
+              price: best.price,
+              regularPrice: best.regular && best.regular > best.price ? best.regular : null,
+              promotionId: null,
+              promotionType: null,
+              thumbnail: pic ? String(pic).replace(/^http:/, 'https:') : null,
+              permalink: `https://www.mercadolivre.com.br/p/${id}`,
+              sellerNickname: null,
+            };
+          }
+          problems.push(`/products/${id}/items: lista sem ofertas com preço`);
+        } catch (err) { note(err); }
+      }
     } catch (err) { note(err); }
   }
 
@@ -419,7 +456,7 @@ async function getItemSnapshot({ id, kind = 'item', token, url, needDetails = fa
         itemId,
         title: page.title,
         price: page.price,
-        regularPrice: null,
+        regularPrice: page.originalPrice || null,
         promotionId: null,
         promotionType: null,
         thumbnail: page.image ? String(page.image).replace(/^http:/, 'https:') : null,
