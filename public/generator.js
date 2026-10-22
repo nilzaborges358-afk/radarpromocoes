@@ -38,7 +38,6 @@ async function generateLink(slug) {
 
 document.getElementById('shopee-btn').addEventListener('click', () => generateLink('shopee'));
 document.getElementById('netshoes-btn').addEventListener('click', () => generateLink('netshoes'));
-document.getElementById('riachuelo-btn').addEventListener('click', () => generateLink('riachuelo'));
 
 document.getElementById('ml-copy-btn').addEventListener('click', async () => {
   const url = document.getElementById('ml-url').value.trim();
