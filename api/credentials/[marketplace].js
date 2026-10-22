@@ -3,13 +3,12 @@ const { supabaseAdmin } = require('../../src/core/database/supabaseClient');
 // GET  /api/credentials/mercadolivre | /api/credentials/shopee  -> status
 // POST /api/credentials/mercadolivre  -> { client_id, client_secret }
 // POST /api/credentials/shopee        -> { app_id, app_secret }
-// POST /api/credentials/riachuelo     -> { awin_publisher_id, awin_token, advertiser_id?, feed_id?, feed_key? }
 // [marketplace] no nome do arquivo faz a Vercel tratar qualquer coisa depois
 // de /api/credentials/ como esse mesmo arquivo — antes eram 2 functions,
 // agora é 1 só.
 module.exports = async function handler(req, res) {
   const slug = req.query.marketplace;
-  if (!['mercadolivre', 'shopee', 'amazon', 'netshoes', 'riachuelo'].includes(slug)) {
+  if (!['mercadolivre', 'shopee', 'amazon', 'netshoes'].includes(slug)) {
     res.status(404).json({ error: `Marketplace "${slug}" não suportado.` });
     return;
   }
@@ -54,35 +53,6 @@ module.exports = async function handler(req, res) {
 
     if (req.method === 'POST') {
       const body = req.body || {};
-      if (slug === 'riachuelo') {
-        // Awin: Publisher ID + token da API são obrigatórios; Advertiser ID, Feed ID e chave do feed
-        // só são gravados quando vierem preenchidos (vazio = mantém o que já estava salvo).
-        const publisherId = String(body.awin_publisher_id || '').trim();
-        const token = String(body.awin_token || '').trim();
-        if (!publisherId || !token) {
-          res.status(400).json({ error: 'Preencha o Publisher ID e o Token da API da Awin.' });
-          return;
-        }
-        const advertiserId = String(body.advertiser_id || '').trim();
-        const feedId = String(body.feed_id || '').trim();
-        const feedKey = String(body.feed_key || '').trim();
-        const { error: awinError } = await supabaseAdmin.from('marketplace_credentials').upsert(
-          {
-            marketplace_id: marketplace.id,
-            client_id: publisherId,
-            client_secret: token,
-            ...(advertiserId ? { extra_credential: advertiserId } : {}),
-            ...(feedId ? { extra_credential_2: feedId } : {}),
-            ...(feedKey ? { extra_credential_3: feedKey } : {}),
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: 'marketplace_id' }
-        );
-        if (awinError) throw new Error(awinError.message);
-        res.status(200).json({ ok: true });
-        return;
-      }
-
       const clientId = slug === 'shopee' ? body.app_id
         : slug === 'amazon' ? body.access_key
         : slug === 'netshoes' ? body.rakuten_client_id
