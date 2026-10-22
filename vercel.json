@@ -8,6 +8,9 @@
     },
     "api/dispatch.js": {
       "maxDuration": 30
+    },
+    "api/groups.js": {
+      "maxDuration": 30
     }
   }
 }
