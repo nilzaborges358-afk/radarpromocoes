@@ -5,7 +5,7 @@ const MARKETPLACE_LABELS = {
   magalu: { name: 'Magalu', color: '#0086ff', textColor: '#fff' },
   tiktokshop: { name: 'TikTok Shop', color: '#010101', textColor: '#fff' },
   netshoes: { name: 'Netshoes', color: '#f5761a', textColor: '#fff' },
-  riachuelo: { name: 'Riachuelo', color: '#e2231a', textColor: '#fff' },
+  shein: { name: 'Shein', color: '#000000', textColor: '#fff' },
 };
 
 const STATUS_LABEL = { PENDING: 'aguardando afiliação', AFFILIATED: 'afiliada', IGNORED: 'ignorada' };
@@ -457,7 +457,7 @@ async function confirmScan() {
   confirmBtn.textContent = 'Buscando...';
   msg.textContent = 'Buscando… pode levar até 1 minuto, não feche a página.';
 
-  const marketplaceNames = { mercadolivre: 'Mercado Livre', shopee: 'Shopee', amazon: 'Amazon', netshoes: 'Netshoes', riachuelo: 'Riachuelo' };
+  const marketplaceNames = { mercadolivre: 'Mercado Livre', shopee: 'Shopee', amazon: 'Amazon', netshoes: 'Netshoes' };
   const marketplaceName = marketplaceNames[marketplace] || marketplace;
 
   try {
