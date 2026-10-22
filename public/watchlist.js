@@ -40,7 +40,7 @@ function mergeGroupsByName(rows) {
     merged.ids.push(g.id);
     // Se as linhas diferem só em maiúscula/minúscula, mostra a variante com inicial maiúscula.
     if (!/[A-ZÀ-Þ]/.test(merged.name) && /[A-ZÀ-Þ]/.test(cleanText(g.name))) merged.name = cleanText(g.name);
-    String(g.search_keyword || g.name || '').split(',').map(cleanText).filter(Boolean).forEach((kw) => {
+    String(g.search_keyword || g.name || '').split(/[,;\n\r]+/).map(cleanText).filter(Boolean).forEach((kw) => {
       if (!merged.keywords.some((k) => normKey(k) === normKey(kw))) merged.keywords.push(kw);
     });
   });
@@ -237,6 +237,30 @@ async function submitManualPromotion() {
   }
 }
 
+function splitKeywordText(text) {
+  const seen = new Set();
+  return String(text || '').split(/[,;\n\r]+/).map(cleanText).filter(Boolean).filter((k) => {
+    const key = normKey(k);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function updateKeywordCount() {
+  const el = document.getElementById('kwCount');
+  if (!el) return;
+  const n = splitKeywordText(document.getElementById('newGroupKeyword').value).length;
+  el.innerHTML = n ? `<strong>${n}</strong> palavra${n === 1 ? '' : 's'}-chave detectada${n === 1 ? '' : 's'}` : '';
+}
+
+function money(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0
+    ? `R$ ${n.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+    : 'preço indisponível';
+}
+
 async function testSearch() {
   const keyword = document.getElementById('newGroupKeyword').value.trim();
   const btn = document.getElementById('testSearchBtn');
@@ -246,7 +270,7 @@ async function testSearch() {
   if (!keyword) { msg.textContent = 'Digite uma palavra-chave antes de testar.'; return; }
 
   btn.disabled = true;
-  btn.textContent = 'Testando...';
+  btn.textContent = 'Testando em todos os marketplaces...';
   msg.textContent = '';
   preview.innerHTML = '';
 
@@ -259,18 +283,31 @@ async function testSearch() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Falha ao testar');
 
-    if (data.preview.length === 0) {
-      msg.textContent = 'Nenhum resultado para essa palavra-chave — tente algo mais específico ou diferente.';
-    } else {
-      preview.innerHTML = data.preview.map((item) => `
-        <div class="item">
-          <img src="${item.image || ''}" alt="" loading="lazy" />
-          <div>${escapeHtml(item.title)}</div>
-          <div class="t-price">R$ ${Number(item.price).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
-        </div>
-      `).join('');
-      msg.textContent = 'Isso aqui bate com o que você quer? Se sim, clique em "Criar grupo".';
-    }
+    preview.innerHTML = (data.results || []).map((r) => {
+      const badge = r.status === 'ok'
+        ? `<span class="tp-badge ok">${r.items.length} resultado${r.items.length === 1 ? '' : 's'}</span>`
+        : r.status === 'skipped'
+          ? '<span class="tp-badge">não conectado</span>'
+          : '<span class="tp-badge err">erro</span>';
+      const body = r.items.length
+        ? `<div class="test-preview">${r.items.map((item) => `
+            <div class="item">
+              <img src="${escapeHtml(item.image || '')}" alt="" loading="lazy" />
+              <div>${escapeHtml(item.title || '')}</div>
+              <div class="t-price">${money(item.price)}</div>
+            </div>`).join('')}</div>`
+        : '';
+      const note = r.message ? `<div class="tp-note">${escapeHtml(r.message)}</div>` : (r.status === 'ok' && !r.items.length ? '<div class="tp-note">Nenhum resultado para essa palavra-chave neste marketplace.</div>' : '');
+      return `<div class="tp-section"><div class="tp-title">${escapeHtml(r.name)} ${badge}</div>${body}${note}</div>`;
+    }).join('');
+
+    const partial = data.totalKeywords > (data.tested || []).length
+      ? ` Testei as ${data.tested.length} primeiras de ${data.totalKeywords} palavras (o grupo salva todas).`
+      : '';
+    const anyItems = (data.results || []).some((r) => r.items.length);
+    msg.textContent = anyItems
+      ? `Resultado em cada marketplace.${partial} Isso bate com o que você quer? Se sim, clique em "Criar grupo".`
+      : `Nenhum resultado em nenhum marketplace — tente algo mais específico ou diferente.${partial}`;
   } catch (err) {
     msg.textContent = `Erro: ${err.message}`;
   } finally {
@@ -301,6 +338,7 @@ async function createGroup() {
 
     document.getElementById('newGroupName').value = '';
     document.getElementById('newGroupKeyword').value = '';
+    updateKeywordCount();
     document.getElementById('testPreview').innerHTML = '';
     msg.textContent = data.message || 'Grupo criado!';
     await load();
@@ -357,6 +395,7 @@ function escapeHtml(str) {
 
 document.getElementById('addBtn').addEventListener('click', addProduct);
 document.getElementById('testSearchBtn').addEventListener('click', testSearch);
+document.getElementById('newGroupKeyword').addEventListener('input', updateKeywordCount);
 document.getElementById('createGroupBtn').addEventListener('click', createGroup);
 document.getElementById('manualSubmitBtn').addEventListener('click', submitManualPromotion);
 load();
