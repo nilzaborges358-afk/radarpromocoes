@@ -1,6 +1,5 @@
 const ml = require('../integrations/mercadolivre/client');
 const netshoesClient = require('../integrations/netshoes/client');
-const awinClient = require('../integrations/awin/client');
 
 // ---------- utilidades ----------
 
@@ -33,7 +32,7 @@ function detectMarketplace(url) {
   if (/mercadolivre|mercadolibre|meli\.la/.test(u)) return 'mercadolivre';
   if (/shopee/.test(u)) return 'shopee';
   if (/netshoes/.test(u)) return 'netshoes';
-  if (/riachuelo|awin1\.com|tidd\.ly/.test(u)) return 'riachuelo';
+  if (/shein/.test(u)) return 'shein';
   if (/amazon\.com|amzn\./.test(u)) return 'amazon';
   if (/magazineluiza|magalu/.test(u)) return 'magalu';
   return null;
@@ -370,69 +369,6 @@ async function netshoesFetchCoupons(supabase) {
   };
 }
 
-// ---------- Riachuelo (cupons via Awin) ----------
-
-// Nome do produto a partir do link da Riachuelo: usa o trecho mais "descritivo" do caminho.
-function riachueloTitleFromUrl(url) {
-  try {
-    const segs = new URL(url).pathname.split('/').filter(Boolean);
-    const best = segs.filter((sg) => sg.includes('-')).sort((a, b) => b.length - a.length)[0] || '';
-    const parts = norm(best).replace(/\.html?$/, '').split('-').filter(Boolean);
-    while (parts.length > 3 && /^\d+$/.test(parts[parts.length - 1])) parts.pop();
-    return parts.join(' ') || null;
-  } catch { return null; }
-}
-
-async function awinFetchCoupons(supabase) {
-  const { getAwinContext, loadAwinCoupons } = require('./awin');
-  const ctx = await getAwinContext(supabase);
-  if (ctx.error) return { status: 400, json: { error: ctx.error } };
-  const r = await loadAwinCoupons(ctx);
-  if (r.error) return { status: 502, json: { error: r.error } };
-  return {
-    status: 200,
-    json: { ok: true, marketplace: 'riachuelo', total: r.coupons.length, withCode: r.coupons.filter((c) => c.code).length, expired: r.expired, totalMatches: r.totalMatches, coupons: r.coupons },
-  };
-}
-
-// Mesmo formato de resposta do netshoesCheck, para a tela reaproveitar o mesmo desenho.
-async function awinCheck(supabase, url, manualPrice) {
-  const { getAwinContext, loadAwinCoupons } = require('./awin');
-  const ctx = await getAwinContext(supabase);
-  if (ctx.error) return { status: 400, json: { error: ctx.error } };
-
-  // A Awin não tem consulta de produto por link (só o feed inteiro, com limite de downloads por hora).
-  // Então o produto é identificado pelo nome que está no link + o preço que você digitar.
-  const product = { title: riachueloTitleFromUrl(url), price: manualPrice || null, regularPrice: null, imageUrl: null, category: null, url, found: false };
-
-  const loaded = await loadAwinCoupons(ctx);
-  const results = { ok: [], check: [], no: [] };
-  if (!loaded.error) {
-    for (const c of loaded.coupons) {
-      const r = matchNetshoesCoupon(c, product);
-      results[r.status].push(r);
-    }
-    const order = (a, b) => (b.discount || 0) - (a.discount || 0) || (b.coupon.code ? 1 : 0) - (a.coupon.code ? 1 : 0);
-    results.ok.sort(order);
-    results.check.sort(order);
-  }
-
-  return {
-    status: 200,
-    json: {
-      ok: true,
-      marketplace: 'riachuelo',
-      product,
-      productError: 'A Awin não consulta produto por link; usei o nome do link e o preço que você digitou.',
-      affiliateUrl: awinClient.buildAffiliateLink(ctx.publisherId, ctx.advertiserId, url),
-      results,
-      totalCoupons: loaded.error ? 0 : loaded.coupons.length,
-      couponsError: loaded.error || null,
-      rawSample: null,
-    },
-  };
-}
-
 // ---------- Netshoes: este cupom serve para ESTE produto? ----------
 
 function norm(value) {
@@ -695,7 +631,6 @@ async function handleAction(supabase, body) {
   const action = body.action;
 
   if (action === 'coupons_netshoes_fetch') return netshoesFetchCoupons(supabase);
-  if (action === 'coupons_awin_fetch') return awinFetchCoupons(supabase);
   if (action === 'coupons_netshoes_products') return netshoesProducts(supabase, body);
 
   if (action === 'coupons_list') {
@@ -742,7 +677,6 @@ async function handleAction(supabase, body) {
 
     // Netshoes: cupons vêm da própria integração (Rakuten) e são cruzados com o produto do link.
     if (marketplace === 'netshoes') return netshoesCheck(supabase, url, manualPrice);
-    if (marketplace === 'riachuelo') return awinCheck(supabase, url, manualPrice);
 
     let product = null;
     let productError = null;
@@ -779,4 +713,4 @@ async function handleAction(supabase, body) {
   return { status: 400, json: { error: 'Ação desconhecida.' } };
 }
 
-module.exports = { handleAction, awinCheck, riachueloTitleFromUrl, matchCoupons, detectMarketplace, pickMlId, num, parseDiscountText, getNetshoesContext, loadNetshoesCoupons, matchNetshoesCoupon, bestNetshoesCoupon };
+module.exports = { handleAction, matchCoupons, detectMarketplace, pickMlId, num, parseDiscountText, getNetshoesContext, loadNetshoesCoupons, matchNetshoesCoupon, bestNetshoesCoupon };
