@@ -1,9 +1,12 @@
 const { supabaseAdmin } = require('../src/core/database/supabaseClient');
 const { searchProductOffers } = require('../src/integrations/shopee/client');
+const mlClient = require('../src/integrations/mercadolivre/client');
+const netshoesClient = require('../src/integrations/netshoes/client');
 
 // GET    /api/groups                          -> lista todos
 // POST   /api/groups  { name, search_keyword } -> cria um grupo (se o nome já existir, soma as palavras-chave nele)
-// POST   /api/groups  { action: 'test', keyword } -> testa uma busca sem salvar
+//        search_keyword aceita VÁRIAS palavras de uma vez, separadas por vírgula, ponto e vírgula ou quebra de linha
+// POST   /api/groups  { action: 'test', keyword } -> testa uma busca (Shopee + Netshoes + Mercado Livre) sem salvar
 // POST   /api/groups  { action: 'remove_keyword', ids, keyword } -> tira UMA palavra-chave de um grupo
 // DELETE /api/groups?id=a,b,c                 -> remove o grupo (todas as linhas com esses ids)
 module.exports = async function handler(req, res) {
@@ -91,7 +94,7 @@ module.exports = async function handler(req, res) {
         throw new Error(error.message);
       }
 
-      res.status(200).json({ ok: true, group: data, message: 'Grupo criado!' });
+      res.status(200).json({ ok: true, group: data, message: `Grupo criado com ${newKeywords.length} palavra${newKeywords.length === 1 ? '' : 's'}-chave!` });
       return;
     }
 
@@ -123,8 +126,9 @@ function normalizeKey(value) {
   return normalizeText(value).toLowerCase();
 }
 
+// Aceita vírgula, ponto e vírgula e quebra de linha (dá para colar uma lista inteira, uma palavra por linha).
 function splitKeywords(value) {
-  return String(value || '').split(',').map((k) => normalizeText(k)).filter(Boolean);
+  return String(value || '').split(/[,;\n\r]+/).map((k) => normalizeText(k)).filter(Boolean);
 }
 
 function uniqueKeywords(list) {
@@ -189,35 +193,148 @@ async function removeKeyword(res, body) {
   res.status(200).json({ ok: true });
 }
 
-async function testSearch(req, res, keyword) {
-  if (!keyword) {
-    res.status(400).json({ error: 'Informe uma palavra-chave para testar.' });
-    return;
-  }
+// ---------------------------------------------------------------------------------------------
+// TESTAR BUSCA — consulta TODOS os marketplaces que estão rodando (Shopee, Netshoes e Mercado Livre)
+// ao mesmo tempo e mostra o resultado de cada um separado. Um que falhe ou não esteja conectado
+// não derruba os outros: aparece só um aviso no lugar dele.
+// ---------------------------------------------------------------------------------------------
+const TEST_MAX_KEYWORDS = 4;     // testa no máximo as 4 primeiras palavras (rápido); o grupo salva todas
+const TEST_TIMEOUT_MS = 14000;   // cada marketplace tem esse tempo; passou, mostra aviso e segue
 
-  const { data: marketplace } = await supabaseAdmin.from('marketplaces').select('id').eq('slug', 'shopee').single();
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} demorou mais de ${Math.round(ms / 1000)}s para responder`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function toPrice(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  let t = String(v).replace(/[^0-9.,-]/g, '');
+  if (!t) return null;
+  if (t.includes(',')) t = t.replace(/\./g, '').replace(',', '.');
+  const n = Number(t);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+async function testShopee(keywords) {
+  const { data: marketplace } = await supabaseAdmin.from('marketplaces').select('id').eq('slug', 'shopee').maybeSingle();
+  if (!marketplace) return { status: 'skipped', message: 'Shopee ainda não está cadastrada.' };
   const { data: creds } = await supabaseAdmin
     .from('marketplace_credentials')
     .select('client_id, client_secret')
     .eq('marketplace_id', marketplace.id)
     .maybeSingle();
-
   if (!creds?.client_id || !creds?.client_secret) {
-    res.status(400).json({ error: 'Credenciais da Shopee não cadastradas ainda. Vá em /marketplaces.html.' });
+    return { status: 'skipped', message: 'Credenciais da Shopee não cadastradas (aba Marketplaces).' };
+  }
+
+  const perKeyword = Math.max(2, Math.floor(8 / keywords.length));
+  const items = [];
+  const errors = [];
+  for (const kw of keywords) {
+    try {
+      const offers = await searchProductOffers(creds.client_id, creds.client_secret, kw, { limit: perKeyword });
+      offers.slice(0, perKeyword).forEach((o) => items.push({
+        keyword: kw, title: o.productName, image: o.imageUrl, price: toPrice(o.priceMin),
+      }));
+    } catch (err) { errors.push(`"${kw}": ${err.message}`); }
+  }
+  if (!items.length && errors.length) return { status: 'error', message: errors[0] };
+  return { status: 'ok', items, message: errors.length ? `Algumas palavras falharam: ${errors.join(' | ')}` : null };
+}
+
+async function testNetshoes(keywords) {
+  const { data: marketplace } = await supabaseAdmin.from('marketplaces').select('id').eq('slug', 'netshoes').maybeSingle();
+  if (!marketplace) return { status: 'skipped', message: 'Netshoes ainda não está cadastrada.' };
+  const { data: creds } = await supabaseAdmin
+    .from('marketplace_credentials')
+    .select('client_id, client_secret, extra_credential, extra_credential_2, extra_credential_3')
+    .eq('marketplace_id', marketplace.id)
+    .maybeSingle();
+  if (!creds?.extra_credential || !creds?.extra_credential_2 || !creds?.extra_credential_3) {
+    return { status: 'skipped', message: 'Credenciais da Netshoes/Rakuten incompletas (aba Marketplaces).' };
+  }
+
+  // Mesmo método do scan: token do Web Services + (se der) token OAuth.
+  const auth = { accessToken: null, webServicesToken: creds.extra_credential_3, strategy: null };
+  if (creds.client_id && creds.client_secret) {
+    try { auth.accessToken = await netshoesClient.getAccessToken(creds.client_id, creds.client_secret, creds.extra_credential); } catch (e) { /* segue só com o Web Services Token */ }
+  }
+
+  const perKeyword = Math.max(2, Math.floor(8 / keywords.length));
+  const items = [];
+  const errors = [];
+  for (const kw of keywords) {
+    try {
+      const found = await netshoesClient.searchProducts(auth, creds.extra_credential_2, kw, { max: Math.max(perKeyword, 10), page: 1 });
+      found.slice(0, perKeyword).forEach((it) => items.push({
+        keyword: kw, title: it.itemName, image: it.imageUrl || it.image || null,
+        price: toPrice(it.salePrice) || toPrice(it.price),
+      }));
+    } catch (err) { errors.push(`"${kw}": ${err.message}`); }
+  }
+  if (!items.length && errors.length) return { status: 'error', message: errors[0] };
+  return { status: 'ok', items, message: errors.length ? `Algumas palavras falharam: ${errors.join(' | ')}` : null };
+}
+
+async function testMercadoLivre(keywords) {
+  const { token, reason } = await mlClient.getAccessToken(supabaseAdmin);
+  if (!token) return { status: 'skipped', message: `Mercado Livre não conectado: ${reason || 'conecte a conta na aba Marketplaces.'}` };
+
+  const perKeyword = Math.max(2, Math.floor(6 / keywords.length));
+  const items = [];
+  const errors = [];
+  for (const kw of keywords) {
+    try {
+      const found = await mlClient.searchCatalogProducts({ q: kw, token, limit: perKeyword });
+      const snaps = await Promise.allSettled(
+        found.slice(0, perKeyword).map((f) => mlClient.getItemSnapshot({ id: f.id, kind: 'catalog', token }))
+      );
+      found.slice(0, perKeyword).forEach((f, i) => {
+        const snap = snaps[i].status === 'fulfilled' ? snaps[i].value : null;
+        items.push({
+          keyword: kw, title: (snap && snap.title) || f.title || f.id,
+          image: snap ? snap.thumbnail : null, price: snap ? snap.price : null,
+        });
+      });
+    } catch (err) { errors.push(`"${kw}": ${err.message}`); }
+  }
+  if (!items.length && errors.length) return { status: 'error', message: errors[0] };
+  return { status: 'ok', items, message: errors.length ? `Algumas palavras falharam: ${errors.join(' | ')}` : null };
+}
+
+async function testSearch(req, res, keyword) {
+  const all = uniqueKeywords(splitKeywords(keyword));
+  if (!all.length) {
+    res.status(400).json({ error: 'Informe uma palavra-chave para testar.' });
     return;
   }
+  const keywords = all.slice(0, TEST_MAX_KEYWORDS);
 
-  const keywords = keyword.split(',').map((k) => k.trim()).filter(Boolean);
-  const perKeywordLimit = Math.max(2, Math.floor(8 / keywords.length));
+  const runners = [
+    { slug: 'shopee', name: 'Shopee', run: testShopee },
+    { slug: 'netshoes', name: 'Netshoes', run: testNetshoes },
+    { slug: 'mercadolivre', name: 'Mercado Livre', run: testMercadoLivre },
+  ];
 
-  let allOffers = [];
-  for (const kw of keywords) {
-    const offers = await searchProductOffers(creds.client_id, creds.client_secret, kw, { limit: perKeywordLimit });
-    allOffers = allOffers.concat(offers);
-  }
+  const results = await Promise.all(runners.map(async (r) => {
+    try {
+      const out = await withTimeout(r.run(keywords), TEST_TIMEOUT_MS, r.name);
+      return { slug: r.slug, name: r.name, status: out.status, message: out.message || null, items: out.items || [] };
+    } catch (err) {
+      return { slug: r.slug, name: r.name, status: 'error', message: err.message, items: [] };
+    }
+  }));
 
   res.status(200).json({
     ok: true,
-    preview: allOffers.map((o) => ({ title: o.productName, image: o.imageUrl, price: o.priceMin, discount: o.priceDiscountRate })),
+    tested: keywords,
+    totalKeywords: all.length,
+    results,
+    // compatibilidade com a tela antiga (lista única)
+    preview: results.flatMap((r) => r.items.map((o) => ({ title: o.title, image: o.image, price: o.price }))),
   });
 }
