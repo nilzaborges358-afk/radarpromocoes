@@ -5,7 +5,7 @@ const MARKETPLACES = [
   { slug: 'magalu', name: 'Magalu', color: '#0086ff', implemented: true, manualOnly: true },
   { slug: 'tiktokshop', name: 'TikTok Shop', color: '#ffffff', implemented: false },
   { slug: 'netshoes', name: 'Netshoes', color: '#f5761a', implemented: true },
-  { slug: 'riachuelo', name: 'Riachuelo (Awin)', color: '#e2231a', implemented: true },
+  { slug: 'shein', name: 'Shein', color: '#000000', implemented: true, manualOnly: true, manualNote: 'A Shein tem programa de afiliados direto, mas <b>não oferece API</b> para afiliados (nem busca de produto, nem geração de link, nem cupons). O link rastreado só sai do <b>Centro de Afiliados</b>, dentro do app da Shein (procure "afiliado" no app). Gere o link lá, copie e use o <a href="watchlist.html" style="color:var(--accent);">"Adicionar promoção manual"</a> na Lista de vigilância (marketplace Shein) colando o link de afiliado — a promoção já entra no Painel e no Disparador.' },
 ];
 
 const list = document.getElementById('list');
@@ -25,7 +25,7 @@ function render() {
       </div>
       <div class="mp-body" id="body-${mp.slug}">
         ${mp.manualOnly
-          ? `<p class="soon-note">A ${mp.name} não tem API de afiliados — não existe como automatizar descoberta de promoção nem geração de link. Use o <a href="watchlist.html" style="color:var(--accent);">"Adicionar promoção manual"</a> na Lista de vigilância pra cadastrar o que você encontrar.</p>`
+          ? `<p class="soon-note">${mp.manualNote || `A ${mp.name} não tem API de afiliados — não existe como automatizar descoberta de promoção nem geração de link. Use o <a href="watchlist.html" style="color:var(--accent);">"Adicionar promoção manual"</a> na Lista de vigilância pra cadastrar o que você encontrar.`}</p>`
           : mp.implemented ? renderForm(mp.slug) : `<p class="soon-note">Essa integração ainda não foi implementada. Assim que estiver pronta, o formulário de credenciais aparece aqui.</p>`}
       </div>
     </div>
@@ -35,7 +35,6 @@ function render() {
   loadStatus('shopee');
   loadStatus('amazon');
   loadStatus('netshoes');
-  loadStatus('riachuelo');
 }
 
 function renderForm(slug) {
@@ -73,36 +72,6 @@ function renderForm(slug) {
       </div>
       <div class="save-msg" id="shopee-save-msg"></div>
       <p class="soon-note" style="margin-top:10px;">Não precisa de "conectar" — assim que salvar, o botão "Buscar promoções agora" do painel geral já passa a buscar na Shopee também, usando os grupos da Lista de vigilância como palavra-chave.</p>
-    `;
-  }
-
-  if (slug === 'riachuelo') {
-    return `
-      <div class="field">
-        <label>Publisher ID da Awin</label>
-        <input type="text" id="riachuelo-id" placeholder="Ex: 1234567 (número no canto do painel da Awin)" />
-      </div>
-      <div class="field">
-        <label>Token da API da Awin (OAuth2)</label>
-        <input type="password" id="riachuelo-secret" placeholder="Awin > API Credentials > Create API Token" />
-      </div>
-      <div class="field">
-        <label>Endereço do "Feed List Download" (Awin &gt; Toolbox &gt; Create-a-Feed)</label>
-        <input type="password" id="riachuelo-feedkey" placeholder="Cole o endereço inteiro (https://ui.awin.com/...) — vazio mantém o salvo" />
-      </div>
-      <div class="field">
-        <label>Advertiser ID da Riachuelo (opcional — o sistema descobre sozinho)</label>
-        <input type="text" id="riachuelo-tag" placeholder="Deixe vazio para detectar automaticamente" />
-      </div>
-      <div class="field">
-        <label>Feed ID (opcional — só se a Riachuelo tiver mais de um feed)</label>
-        <input type="text" id="riachuelo-mid" placeholder="Deixe vazio para escolher automaticamente" />
-      </div>
-      <div class="row-actions">
-        <button class="primary" onclick="saveCredentials('riachuelo')">Salvar credenciais</button>
-      </div>
-      <div class="save-msg" id="riachuelo-save-msg"></div>
-      <p class="soon-note" style="margin-top:10px;">Precisa estar aprovado no programa da Riachuelo na Awin. Publisher ID: número da sua conta (aparece no topo do painel). Token: Awin &gt; Account &gt; API Credentials. Feed: Awin &gt; Toolbox &gt; Create-a-Feed, quadro azul "Feed List Download": copie o endereço inteiro. Ele é DIFERENTE do token da API.</p>
     `;
   }
 
@@ -177,12 +146,7 @@ async function loadStatus(slug) {
     const dot = document.getElementById(`dot-${slug}`);
     const statusText = document.getElementById(`status-${slug}`);
 
-    if (slug === 'riachuelo' && data.hasCredentials) {
-      dot.className = data.hasExtraCredential3 ? 'dot on' : 'dot off';
-      statusText.textContent = data.hasExtraCredential3
-        ? 'Credenciais salvas'
-        : 'Credenciais salvas — falta o endereço do Feed';
-    } else if (slug === 'netshoes' && data.hasCredentials) {
+    if (slug === 'netshoes' && data.hasCredentials) {
       dot.className = data.hasExtraCredential3 ? 'dot on' : 'dot off';
       statusText.textContent = data.hasExtraCredential3
         ? 'Credenciais salvas'
@@ -191,7 +155,7 @@ async function loadStatus(slug) {
       dot.className = 'dot on';
       statusText.textContent = `Conectado${data.sellerId ? ` (seller ${data.sellerId})` : ''}`;
     } else if (data.hasCredentials) {
-      if (slug === 'shopee' || slug === 'netshoes' || slug === 'riachuelo') {
+      if (slug === 'shopee' || slug === 'netshoes') {
         dot.className = 'dot on';
         statusText.textContent = 'Credenciais salvas';
       } else if (slug === 'amazon') {
@@ -244,14 +208,6 @@ async function saveCredentials(slug) {
         access_key: id,
         secret_key: secret,
         associate_tag: document.getElementById('amazon-tag').value.trim(),
-      };
-    } else if (slug === 'riachuelo') {
-      body = {
-        awin_publisher_id: id,
-        awin_token: secret,
-        feed_key: document.getElementById('riachuelo-feedkey').value.trim(),
-        advertiser_id: document.getElementById('riachuelo-tag').value.trim(),
-        feed_id: document.getElementById('riachuelo-mid').value.trim(),
       };
     } else if (slug === 'netshoes') {
       body = {
