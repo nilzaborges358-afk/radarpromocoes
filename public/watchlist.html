@@ -34,11 +34,11 @@
   .add-form .field { flex:1; min-width:220px; }
   .add-form label { display:block; font-size:12px; color: var(--muted); margin-bottom:6px; }
   .add-form input, .add-form select {
-    width:100%; background:#0d0e10; border:1px solid var(--line); color: var(--ink);
+    width:100%; background:var(--inset); border:1px solid var(--line); color: var(--ink);
     padding:9px 10px; font-family: var(--font-body); font-size:13px;
   }
   .add-form button {
-    background: var(--accent); color:#1a1204; border:none; font-weight:600; font-size:13px;
+    background: var(--accent); color:var(--on-accent); border:none; font-weight:600; font-size:13px;
     padding:10px 18px; cursor:pointer;
   }
   .add-form button:disabled { opacity:0.6; cursor:wait; }
@@ -63,7 +63,7 @@
   .group-manager-title { font-family: var(--font-display); font-weight:600; font-size:15px; margin-bottom:4px; }
   .group-manager-sub { font-size:12px; color: var(--muted); margin:0 0 14px; }
   .groups-list { display:flex; flex-direction:column; gap:1px; background:var(--line); margin-bottom:16px; }
-  .group-row { background:#0d0e10; padding:10px 14px; display:flex; align-items:center; justify-content:space-between; gap:10px; }
+  .group-row { background:var(--inset); padding:10px 14px; display:flex; align-items:center; justify-content:space-between; gap:10px; }
   .group-row { align-items:flex-start; }
   .group-row .g-info { flex:1; min-width:0; }
   .group-row .g-name { font-size:13px; font-weight:600; }
@@ -78,18 +78,20 @@
   .new-group-form .field { flex:1; min-width:220px; }
   .new-group-form label { display:block; font-size:12px; color: var(--muted); margin-bottom:6px; }
   .new-group-form input {
-    width:100%; background:#0d0e10; border:1px solid var(--line); color: var(--ink);
+    width:100%; background:var(--inset); border:1px solid var(--line); color: var(--ink);
     padding:9px 10px; font-family: var(--font-body); font-size:13px;
   }
-  .new-group-form button.primary { background: var(--accent); color:#1a1204; border:none; font-weight:600; font-size:13px; padding:10px 16px; cursor:pointer; }
+  .new-group-form button.primary { background: var(--accent); color:var(--on-accent); border:none; font-weight:600; font-size:13px; padding:10px 16px; cursor:pointer; }
   .new-group-form button.secondary { background:transparent; color: var(--ink); border:1px solid var(--line); font-size:13px; padding:10px 16px; cursor:pointer; }
   .new-group-form button:disabled { opacity:0.6; cursor:wait; }
   .test-preview { width:100%; display:flex; gap:10px; flex-wrap:wrap; margin-top:4px; }
-  .test-preview .item { width:110px; background:#0d0e10; border:1px solid var(--line); padding:6px; font-size:10.5px; }
+  .test-preview .item { width:110px; background:var(--inset); border:1px solid var(--line); padding:6px; font-size:10.5px; }
   .test-preview .item img { width:100%; height:70px; object-fit:contain; background:#fff; margin-bottom:4px; }
   .test-preview .item .t-price { color: var(--good); font-weight:600; }
   .group-msg { width:100%; font-size:12px; color: var(--muted); }
 </style>
+<script src="theme.js"></script>
+<link rel="stylesheet" href="theme.css">
 </head>
 <body>
 
