@@ -1,7 +1,5 @@
 const { generateShortLink } = require('../src/integrations/shopee/client');
 const { buildAffiliateLink, publisherIdLooksNumeric } = require('../src/integrations/netshoes/client');
-const awinClient = require('../src/integrations/awin/client');
-const { getAwinContext } = require('../src/core/awin');
 const { supabaseAdmin } = require('../src/core/database/supabaseClient');
 const { handleAction: handleCouponAction } = require('../src/core/coupons');
 
@@ -73,19 +71,8 @@ module.exports = async function handler(req, res) {
       return;
     }
 
-    if (slug === 'riachuelo') {
-      const ctx = await getAwinContext(supabaseAdmin);
-      if (ctx.error) { res.status(400).json({ error: ctx.error }); return; }
-      // Link longo montado na hora (sem limite de chamadas). Tenta também o link curto (tidd.ly) pela
-      // Link Builder API da Awin; se ela recusar, devolve só o longo — sempre sai um link rastreado.
-      const longLink = awinClient.buildAffiliateLink(ctx.publisherId, ctx.advertiserId, url);
-      let shortLink = null;
-      let shortNote = null;
-      try {
-        const r = await awinClient.generateShortLink(ctx.publisherId, ctx.token, ctx.advertiserId, url);
-        shortLink = r.shortUrl || null;
-      } catch (err) { shortNote = err.message; }
-      res.status(200).json({ ok: true, affiliateUrl: shortLink || longLink, longUrl: longLink, shortNote });
+    if (slug === 'shein') {
+      res.status(400).json({ error: 'A Shein não tem API de afiliados: o link rastreado só sai do Centro de Afiliados (no app da Shein). Gere lá e cadastre a promoção em Lista de vigilância > Adicionar promoção manual.' });
       return;
     }
 
