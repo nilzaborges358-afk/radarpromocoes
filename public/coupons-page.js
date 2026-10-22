@@ -49,7 +49,7 @@ async function checkCoupons() {
 
   try {
     const r = await couponApi({ action: 'coupons_check', url, price });
-    if (r.marketplace === 'netshoes' || r.marketplace === 'riachuelo') { renderNetshoesCheck(r, box); return; }
+    if (r.marketplace === 'netshoes') { renderNetshoesCheck(r, box); return; }
     let html = '';
 
     if (r.product && r.product.source === 'page') {
@@ -415,12 +415,12 @@ function renderNetshoesCheck(r, box) {
   html += `<div class="cp-product">
     ${p.imageUrl ? `<img src="${esc(p.imageUrl)}" alt="" />` : ''}
     <div>
-      <div class="t">${esc(p.title || (r.marketplace === 'riachuelo' ? 'Produto da Riachuelo' : 'Produto da Netshoes'))}</div>
+      <div class="t">${esc(p.title || 'Produto da Netshoes')}</div>
       <div class="m">${p.price ? `R$ ${brl(p.price)}${p.regularPrice ? ` <s>R$ ${brl(p.regularPrice)}</s>` : ''}` : 'preço não lido'}${p.category ? ` · ${esc(p.category)}` : ''} · <a href="${esc(p.url)}" target="_blank" rel="noopener" style="color:var(--accent)">abrir produto ↗</a></div>
     </div>
   </div>`;
   if (!p.found) {
-    html += `<div class="cp-note" style="color:var(--accent)"><b>${r.marketplace === 'riachuelo' ? 'A Awin não lê produto por link' : 'Não achei esse produto na integração da Rakuten'}</b>, então usei só o nome que está no link${p.price ? ' e o preço que você digitou' : ''}. ${p.price ? '' : 'Digite o preço no campo ao lado e clique em "Ver cupons" de novo para calcular o valor final e checar compra mínima.'}${r.productError ? `<details class="cp-excluded"><summary>detalhes técnicos</summary><div style="margin-top:6px; word-break:break-all;">${esc(r.productError)}</div></details>` : ''}</div>`;
+    html += `<div class="cp-note" style="color:var(--accent)"><b>Não achei esse produto na integração da Rakuten</b>, então usei só o nome que está no link${p.price ? ' e o preço que você digitou' : ''}. ${p.price ? '' : 'Digite o preço no campo ao lado e clique em "Ver cupons" de novo para calcular o valor final e checar compra mínima.'}${r.productError ? `<details class="cp-excluded"><summary>detalhes técnicos</summary><div style="margin-top:6px; word-break:break-all;">${esc(r.productError)}</div></details>` : ''}</div>`;
   }
 
   if (r.couponsError) {
@@ -438,7 +438,7 @@ function renderNetshoesCheck(r, box) {
     html += `<div class="cp-list">${res.check.map((x, i) => nsCheckItemHtml(x, 'check', i)).join('')}</div>`;
   }
   if (!res.ok.length && !res.check.length) {
-    html += `<div class="cp-note" style="margin-top:14px; color:var(--bad); font-size:13px;"><b>❌ Para esse produto não temos cupons disponíveis.</b> ${r.totalCoupons ? `Olhei ${r.totalCoupons} cupom(ns)/oferta(s) ativo(s) ${r.marketplace === 'riachuelo' ? 'da Riachuelo' : 'da Netshoes'} e nenhum serve.` : `${r.marketplace === 'riachuelo' ? 'A Awin' : 'A Rakuten'} não devolveu nenhum cupom ativo agora.`}</div>`;
+    html += `<div class="cp-note" style="margin-top:14px; color:var(--bad); font-size:13px;"><b>❌ Para esse produto não temos cupons disponíveis.</b> ${r.totalCoupons ? `Olhei ${r.totalCoupons} cupom(ns)/oferta(s) ativo(s) da Netshoes e nenhum serve.` : 'A Rakuten não devolveu nenhum cupom ativo agora.'}</div>`;
     if (!r.totalCoupons && r.rawSample) html += `<details class="cp-excluded"><summary>resposta recebida da Rakuten</summary><div style="margin-top:6px; word-break:break-all;">${esc(r.rawSample)}</div></details>`;
   }
   if (res.no.length) {
@@ -460,71 +460,4 @@ F('cp-result').addEventListener('click', (e) => {
   if (d.nscCode !== undefined) nsCopy(b, item.coupon.code);
   else if (d.nscMsg !== undefined) nsCopy(b, nsCheckMessage(nsCheck, item));
   else window.open(`https://wa.me/?text=${encodeURIComponent(nsCheckMessage(nsCheck, item))}`, '_blank');
-});
-
-
-// =====================================================================
-// Cupons da Riachuelo (Awin)
-// =====================================================================
-let awCoupons = [];
-
-function awMessage(c) {
-  const until = nsDate(c.endsAt);
-  return [
-    '🏷️ CUPOM RIACHUELO',
-    c.description || '',
-    c.code ? `✅ Código: ${c.code}` : '',
-    c.restriction ? `⚠️ ${c.restriction}` : '',
-    until ? `⏰ Válido até ${until}` : '',
-    c.clickUrl ? `👉 ${c.clickUrl}` : '',
-  ].filter(Boolean).join('\n');
-}
-
-function awRender(r) {
-  const box = F('aw-result');
-  awCoupons = r.coupons || [];
-  if (!awCoupons.length) {
-    box.innerHTML = `<div class="cp-note"><b>A Awin não devolveu nenhum cupom ativo para a Riachuelo.</b> ${r.expired ? `(${r.expired} já vencido(s) foram ignorados.) ` : ''}Pode ser que a Riachuelo não tenha cupom para afiliados agora, ou que a afiliação ainda não esteja aprovada.</div>`;
-    return;
-  }
-  box.innerHTML = `<div class="cp-note" style="margin-top:4px;">${r.total} cupom(ns)/oferta(s) ativo(s), ${r.withCode} com código.${r.expired ? ` ${r.expired} vencido(s) ocultado(s).` : ''}</div>` +
-    `<div class="cp-list">` + awCoupons.map((c, i) => {
-      const until = nsDate(c.endsAt);
-      const parsed = nsParsedLabel(c);
-      return `<div class="cp-item">
-        <div style="flex:1; min-width:220px;">
-          <div class="cp-name">${esc(c.description || '(sem descrição)')} ${c.code ? `<span class="cp-code">${esc(c.code)}</span>` : '<span class="cp-badge">sem código (oferta)</span>'}</div>
-          <div class="cp-meta">${until ? `válido até ${until}` : 'sem data de validade informada'}${parsed ? ` · <span style="color:var(--accent)">${esc(parsed)}</span>` : ''}${c.exclusive ? ' · exclusivo seu' : ''}</div>
-          ${c.restriction ? `<div class="cp-meta"><b>Restrição:</b> ${esc(c.restriction)}</div>` : ''}
-        </div>
-        <div class="cp-actions">
-          ${c.code ? `<button data-aw-code="${i}">Copiar código</button>` : ''}
-          <button data-aw-msg="${i}">Copiar mensagem</button>
-          <button data-aw-wa="${i}">WhatsApp</button>
-        </div>
-      </div>`;
-    }).join('') + `</div>`;
-}
-
-async function awFetch() {
-  const btn = F('aw-btn'); const msg = F('aw-msg');
-  btn.disabled = true; btn.textContent = 'Buscando...';
-  msg.textContent = ''; msg.className = 'msg'; F('aw-result').innerHTML = '';
-  try {
-    awRender(await couponApi({ action: 'coupons_awin_fetch' }));
-  } catch (err) {
-    msg.textContent = `Erro: ${err.message}`; msg.className = 'msg error';
-  } finally {
-    btn.disabled = false; btn.textContent = 'Buscar cupons da Riachuelo';
-  }
-}
-
-F('aw-btn').addEventListener('click', awFetch);
-F('aw-result').addEventListener('click', (e) => {
-  const b = e.target.closest('button');
-  if (!b) return;
-  const d = b.dataset;
-  if (d.awCode !== undefined) nsCopy(b, awCoupons[d.awCode].code);
-  else if (d.awMsg !== undefined) nsCopy(b, awMessage(awCoupons[d.awMsg]));
-  else if (d.awWa !== undefined) window.open(`https://wa.me/?text=${encodeURIComponent(awMessage(awCoupons[d.awWa]))}`, '_blank');
 });
