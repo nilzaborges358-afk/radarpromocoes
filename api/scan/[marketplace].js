@@ -10,7 +10,7 @@ const { loadRecentIndex } = require('../../src/core/dedupe');
 // Promoção = o ML informa preço "de" maior que o atual (sale_price) OU o preço atual caiu contra o
 // que o sistema já viu nos últimos 7 dias (mesmo método da Shopee/Netshoes).
 const ML_CONCURRENCY = 4;
-const ML_MIN_DROP_PCT = 5;
+const ML_MIN_DROP_PCT = 3;   // era 5 — mais produtos vigiados entram como promoção
 const ML_HISTORY_DAYS = 7;
 // Descoberta automática por palavra-chave (catálogo do ML): quantos produtos pedir por palavra, de
 // quantas "páginas" sortear (variedade a cada busca) e o teto total por busca.
@@ -18,7 +18,7 @@ const ML_DISCOVERY_PAGE_SIZE = 10;
 const ML_DISCOVERY_MAX_PAGE = 5;
 const ML_DISCOVERY_MAX_CANDIDATES = 200;
 const ML_DISCOVERY_CONCURRENCY = 8;
-const ML_DISCOVERY_MIN_DISCOUNT_PCT = 10;
+const ML_DISCOVERY_MIN_DISCOUNT_PCT = 7;  // era 10 — para voltar ao mais exigente, ponha 10
 
 const MIN_DISCOUNT_PCT = 10; // era 15 — baixei pra achar mais resultado em categorias mais de nicho
 
@@ -50,7 +50,7 @@ const NETSHOES_HISTORY_MIN_GAP_HOURS = 6; // não grava o mesmo produto de novo 
 // muitos vendedores deixam um preço de tabela inflado PARA SEMPRE, então ele aparece como "desconto"
 // em toda busca, sem nunca ter havido queda real. Por isso a Shopee agora usa o mesmo método da
 // Netshoes: só é promoção quando o preço ATUAL está abaixo do que o sistema já viu nos últimos 7 dias.
-const SHOPEE_MIN_DROP_PCT = 5;              // queda real mínima contra o histórico
+const SHOPEE_MIN_DROP_PCT = 3;              // queda real mínima contra o histórico (era 5)
 const SHOPEE_ACCEPT_LISTED_DISCOUNT = true;  // true = aceita também o "desconto de tabela" (marcado como tal; false = só queda comprovada)
 const SHOPEE_LISTED_MIN_PCT = 30;           // desconto de tabela mínimo para entrar (usado só se a linha acima for true)
 
@@ -262,6 +262,7 @@ async function discoverMlPromotions({ groups, ctx, startedAt, disc }) {
   const candidates = new Map(); // id -> { id, title, group }
   const tasks = [];
   for (const g of groups) for (const kw of g.keywords) tasks.push({ group: g, kw });
+  shuffle(tasks);
   for (const batch of chunk(tasks, 3)) {
     if (Date.now() - startedAt > SCAN_BUDGET_MS * 0.5) break; // metade do tempo para buscar, metade para conferir preços
     await Promise.all(
@@ -550,6 +551,7 @@ async function scanNetshoes(req, res) {
         tasks.push({ group, keyword });
       }
     }
+    shuffle(tasks);
 
     const startedAt = Date.now();
     const seenUrls = new Set();
@@ -669,6 +671,17 @@ function parsePrice(value) {
   }
   const n = parseFloat(s);
   return Number.isFinite(n) ? Math.round(n * 100) / 100 : null; // sempre 2 casas
+}
+
+// Embaralha a lista NO LUGAR. Com listas grandes de palavras-chave, o tempo de busca acaba antes de
+// chegar nas últimas — sem embaralhar, as mesmas palavras do fim da lista nunca eram buscadas.
+// Embaralhando, cada busca cobre palavras diferentes e, rodando algumas vezes, tudo é coberto.
+function shuffle(list) {
+  for (let i = list.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [list[i], list[j]] = [list[j], list[i]];
+  }
+  return list;
 }
 
 function chunk(list, size) {
@@ -913,7 +926,7 @@ async function scanShopee(req, res) {
     const seenUrls = new Set();
     const totals = { checked: 0, updated: 0, listedOnly: 0, withHistory: 0, trackedNow: 0, maxDrop: 0, changed: 0, duplicates: 0, historyError: null };
 
-    for (const group of groups || []) {
+    for (const group of shuffle([...(groups || [])])) {
       try {
         // Suporta várias palavras-chave por grupo, separadas por vírgula —
         // busca cada uma separadamente, pra trazer produtos de fato distintos
@@ -923,6 +936,7 @@ async function scanShopee(req, res) {
           .split(',')
           .map((k) => k.trim())
           .filter(Boolean);
+        shuffle(keywords);
 
         const perKeywordLimit = Math.max(10, Math.floor(40 / keywords.length));
 
