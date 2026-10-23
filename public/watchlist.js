@@ -35,9 +35,10 @@ function mergeGroupsByName(rows) {
   const map = new Map();
   (rows || []).forEach((g) => {
     const key = normKey(g.name);
-    if (!map.has(key)) map.set(key, { key, name: cleanText(g.name), ids: [], keywords: [] });
+    if (!map.has(key)) map.set(key, { key, name: cleanText(g.name), ids: [], keywords: [], marketplaces: null });
     const merged = map.get(key);
     merged.ids.push(g.id);
+    if (!merged.marketplaces && Array.isArray(g.marketplaces) && g.marketplaces.length) merged.marketplaces = g.marketplaces;
     // Se as linhas diferem só em maiúscula/minúscula, mostra a variante com inicial maiúscula.
     if (!/[A-ZÀ-Þ]/.test(merged.name) && /[A-ZÀ-Þ]/.test(cleanText(g.name))) merged.name = cleanText(g.name);
     String(g.search_keyword || g.name || '').split(/[,;\n\r]+/).map(cleanText).filter(Boolean).forEach((kw) => {
@@ -52,6 +53,49 @@ function renderGroupSelect() {
   select.innerHTML =
     `<option value="">Sem grupo</option>` +
     mergedGroups.map((g) => `<option value="${g.ids[0]}">${escapeHtml(g.name)}</option>`).join('');
+}
+
+// Marketplaces que buscam por palavra-chave. Grupo sem lista salva (os antigos) roda em todos.
+const MP_OPTIONS = [
+  { slug: 'shopee', name: 'Shopee' },
+  { slug: 'netshoes', name: 'Netshoes' },
+  { slug: 'mercadolivre', name: 'Mercado Livre' },
+];
+
+function groupRunsOn(g, slug) {
+  return !Array.isArray(g.marketplaces) || g.marketplaces.length === 0 || g.marketplaces.includes(slug);
+}
+
+async function saveGroupMarketplaces(key) {
+  const group = mergedGroups.find((g) => g.key === key);
+  if (!group) return;
+  const boxes = [...document.querySelectorAll('[data-gmp-key]')].filter((cb) => cb.dataset.gmpKey === key);
+  const chosen = boxes.filter((cb) => cb.checked).map((cb) => cb.value);
+  const msg = document.getElementById('groupMsg');
+
+  if (!chosen.length) {
+    msg.textContent = 'Deixe pelo menos um marketplace marcado no grupo.';
+    renderGroupsList();
+    return;
+  }
+  boxes.forEach((cb) => { cb.disabled = true; });
+  try {
+    const res = await fetch('/api/groups', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'set_marketplaces', ids: group.ids, marketplaces: chosen }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Falha ao salvar');
+    group.marketplaces = chosen;
+    const names = MP_OPTIONS.filter((mp) => chosen.includes(mp.slug)).map((mp) => mp.name).join(', ');
+    msg.textContent = `"${group.name}" agora roda em: ${names}.`;
+  } catch (err) {
+    msg.textContent = `Erro: ${err.message}`;
+    await load();
+    return;
+  }
+  renderGroupsList();
 }
 
 function renderGroupsList() {
@@ -70,10 +114,19 @@ function renderGroupsList() {
               ? `<button class="kw-remove" title="Tirar essa palavra-chave" data-remove-kw="${escapeHtml(g.key)}" data-kw-index="${i}">×</button>`
               : ''}</span>`).join('')}
         </div>
+        <div class="g-mps">
+          <span class="g-mps-label">Roda em:</span>
+          ${MP_OPTIONS.map((mp) => `
+            <label class="mp-check"><input type="checkbox" data-gmp-key="${escapeHtml(g.key)}" value="${mp.slug}" ${groupRunsOn(g, mp.slug) ? 'checked' : ''} /> ${mp.name}</label>`).join('')}
+        </div>
       </div>
       <button class="remove" data-remove-group="${escapeHtml(g.key)}">Remover grupo</button>
     </div>
   `).join('');
+
+  container.querySelectorAll('[data-gmp-key]').forEach((cb) => {
+    cb.addEventListener('change', () => saveGroupMarketplaces(cb.dataset.gmpKey));
+  });
 
   container.querySelectorAll('[data-remove-group]').forEach((btn) => {
     btn.addEventListener('click', () => removeGroup(btn.dataset.removeGroup));
@@ -323,6 +376,8 @@ async function createGroup() {
   const msg = document.getElementById('groupMsg');
 
   if (!name || !keyword) { msg.textContent = 'Preencha o nome e a palavra-chave antes de criar.'; return; }
+  const marketplaces = [...document.querySelectorAll('.ng-mp:checked')].map((cb) => cb.value);
+  if (!marketplaces.length) { msg.textContent = 'Marque pelo menos um marketplace para o grupo rodar.'; return; }
 
   btn.disabled = true;
   btn.textContent = 'Criando...';
@@ -331,7 +386,7 @@ async function createGroup() {
     const res = await fetch('/api/groups', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, search_keyword: keyword }),
+      body: JSON.stringify({ name, search_keyword: keyword, marketplaces }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Falha ao criar');
