@@ -8,6 +8,8 @@ const netshoesClient = require('../src/integrations/netshoes/client');
 //        search_keyword aceita VÁRIAS palavras de uma vez, separadas por vírgula, ponto e vírgula ou quebra de linha
 // POST   /api/groups  { action: 'test', keyword } -> testa uma busca (Shopee + Netshoes + Mercado Livre) sem salvar
 // POST   /api/groups  { action: 'remove_keyword', ids, keyword } -> tira UMA palavra-chave de um grupo
+// POST   /api/groups  { action: 'set_marketplaces', ids, marketplaces: ['shopee', ...] } -> em quais marketplaces o grupo roda
+//        (criar grupo também aceita { marketplaces }; vazio/ausente = todos)
 // DELETE /api/groups?id=a,b,c                 -> remove o grupo (todas as linhas com esses ids)
 module.exports = async function handler(req, res) {
   try {
@@ -31,10 +33,24 @@ module.exports = async function handler(req, res) {
         return;
       }
 
+      if (body.action === 'set_marketplaces') {
+        await setMarketplaces(res, body);
+        return;
+      }
+
       const { name, search_keyword } = body;
       if (!name || !search_keyword) {
         res.status(400).json({ error: 'Preencha o nome do grupo e a palavra-chave de busca.' });
         return;
+      }
+
+      let chosenMarketplaces = null;
+      if (body.marketplaces !== undefined && body.marketplaces !== null) {
+        chosenMarketplaces = cleanMarketplaces(body.marketplaces);
+        if (!chosenMarketplaces.length) {
+          res.status(400).json({ error: 'Marque pelo menos um marketplace para o grupo rodar.' });
+          return;
+        }
       }
 
       const cleanName = normalizeText(name);
@@ -75,18 +91,19 @@ module.exports = async function handler(req, res) {
           merged: true,
           added: toAdd.length,
           group: data,
-          message: `Grupo "${normalizeText(primary.name)}" já existia — ${toAdd.length} palavra(s)-chave adicionada(s) a ele.`,
+          message: `Grupo "${normalizeText(primary.name)}" já existia — ${toAdd.length} palavra(s)-chave adicionada(s) a ele (os marketplaces dele continuam como estavam).`,
         });
         return;
       }
 
       const { data, error } = await supabaseAdmin
         .from('watch_groups')
-        .insert({ name: cleanName, search_keyword: newKeywords.join(', ') })
+        .insert({ name: cleanName, search_keyword: newKeywords.join(', '), ...(chosenMarketplaces ? { marketplaces: chosenMarketplaces } : {}) })
         .select()
         .single();
 
       if (error) {
+        if (/marketplaces/i.test(error.message || '')) throw new Error('A coluna "marketplaces" ainda não existe no banco — rode o SQL 0008_grupos_por_marketplace.sql no Supabase.');
         if (error.code === '23505') {
           res.status(400).json({ error: 'Já existe um grupo com esse nome.' });
           return;
@@ -117,6 +134,36 @@ module.exports = async function handler(req, res) {
     res.status(500).json({ error: `Erro no servidor: ${err.message}` });
   }
 };
+
+// Marketplaces em que um grupo pode rodar (os que buscam por palavra-chave).
+const GROUP_MARKETPLACES = ['mercadolivre', 'shopee', 'netshoes'];
+
+function cleanMarketplaces(list) {
+  const arr = Array.isArray(list) ? list : String(list || '').split(',');
+  return [...new Set(arr.map((v) => String(v).trim().toLowerCase()).filter((v) => GROUP_MARKETPLACES.includes(v)))];
+}
+
+// Muda em quais marketplaces um grupo roda (vale para todas as linhas do grupo "unificado").
+async function setMarketplaces(res, body) {
+  const ids = Array.isArray(body.ids) ? body.ids.filter(Boolean) : [];
+  const list = cleanMarketplaces(body.marketplaces);
+  if (!ids.length) {
+    res.status(400).json({ error: 'ids do grupo são obrigatórios.' });
+    return;
+  }
+  if (!list.length) {
+    res.status(400).json({ error: 'Deixe pelo menos um marketplace marcado.' });
+    return;
+  }
+  const { error } = await supabaseAdmin.from('watch_groups').update({ marketplaces: list }).in('id', ids);
+  if (error) {
+    if (/marketplaces/i.test(error.message || '')) {
+      throw new Error('A coluna "marketplaces" ainda não existe no banco — rode o SQL 0008_grupos_por_marketplace.sql no Supabase.');
+    }
+    throw new Error(error.message);
+  }
+  res.status(200).json({ ok: true, marketplaces: list });
+}
 
 function normalizeText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
