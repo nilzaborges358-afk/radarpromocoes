@@ -96,9 +96,7 @@ function init() {
   document.getElementById('scanModalConfirm').addEventListener('click', confirmScan);
   document.getElementById('scanSelectAll').addEventListener('click', () => setAllScanGroups(true));
   document.getElementById('scanSelectNone').addEventListener('click', () => setAllScanGroups(false));
-  document.querySelectorAll('input[name="scanMarketplace"]').forEach((radio) => {
-    radio.addEventListener('change', updateScanConfirmState);
-  });
+  document.getElementById('scanModalBack').addEventListener('click', () => { showScanStep('marketplace'); renderMarketplacePicks(); });
 
   loadFilterOptions();
   loadPromotions();
@@ -121,7 +119,11 @@ async function loadFilterOptions() {
   });
   if ([...mpSelect.options].some((o) => o.value === mpPrevValue)) mpSelect.value = mpPrevValue;
 
-  const { data: groups, error: groupError } = await client.from('watch_groups').select('id, name, search_keyword').order('name');
+  // "marketplaces" diz em quais marketplaces o grupo roda. Se a coluna ainda não existir (SQL 0008 não rodado), lê sem ela.
+  let { data: groups, error: groupError } = await client.from('watch_groups').select('id, name, search_keyword, marketplaces').order('name');
+  if (groupError) {
+    ({ data: groups, error: groupError } = await client.from('watch_groups').select('id, name, search_keyword').order('name'));
+  }
   if (groupError) { showFatalError(`Erro ao carregar grupos: ${groupError.message}`); return; }
 
   knownGroups = groups || [];
@@ -396,26 +398,100 @@ async function markStatus(id, status) {
   await loadPromotions();
 }
 
-function openScanModal() {
-  // Uma caixinha por GRUPO (nomes iguais viram um só) + "Sem grupo", todas marcadas por padrão.
-  // O valor de cada caixinha guarda todos os ids do grupo, separados por vírgula.
-  const container = document.getElementById('scanGroupsCheckboxes');
-  const groupOptions = [
-    ...mergeGroupsByName(knownGroups).map((g) => ({ value: g.ids.join(','), name: g.name })),
-    { value: 'none', name: 'Sem grupo' },
-  ];
+// ---------- busca em dois passos: 1) marketplace  2) só os grupos que rodam nele ----------
+let scanChoice = null;
+const SCAN_MARKETPLACES = ['shopee', 'netshoes', 'mercadolivre', 'amazon'];
 
-  container.innerHTML = groupOptions.map((g) => `
-    <label class="check-row">
-      <input type="checkbox" class="scan-group-checkbox" value="${escapeHtml(g.value)}" checked /> ${escapeHtml(g.name)}
-    </label>
-  `).join('');
+// Grupo sem lista de marketplaces (os antigos) roda em todos.
+function groupRunsOn(g, slug) {
+  const list = g && g.marketplaces;
+  return !Array.isArray(list) || list.length === 0 || list.includes(slug);
+}
 
-  document.querySelectorAll('input[name="scanMarketplace"]').forEach((r) => { r.checked = false; });
+function groupsFor(slug) {
+  return mergeGroupsByName(knownGroups.filter((g) => groupRunsOn(g, slug)));
+}
+
+function showScanStep(step) {
+  const isGroups = step === 'groups';
+  document.getElementById('scanStepMarketplace').style.display = isGroups ? 'none' : 'block';
+  document.getElementById('scanStepGroups').style.display = isGroups ? 'block' : 'none';
+  document.getElementById('scanModalBack').style.display = isGroups ? '' : 'none';
+  document.getElementById('scanModalConfirm').style.display = isGroups ? '' : 'none';
   const msg = document.getElementById('scanModalMsg');
   msg.textContent = '';
   msg.classList.remove('error');
-  updateScanConfirmState();
+  if (!isGroups) {
+    scanChoice = null;
+    document.getElementById('scanModalTitle').textContent = 'Buscar promoções';
+    document.getElementById('scanModalSub').textContent = 'Escolha o marketplace. Depois você marca só os grupos que fazem sentido para ele.';
+  }
+}
+
+function renderMarketplacePicks() {
+  const container = document.getElementById('scanMpPicks');
+  container.innerHTML = SCAN_MARKETPLACES.map((slug) => {
+    const label = MARKETPLACE_LABELS[slug] || { name: slug, color: '#888' };
+    const n = groupsFor(slug).length;
+    const hint = slug === 'amazon'
+      ? 'busca por categoria'
+      : slug === 'mercadolivre'
+        ? `${n} grupo${n === 1 ? '' : 's'} + produtos que você vigia`
+        : `${n} grupo${n === 1 ? '' : 's'} configurado${n === 1 ? '' : 's'}`;
+    return `
+      <button type="button" class="mp-pick" data-mp="${slug}">
+        <span class="mp-dotc" style="background:${label.color}; ${label.color === '#000000' ? 'box-shadow:0 0 0 1px var(--line-strong);' : ''}"></span>
+        <span class="mp-info">${escapeHtml(label.name)}<small>${hint}</small></span>
+        <span class="mp-go">›</span>
+      </button>`;
+  }).join('');
+  container.querySelectorAll('[data-mp]').forEach((btn) => {
+    btn.addEventListener('click', () => chooseScanMarketplace(btn.dataset.mp));
+  });
+}
+
+function chooseScanMarketplace(slug) {
+  scanChoice = slug;
+  const label = MARKETPLACE_LABELS[slug] || { name: slug };
+  showScanStep('groups');
+  // showScanStep('groups') não mexe em scanChoice; título/subtítulo ficam por conta daqui
+  document.getElementById('scanModalTitle').textContent = `Buscar na ${label.name}`;
+  document.getElementById('scanModalSub').textContent = 'Marque o que quer buscar agora. Só aparecem os grupos configurados para rodar neste marketplace.';
+
+  const container = document.getElementById('scanGroupsCheckboxes');
+  const selectLinks = document.querySelector('#scanStepGroups .select-links');
+
+  if (slug === 'amazon') {
+    selectLinks.style.display = 'none';
+    container.innerHTML = '<div class="scan-empty">A Amazon busca por categorias, não por grupos. É só clicar em Buscar.</div>';
+    return;
+  }
+  selectLinks.style.display = '';
+
+  const options = groupsFor(slug).map((g) => ({
+    value: g.ids.join(','),
+    name: g.name,
+    count: g.keywords.length,
+  }));
+  // No Mercado Livre existem também os produtos que você vigia, que podem estar sem grupo.
+  if (slug === 'mercadolivre') options.push({ value: 'none', name: 'Sem grupo (produtos vigiados)', count: null });
+
+  if (!options.length) {
+    container.innerHTML = `<div class="scan-empty">Nenhum grupo está configurado para rodar na ${escapeHtml(label.name)}. Vá em <b>Lista de vigilância</b> e marque a caixinha "${escapeHtml(label.name)}" no(s) grupo(s) que quiser.</div>`;
+    return;
+  }
+
+  container.innerHTML = options.map((g) => `
+    <label class="check-row">
+      <input type="checkbox" class="scan-group-checkbox" value="${escapeHtml(g.value)}" checked />
+      ${escapeHtml(g.name)}${g.count ? ` <span style="color:var(--muted); font-size:11.5px;">· ${g.count} palavra${g.count === 1 ? '' : 's'}</span>` : ''}
+    </label>
+  `).join('');
+}
+
+function openScanModal() {
+  showScanStep('marketplace');
+  renderMarketplacePicks();
   document.getElementById('scanModalOverlay').classList.add('show');
 }
 
@@ -427,13 +503,8 @@ function closeScanModal() {
   document.getElementById('scanModalOverlay').classList.remove('show');
 }
 
-function updateScanConfirmState() {
-  const selected = document.querySelector('input[name="scanMarketplace"]:checked');
-  document.getElementById('scanModalConfirm').disabled = !selected;
-}
-
 async function confirmScan() {
-  const marketplace = document.querySelector('input[name="scanMarketplace"]:checked')?.value;
+  const marketplace = scanChoice;
   if (!marketplace) return;
 
   // Cada caixinha pode carregar vários ids ("id1,id2,id3") — junta tudo numa lista só.
@@ -447,8 +518,8 @@ async function confirmScan() {
   msg.classList.remove('error');
   scanResult.classList.remove('error');
 
-  if (groupIds.length === 0) {
-    msg.textContent = 'Marque pelo menos um grupo (ou "Sem grupo") antes de buscar.';
+  if (groupIds.length === 0 && marketplace !== 'amazon') {
+    msg.textContent = 'Marque pelo menos um grupo antes de buscar.';
     msg.classList.add('error');
     return;
   }
