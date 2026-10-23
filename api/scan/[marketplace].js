@@ -97,6 +97,13 @@ function getGroupsParam(req) {
   return req.query.groups ? String(req.query.groups).split(',').filter(Boolean) : null;
 }
 
+// Cada grupo escolhe em quais marketplaces roda (coluna watch_groups.marketplaces).
+// Vazio/ausente = roda em todos (é o caso dos grupos antigos).
+function groupRunsOn(row, slug) {
+  const list = row && row.marketplaces;
+  return !Array.isArray(list) || list.length === 0 || list.includes(slug);
+}
+
 // Tudo que tem o MESMO nome vira UM grupo só, com todas as palavras-chave somadas
 // (sem repetir). Assim 30 linhas "Beleza" viram 1 grupo "Beleza" — e a mesma palavra
 // nunca é buscada duas vezes.
@@ -141,7 +148,7 @@ async function scanMercadoLivre(req, res) {
     const selectedGroups = groupsParam
       ? (allGroups || []).filter((g) => groupsParam.includes(g.id))
       : allGroups || [];
-    const discoveryGroups = mergeGroupsByName(selectedGroups).filter((g) => g.keywords.length > 0);
+    const discoveryGroups = mergeGroupsByName(selectedGroups.filter((g) => groupRunsOn(g, 'mercadolivre'))).filter((g) => g.keywords.length > 0);
 
     if (products.length === 0 && discoveryGroups.length === 0) {
       res.status(200).json({
@@ -522,7 +529,8 @@ async function scanNetshoes(req, res) {
     const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
     const groupsParam = getGroupsParam(req);
     const selectedRows = groupsParam ? (allGroups || []).filter((g) => groupsParam.includes(g.id)) : allGroups;
-    const groups = mergeGroupsByName(selectedRows);
+    // Só entram grupos configurados para rodar na Netshoes.
+    const groups = mergeGroupsByName((selectedRows || []).filter((g) => groupRunsOn(g, 'netshoes')));
 
     // Produtos já salvos nos últimos 14 dias (para não repetir o mesmo produto de outro vendedor).
     const recent = await loadRecentIndex(supabaseAdmin, marketplace.id);
@@ -535,7 +543,7 @@ async function scanNetshoes(req, res) {
         productsChecked: 0,
         promotionsFound: 0,
         errors: [],
-        note: 'Nenhum grupo selecionado — a Netshoes busca por palavra-chave, então marque pelo menos um grupo (não vale só "Sem grupo").',
+        note: 'Nenhum grupo para buscar na Netshoes — ela busca por palavra-chave, então marque pelo menos um grupo que esteja configurado para rodar na Netshoes (Lista de vigilância > caixinhas "Roda em").',
       });
       return;
     }
@@ -913,7 +921,8 @@ async function scanShopee(req, res) {
     const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
     const groupsParam = getGroupsParam(req);
     const selectedRows = groupsParam ? (allGroups || []).filter((g) => groupsParam.includes(g.id)) : allGroups;
-    const groups = mergeGroupsByName(selectedRows);
+    // Só entram grupos configurados para rodar na Shopee.
+    const groups = mergeGroupsByName((selectedRows || []).filter((g) => groupRunsOn(g, 'shopee')));
 
     // Produtos já salvos nos últimos 14 dias: a Shopee devolve o MESMO produto em vários anúncios
     // (um por vendedor, cada um com link diferente) — comparar só o link não pega isso.
