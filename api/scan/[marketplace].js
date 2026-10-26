@@ -280,7 +280,7 @@ async function discoverMlPromotions({ groups, ctx, startedAt, disc }) {
             q: kw, token: ctx.token, limit: ML_DISCOVERY_PAGE_SIZE, offset,
           });
           disc.searched += 1;
-          for (const r of list) if (!candidates.has(r.id)) candidates.set(r.id, { ...r, group });
+          for (const r of list) if (!candidates.has(r.id)) candidates.set(r.id, { ...r, group, keyword: kw });
         } catch (err) {
           disc.searchErrors.push(`"${kw}": ${err.message}`);
           if (err.status) disc.statuses[err.status] = (disc.statuses[err.status] || 0) + 1;
@@ -331,10 +331,11 @@ async function discoverMlPromotions({ groups, ctx, startedAt, disc }) {
             .limit(1);
           if (rows && rows[0]) return;
 
-          await supabaseAdmin.from('promotions').insert({
+          await insertPromotions({
             marketplace_id: ctx.marketplaceId,
             product_id: product.id,
             watch_group_id: cand.group.id,
+            matched_keyword: cand.keyword,
             title: product.title,
             image_url: product.image_url,
             original_url: product.permalink,
@@ -584,7 +585,7 @@ async function scanNetshoes(req, res) {
           done += 1;
           itemsSeen += items.length;
           if (!items.length && items.rawSample && emptySamples.length < 1) emptySamples.push(`"${task.keyword}": ${items.rawSample}`);
-          const result = await processNetshoesItems(items, marketplace.id, task.group, publisherId, mid, seenUrls, couponCtx, dedupeCtx);
+          const result = await processNetshoesItems(items, marketplace.id, task.group, publisherId, mid, seenUrls, couponCtx, dedupeCtx, task.keyword);
           found += result.found;
           withDiscount += result.withDiscount;
           totals.withSale += result.stats.withSale;
@@ -684,6 +685,23 @@ function parsePrice(value) {
 // Embaralha a lista NO LUGAR. Com listas grandes de palavras-chave, o tempo de busca acaba antes de
 // chegar nas últimas — sem embaralhar, as mesmas palavras do fim da lista nunca eram buscadas.
 // Embaralhando, cada busca cobre palavras diferentes e, rodando algumas vezes, tudo é coberto.
+// Salva promoção(ões) novas. Guarda também a palavra-chave que a achou (matched_keyword).
+// Se a coluna ainda não existir no banco (SQL 0010 não rodado), salva igual, só sem a palavra.
+async function insertPromotions(rows) {
+  const many = Array.isArray(rows);
+  let { error } = await supabaseAdmin.from('promotions').insert(rows);
+  if (error && /matched_keyword/i.test(error.message || '')) {
+    const strip = ({ matched_keyword, ...rest }) => rest;
+    ({ error } = await supabaseAdmin.from('promotions').insert(many ? rows.map(strip) : strip(rows)));
+  }
+  return { error };
+}
+
+// Para promoções já salvas que ainda não têm palavra-chave: preenche. (Só se a coluna existir.)
+function keywordPatch(existing, keyword) {
+  return ('matched_keyword' in existing && !existing.matched_keyword && keyword) ? { matched_keyword: keyword } : {};
+}
+
 function shuffle(list) {
   for (let i = list.length - 1; i > 0; i -= 1) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -712,7 +730,7 @@ function median(values) {
 //   preço normal = mediana dos preços registrados nos últimos 7 dias
 //                  (se o produto ainda não tem histórico: o preço "de" da Netshoes)
 //   é promoção quando preço atual < preço normal em pelo menos NETSHOES_MIN_DROP_PCT.
-async function processNetshoesItems(items, marketplaceId, group, publisherId, mid, seenUrls, couponCtx, dedupeCtx) {
+async function processNetshoesItems(items, marketplaceId, group, publisherId, mid, seenUrls, couponCtx, dedupeCtx, keyword) {
   const stats = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0, changed: 0, rose: 0, oldestMs: 0, duplicates: 0 };
 
   // 1) Lê os itens (um por link, mesmo que apareça em mais de uma palavra-chave)
@@ -832,7 +850,7 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
   for (const part of chunk(candidates.map((c) => c.productUrl), 10)) {
     const { data, error } = await supabaseAdmin
       .from('promotions')
-      .select('id, original_url, watch_group_id, current_price, status')
+      .select('*')
       .eq('marketplace_id', marketplaceId)
       .in('original_url', part);
     if (error) throw new Error(`banco de dados: ${error.message}`);
@@ -857,6 +875,7 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
       toInsert.push({
         marketplace_id: marketplaceId,
         watch_group_id: group.id,
+        matched_keyword: keyword || null,
         title: c.title,
         image_url: c.imageUrl,
         original_url: c.productUrl,
@@ -873,7 +892,7 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
   }
 
   if (toInsert.length) {
-    const { error } = await supabaseAdmin.from('promotions').insert(toInsert);
+    const { error } = await insertPromotions(toInsert);
     if (error) throw new Error(`banco de dados: ${error.message}`);
   }
 
@@ -886,6 +905,7 @@ async function processNetshoesItems(items, marketplaceId, group, publisherId, mi
         discount_rate: c.discountRate,
         source: c.source || 'netshoes_rakuten_api',
         watch_group_id: existing.watch_group_id || group.id,
+        ...keywordPatch(existing, keyword),
         last_seen_at: now,
         // Refaz o link de afiliado (corrige links antigos gerados com ID errado), exceto os que você já marcou como afiliados.
         ...(existing.status === 'AFFILIATED' ? {} : { affiliate_url: netshoesClient.buildAffiliateLink(publisherId, mid, c.productUrl) }),
@@ -1117,7 +1137,7 @@ async function processShopeeOffers(offers, marketplaceId, group, keyword, creds,
   for (const part of chunk(candidates.map((c) => c.productUrl), 10)) {
     const { data, error } = await supabaseAdmin
       .from('promotions')
-      .select('id, original_url, watch_group_id')
+      .select('*')
       .eq('marketplace_id', marketplaceId)
       .in('original_url', part);
     if (error) throw new Error(`banco de dados: ${error.message}`);
@@ -1138,6 +1158,7 @@ async function processShopeeOffers(offers, marketplaceId, group, keyword, creds,
           discount_rate: c.discountRate,
           source: c.source,
           watch_group_id: existing.watch_group_id || group.id,
+          ...keywordPatch(existing, keyword),
           last_seen_at: now,
         })
         .eq('id', existing.id);
@@ -1161,9 +1182,10 @@ async function processShopeeOffers(offers, marketplaceId, group, keyword, creds,
       });
     }
 
-    const { error } = await supabaseAdmin.from('promotions').insert({
+    const { error } = await insertPromotions({
       marketplace_id: marketplaceId,
       watch_group_id: group.id,
+      matched_keyword: keyword || null,
       title: c.title,
       image_url: c.imageUrl,
       original_url: c.productUrl,
