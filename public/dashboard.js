@@ -57,18 +57,21 @@ function init() {
     });
   });
 
+  // Cascata: Marketplace -> Grupo -> Palavra-chave. Cada um só oferece o que existe no nível de cima.
   document.getElementById('marketplaceFilter').addEventListener('change', (e) => {
     currentMarketplace = e.target.value;
+    currentKeyword = 'ALL';
+    refreshGroupKeywordOptions();
     render();
   });
   document.getElementById('groupFilter').addEventListener('change', (e) => {
     currentGroup = e.target.value;
+    currentKeyword = 'ALL';
     refreshGroupKeywordOptions();
     render();
   });
   document.getElementById('keywordFilter').addEventListener('change', (e) => {
     currentKeyword = e.target.value;
-    refreshGroupKeywordOptions();
     render();
   });
   document.getElementById('dateFilter').addEventListener('change', (e) => {
@@ -157,54 +160,52 @@ function mergeGroupsByName(rows) {
   return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
 }
 
-// Filtros em cascata: o que está selecionado num dropdown restringe as opções do outro.
-// - Escolheu um grupo  -> o filtro de palavra-chave só lista as palavras-chave daquele grupo.
-// - Escolheu uma palavra-chave -> o filtro de grupo só lista os grupos que usam essa palavra.
-// - Nada escolhido -> aparece tudo.
+// ---------- Filtros em cascata: Marketplace -> Grupo -> Palavra-chave ----------
+// - Marketplace escolhido -> o filtro de grupo só lista os grupos que rodam nele.
+// - Grupo escolhido       -> o filtro de palavra-chave lista, uma por uma (como no cadastro), as palavras daquele grupo.
+// - Sem grupo escolhido   -> o filtro de palavra-chave fica travado (escolha um grupo primeiro).
+const KEYWORD_MARKETPLACES = ['shopee', 'netshoes', 'mercadolivre'];
+
+function groupsForCurrentMarketplace() {
+  const rows = (currentMarketplace === 'ALL' || !KEYWORD_MARKETPLACES.includes(currentMarketplace))
+    ? knownGroups
+    : knownGroups.filter((g) => groupRunsOn(g, currentMarketplace));
+  return mergeGroupsByName(rows);
+}
+
 function refreshGroupKeywordOptions() {
   const groupSelect = document.getElementById('groupFilter');
   const keywordSelect = document.getElementById('keywordFilter');
+  const groups = groupsForCurrentMarketplace();
 
-  const groupsForKeywordList = currentGroup === 'ALL'
-    ? knownGroups
-    : knownGroups.filter((g) => normKey(g.name) === currentGroup);
-  const groupsForGroupList = currentKeyword === 'ALL'
-    ? knownGroups
-    : knownGroups.filter((g) => normKey(displayKeyword(g)) === currentKeyword);
+  // Se o grupo escolhido não roda no marketplace escolhido, volta para "Todos".
+  if (currentGroup !== 'ALL' && !groups.some((g) => g.key === currentGroup)) { currentGroup = 'ALL'; currentKeyword = 'ALL'; }
 
-  const groupOptions = new Map();
-  groupsForGroupList.forEach((g) => { if (!groupOptions.has(normKey(g.name))) groupOptions.set(normKey(g.name), g.name); });
-  const keywordOptions = new Map();
-  groupsForKeywordList.forEach((g) => { if (!keywordOptions.has(normKey(displayKeyword(g)))) keywordOptions.set(normKey(displayKeyword(g)), displayKeyword(g)); });
+  groupSelect.innerHTML = '<option value="ALL">Todos</option>' + groups.map((g) =>
+    `<option value="${escapeHtml(g.key)}">${escapeHtml(g.name)} (${g.keywords.length})</option>`).join('');
+  groupSelect.value = currentGroup;
 
-  // Se a seleção atual deixou de existir (grupo apagado, etc.), volta para "Todos".
-  if (currentGroup !== 'ALL' && !knownGroups.some((g) => normKey(g.name) === currentGroup)) currentGroup = 'ALL';
-  if (currentKeyword !== 'ALL' && !knownGroups.some((g) => normKey(displayKeyword(g)) === currentKeyword)) currentKeyword = 'ALL';
-
-  fillSelect(groupSelect, groupOptions, currentGroup);
-  fillSelect(keywordSelect, keywordOptions, currentKeyword);
+  const chosen = groups.find((g) => g.key === currentGroup);
+  if (!chosen) {
+    currentKeyword = 'ALL';
+    keywordSelect.innerHTML = '<option value="ALL">Escolha um grupo primeiro</option>';
+    keywordSelect.disabled = true;
+    keywordSelect.title = 'Escolha um grupo para filtrar pelas palavras-chave dele';
+    return;
+  }
+  const kws = [...chosen.keywords].sort((a, b) => a.localeCompare(b, 'pt-BR'));
+  if (currentKeyword !== 'ALL' && !kws.some((k) => normKey(k) === currentKeyword)) currentKeyword = 'ALL';
+  keywordSelect.innerHTML = `<option value="ALL">Todas as ${kws.length} palavras</option>` + kws.map((k) =>
+    `<option value="${escapeHtml(normKey(k))}">${escapeHtml(k)}</option>`).join('');
+  keywordSelect.value = currentKeyword;
+  keywordSelect.disabled = false;
+  keywordSelect.title = '';
 }
 
-function fillSelect(select, optionsMap, selected) {
-  select.innerHTML = '<option value="ALL">Todos</option>';
-  [...optionsMap.entries()].sort((a, b) => a[1].localeCompare(b[1], 'pt-BR')).forEach(([value, label]) => {
-    const opt = document.createElement('option');
-    opt.value = value;
-    opt.textContent = label;
-    select.appendChild(opt);
-  });
-  select.value = optionsMap.has(selected) ? selected : 'ALL';
-}
-
-// IDs dos grupos que combinam com o grupo e/ou palavra-chave escolhidos.
+// IDs de banco do grupo escolhido (um grupo "unificado" pode ter várias linhas com o mesmo nome).
 function matchingGroupIds() {
-  if (currentGroup === 'ALL' && currentKeyword === 'ALL') return null;
-  return new Set(
-    knownGroups
-      .filter((g) => (currentGroup === 'ALL' || normKey(g.name) === currentGroup)
-        && (currentKeyword === 'ALL' || normKey(displayKeyword(g)) === currentKeyword))
-      .map((g) => g.id)
-  );
+  if (currentGroup === 'ALL') return null;
+  return new Set(knownGroups.filter((g) => normKey(g.name) === currentGroup).map((g) => g.id));
 }
 
 async function loadPromotions() {
@@ -241,6 +242,7 @@ function render() {
   if (currentMarketplace !== 'ALL') base = base.filter((p) => p.marketplaces?.slug === currentMarketplace);
   const groupIds = matchingGroupIds();
   if (groupIds) base = base.filter((p) => p.watch_group_id && groupIds.has(p.watch_group_id));
+  if (currentKeyword !== 'ALL') base = base.filter((p) => normKey(p.matched_keyword || '') === currentKeyword);
   base = applyDateFilter(base);
 
   // O mesmo produto vendido por vários vendedores aparece UMA vez só (a mais barata, ou a que você já afiliou),
@@ -351,6 +353,8 @@ function renderCard(promo) {
   const slug = promo.marketplaces?.slug;
   const label = MARKETPLACE_LABELS[slug] || { name: promo.marketplaces?.name || 'Marketplace', color: '#444', textColor: '#fff' };
   const groupName = promo.watch_groups?.name;
+  const keyword = (promo.matched_keyword || '').trim();
+  const kwTip = keyword ? `${groupName ? `Grupo: ${groupName} · ` : ''}Palavra-chave que achou este produto: ${keyword}` : '';
   const detectedAt = new Date(promo.detected_at).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
   const discount = promo.discount_rate ? `-${Math.round(promo.discount_rate)}%` : '';
 
@@ -365,6 +369,7 @@ function renderCard(promo) {
       </div>
       <div class="card-body">
         <div class="card-title">${escapeHtml(promo.title)}</div>
+        ${keyword ? `<div class="kw-pill" title="${escapeHtml(kwTip)}"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><span>${escapeHtml(keyword)}</span></div>` : ''}
         ${promo._dupCount ? `<div class="dup-note">+${promo._dupCount} anúncio${promo._dupCount > 1 ? 's' : ''} igual${promo._dupCount > 1 ? 'is' : ''} de outro${promo._dupCount > 1 ? 's' : ''} vendedor${promo._dupCount > 1 ? 'es' : ''} (mostrando o mais barato)</div>` : ''}
         <div class="price-row">
           <span class="price-current">R$ ${formatPrice(promo.current_price)}</span>
