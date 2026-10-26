@@ -59,6 +59,11 @@
     padding:6px 10px; font-family: var(--font-body); font-size:12.5px;
   }
   #customDateRange.show { display:flex !important; }
+  .filters select { max-width:240px; text-overflow:ellipsis; }
+  .filters select:disabled { opacity:0.55; cursor:not-allowed; }
+  .kw-pill { display:inline-flex; align-self:flex-start; width:fit-content; align-items:center; gap:5px; max-width:100%; margin-top:6px; padding:2px 9px; border-radius:999px; font-size:10.5px; font-weight:500; letter-spacing:0.01em; color: var(--accent); background: color-mix(in srgb, var(--accent) 11%, transparent); border:1px solid color-mix(in srgb, var(--accent) 28%, transparent); cursor:default; }
+  .kw-pill svg { flex:none; }
+  .kw-pill span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .filters .clear-btn { font-size:12px; color: var(--muted); background:none; border:none; cursor:pointer; text-decoration:underline; }
 
   #fatalError { display:none; margin:24px 32px; padding:16px 18px; background:#2a1712; border:1px solid var(--bad); color:#ffcfc2; font-size:13px; line-height:1.5; }
@@ -198,7 +203,7 @@
 
   <div id="fatalError"></div>
   <div id="grid"></div>
-  <div id="empty" style="display:none">Nenhuma promoção por aqui ainda. Clique em "Buscar promoções agora" no topo.</div>
+  <div id="empty" style="display:none">Nenhuma promoção por aqui com esses filtros. Clique em "Buscar promoções agora" no topo.<div style="font-size:11.5px; margin-top:8px; color:var(--muted);">Obs.: promoções achadas antes da atualização das palavras-chave não têm palavra registrada, então só aparecem com "Todas as palavras".</div></div>
 
   <div class="modal-overlay" id="scanModalOverlay">
     <div class="modal-box">
