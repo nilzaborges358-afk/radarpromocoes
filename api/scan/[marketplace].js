@@ -31,6 +31,10 @@ const SHOPEE_SORT_ROTATION = [1, 2, 5];
 // Passou disso, a busca para de abrir novas consultas e avisa quantas ficaram pra próxima.
 const SCAN_BUDGET_MS = 48000;
 const NETSHOES_CONCURRENCY = 3;
+// Shopee: quantos produtos pedir POR palavra-chave (fixo — antes era 40 dividido pelo nº de palavras do grupo,
+// então quanto mais palavras, menos produtos cada uma trazia) e quantas palavras buscar ao mesmo tempo.
+const SHOPEE_PER_KEYWORD_LIMIT = 40;
+const SHOPEE_CONCURRENCY = 3;
 // Quantos produtos pedir por palavra-chave e de quantas páginas sortear. Antes eram só 30 por
 // palavra (sempre os mesmos 30 do topo) — por isso o total parecia "fixo" em ~120 produtos.
 const NETSHOES_PAGE_SIZE = 100;
@@ -97,6 +101,28 @@ function getGroupsParam(req) {
   return req.query.groups ? String(req.query.groups).split(',').filter(Boolean) : null;
 }
 
+// Lote de palavras-chave escolhido pelo painel (null = todas as palavras dos grupos escolhidos).
+// O painel manda as palavras em lotes pequenos, para nenhuma ficar de fora por limite de tempo.
+function getKeywordsParam(req) {
+  const raw = req.method === 'POST'
+    ? (req.body && req.body.keywords)
+    : (req.query.keywords ? String(req.query.keywords).split('|') : null);
+  if (!Array.isArray(raw)) return null;
+  const set = new Set(raw.map(normKey).filter(Boolean));
+  return set.size ? set : null;
+}
+
+// Mantém só as palavras do lote dentro de cada grupo (e descarta grupos que ficaram sem palavra).
+function filterGroupKeywords(groups, keywordSet) {
+  if (!keywordSet) return groups;
+  return (groups || [])
+    .map((g) => {
+      const kws = g.keywords.filter((k) => keywordSet.has(normKey(k)));
+      return { ...g, keywords: kws, search_keyword: kws.join(', ') };
+    })
+    .filter((g) => g.keywords.length > 0);
+}
+
 // Cada grupo escolhe em quais marketplaces roda (coluna watch_groups.marketplaces).
 // Vazio/ausente = roda em todos (é o caso dos grupos antigos).
 function groupRunsOn(row, slug) {
@@ -139,7 +165,10 @@ async function scanMercadoLivre(req, res) {
       .eq('marketplace_id', marketplace.id);
 
     const groupsParam = getGroupsParam(req);
-    const products = groupsParam
+    const keywordSet = getKeywordsParam(req);
+    // Em lotes, os produtos vigiados só são conferidos no primeiro lote (o painel manda products:false nos demais).
+    const includeProducts = !(req.method === 'POST' && req.body && req.body.products === false);
+    const products = !includeProducts ? [] : groupsParam
       ? (allProducts || []).filter((p) => groupsParam.includes(p.watch_group_id || 'none'))
       : allProducts || [];
 
@@ -148,7 +177,7 @@ async function scanMercadoLivre(req, res) {
     const selectedGroups = groupsParam
       ? (allGroups || []).filter((g) => groupsParam.includes(g.id))
       : allGroups || [];
-    const discoveryGroups = mergeGroupsByName(selectedGroups.filter((g) => groupRunsOn(g, 'mercadolivre'))).filter((g) => g.keywords.length > 0);
+    const discoveryGroups = filterGroupKeywords(mergeGroupsByName(selectedGroups.filter((g) => groupRunsOn(g, 'mercadolivre'))), keywordSet).filter((g) => g.keywords.length > 0);
 
     if (products.length === 0 && discoveryGroups.length === 0) {
       res.status(200).json({
@@ -203,7 +232,7 @@ async function scanMercadoLivre(req, res) {
     }
 
     // ----- Descoberta automática por palavra-chave (o ML bloqueia /sites/MLB/search; usa o catálogo) -----
-    const disc = { searched: 0, candidates: 0, checked: 0, found: 0, searchErrors: [], statuses: {}, reasons: {} };
+    const disc = { searched: 0, candidates: 0, checked: 0, found: 0, searchErrors: [], statuses: {}, reasons: {}, skippedKeywords: [] };
     if (discoveryGroups.length > 0 && Date.now() - startedAt < SCAN_BUDGET_MS) {
       await discoverMlPromotions({ groups: discoveryGroups, ctx, startedAt, disc });
       stats.found += disc.found;
@@ -256,6 +285,8 @@ async function scanMercadoLivre(req, res) {
       ok: true,
       productsChecked: stats.checked + disc.checked,
       promotionsFound: stats.found,
+      keywordsSearched: disc.searched,
+      skippedKeywords: disc.skippedKeywords,
       errors: stats.errors,
       note: notes.join(' ') || undefined,
     });
@@ -271,7 +302,10 @@ async function discoverMlPromotions({ groups, ctx, startedAt, disc }) {
   for (const g of groups) for (const kw of g.keywords) tasks.push({ group: g, kw });
   shuffle(tasks);
   for (const batch of chunk(tasks, 3)) {
-    if (Date.now() - startedAt > SCAN_BUDGET_MS * 0.5) break; // metade do tempo para buscar, metade para conferir preços
+    if (Date.now() - startedAt > SCAN_BUDGET_MS * 0.5) { // metade do tempo para buscar, metade para conferir preços
+      batch.forEach((t) => disc.skippedKeywords.push(t.kw));
+      continue;
+    }
     await Promise.all(
       batch.map(async ({ group, kw }) => {
         const offset = Math.floor(Math.random() * ML_DISCOVERY_MAX_PAGE) * ML_DISCOVERY_PAGE_SIZE;
@@ -530,8 +564,8 @@ async function scanNetshoes(req, res) {
     const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
     const groupsParam = getGroupsParam(req);
     const selectedRows = groupsParam ? (allGroups || []).filter((g) => groupsParam.includes(g.id)) : allGroups;
-    // Só entram grupos configurados para rodar na Netshoes.
-    const groups = mergeGroupsByName((selectedRows || []).filter((g) => groupRunsOn(g, 'netshoes')));
+    // Só entram grupos configurados para rodar na Netshoes (e, se o painel mandou um lote, só as palavras do lote).
+    const groups = filterGroupKeywords(mergeGroupsByName((selectedRows || []).filter((g) => groupRunsOn(g, 'netshoes'))), getKeywordsParam(req));
 
     // Produtos já salvos nos últimos 14 dias (para não repetir o mesmo produto de outro vendedor).
     const recent = await loadRecentIndex(supabaseAdmin, marketplace.id);
@@ -571,6 +605,7 @@ async function scanNetshoes(req, res) {
     let withDiscount = 0;
     let done = 0;
     let skipped = 0;
+    const skippedKeywords = [];
     let loggedErrors = 0;
     let nextTask = 0;
     const totals = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0, changed: 0, rose: 0, oldestMs: 0, duplicates: 0 };
@@ -578,7 +613,7 @@ async function scanNetshoes(req, res) {
     async function worker() {
       while (nextTask < tasks.length) {
         const task = tasks[nextTask++];
-        if (Date.now() - startedAt > SCAN_BUDGET_MS) { skipped += 1; continue; }
+        if (Date.now() - startedAt > SCAN_BUDGET_MS) { skipped += 1; skippedKeywords.push(task.keyword); continue; }
         try {
           const page = 1 + Math.floor(Math.random() * NETSHOES_MAX_PAGE);
           const items = await netshoesClient.searchProducts(auth, mid, task.keyword, { max: NETSHOES_PAGE_SIZE, page });
@@ -654,6 +689,7 @@ async function scanNetshoes(req, res) {
       ok: true,
       groupsSearched: groups.length,
       keywordsSearched: done,
+      skippedKeywords,
       productsChecked: itemsSeen,
       promotionsFound: found,
       errors,
@@ -941,8 +977,8 @@ async function scanShopee(req, res) {
     const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
     const groupsParam = getGroupsParam(req);
     const selectedRows = groupsParam ? (allGroups || []).filter((g) => groupsParam.includes(g.id)) : allGroups;
-    // Só entram grupos configurados para rodar na Shopee.
-    const groups = mergeGroupsByName((selectedRows || []).filter((g) => groupRunsOn(g, 'shopee')));
+    // Só entram grupos configurados para rodar na Shopee (e, se o painel mandou um lote, só as palavras do lote).
+    const groups = filterGroupKeywords(mergeGroupsByName((selectedRows || []).filter((g) => groupRunsOn(g, 'shopee'))), getKeywordsParam(req));
 
     // Produtos já salvos nos últimos 14 dias: a Shopee devolve o MESMO produto em vários anúncios
     // (um por vendedor, cada um com link diferente) — comparar só o link não pega isso.
@@ -955,26 +991,34 @@ async function scanShopee(req, res) {
     const seenUrls = new Set();
     const totals = { checked: 0, updated: 0, listedOnly: 0, withHistory: 0, trackedNow: 0, maxDrop: 0, changed: 0, duplicates: 0, historyError: null };
 
-    for (const group of shuffle([...(groups || [])])) {
-      try {
-        // Suporta várias palavras-chave por grupo, separadas por vírgula —
-        // busca cada uma separadamente, pra trazer produtos de fato distintos
-        // dentro do nicho, em vez de uma palavra genérica dominada por um
-        // único produto campeão de vendas.
-        const keywords = (group.search_keyword || group.name)
-          .split(',')
-          .map((k) => k.trim())
-          .filter(Boolean);
-        shuffle(keywords);
+    // Uma tarefa por palavra-chave (cada palavra é buscada uma única vez, mesmo que esteja em dois grupos).
+    // Antes as palavras eram buscadas UMA POR VEZ, em fila, e o limite de tempo cortava as últimas —
+    // por isso marcar tudo trazia bem menos produtos do que buscar palavra por palavra.
+    const tasks = [];
+    const seenKeywords = new Set();
+    for (const group of groups) {
+      for (const keyword of group.keywords) {
+        const key = normKey(keyword);
+        if (seenKeywords.has(key)) continue;
+        seenKeywords.add(key);
+        tasks.push({ group, keyword });
+      }
+    }
+    shuffle(tasks);
 
-        const perKeywordLimit = Math.max(10, Math.floor(40 / keywords.length));
-
-        for (const keyword of keywords) {
-          if (Date.now() - startedAt > SCAN_BUDGET_MS) { skipped += 1; continue; }
+    const skippedKeywords = [];
+    let done = 0;
+    let nextTask = 0;
+    async function worker() {
+      while (nextTask < tasks.length) {
+        const task = tasks[nextTask++];
+        if (Date.now() - startedAt > SCAN_BUDGET_MS) { skipped += 1; skippedKeywords.push(task.keyword); continue; }
+        try {
           const sortType = SHOPEE_SORT_ROTATION[Math.floor(Math.random() * SHOPEE_SORT_ROTATION.length)];
           const page = 1 + Math.floor(Math.random() * 3);
-          const offers = await searchProductOffers(creds.client_id, creds.client_secret, keyword, { limit: perKeywordLimit, sortType, page });
-          const r = await processShopeeOffers(offers, marketplace.id, group, keyword, creds, seenUrls, dedupeCtx);
+          const offers = await searchProductOffers(creds.client_id, creds.client_secret, task.keyword, { limit: SHOPEE_PER_KEYWORD_LIMIT, sortType, page });
+          done += 1;
+          const r = await processShopeeOffers(offers, marketplace.id, task.group, task.keyword, creds, seenUrls, dedupeCtx);
           found += r.found;
           totals.updated += r.updated;
           totals.checked += r.checked;
@@ -985,16 +1029,17 @@ async function scanShopee(req, res) {
           totals.duplicates += r.duplicates;
           totals.maxDrop = Math.max(totals.maxDrop, r.maxDrop);
           if (!totals.historyError && r.historyError) totals.historyError = r.historyError;
+        } catch (err) {
+          errors.push(`${task.group.name} / "${task.keyword}": ${err.message}`);
+          await supabaseAdmin.from('integration_logs').insert({
+            marketplace_id: marketplace.id,
+            level: 'error',
+            message: `Falha ao buscar ofertas Shopee para "${task.keyword}" (grupo ${task.group.name}): ${err.message}`,
+          });
         }
-      } catch (err) {
-        errors.push(`${group.name}: ${err.message}`);
-        await supabaseAdmin.from('integration_logs').insert({
-          marketplace_id: marketplace.id,
-          level: 'error',
-          message: `Falha ao buscar ofertas Shopee para "${group.name}": ${err.message}`,
-        });
       }
     }
+    await Promise.all(Array.from({ length: Math.min(SHOPEE_CONCURRENCY, tasks.length) }, worker));
 
     // Limpeza: histórico com mais de 30 dias não serve para nada (a comparação usa 7).
     if (!totals.historyError) {
@@ -1015,6 +1060,8 @@ async function scanShopee(req, res) {
     res.status(200).json({
       ok: true,
       groupsSearched: (groups || []).length,
+      keywordsSearched: done,
+      skippedKeywords,
       productsChecked: totals.checked,
       promotionsFound: found,
       errors,
@@ -1030,14 +1077,18 @@ async function scanShopee(req, res) {
 // populares no título só pra aparecer em mais buscas ("keyword stuffing"). Isso
 // descarta o caso óbvio de vazamento (ex: produto de cozinha aparecendo na
 // busca de "corrida"), sem precisar de um filtro perfeito.
+function foldText(value) {
+  return String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+}
+
 function titleMatchesKeyword(title, keyword) {
   const stopWords = new Set(['de', 'da', 'do', 'das', 'dos', 'e', 'com', 'para', 'em', 'a', 'o']);
-  const words = keyword
-    .toLowerCase()
+  // Sem acento nos dois lados: "calça" na palavra-chave também casa com "Calca" no título (antes era descartado).
+  const words = foldText(keyword)
     .split(/[\s,]+/)
     .filter((w) => w.length > 2 && !stopWords.has(w));
   if (words.length === 0) return true; // palavra-chave só com termos curtos — não filtra
-  const titleLower = title.toLowerCase();
+  const titleLower = foldText(title);
   return words.some((w) => titleLower.includes(w));
 }
 
