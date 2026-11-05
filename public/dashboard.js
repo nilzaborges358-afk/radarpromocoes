@@ -9,6 +9,7 @@ const MARKETPLACE_LABELS = {
 };
 
 const STATUS_LABEL = { PENDING: 'aguardando afiliação', AFFILIATED: 'afiliada', IGNORED: 'ignorada' };
+let endedColumnOk = true; // vira false se o SQL 0005 ainda não foi rodado (coluna ended_at inexistente)
 
 let client = null;
 let currentStatus = 'ALL';
@@ -196,9 +197,13 @@ async function loadPromotions() {
       .order('detected_at', { ascending: false })
       .order('id', { ascending: true })
       .range(from, from + PROMO_PAGE - 1);
-    if (since) query = query.or(`detected_at.gte.${since},last_seen_at.gte.${since}`);
+    if (since) query = query.or(`detected_at.gte.${since},last_seen_at.gte.${since}${endedColumnOk ? `,ended_at.gte.${since}` : ''}`);
 
     const { data, error } = await query;
+    if (error && endedColumnOk && /ended_at/i.test(error.message || '')) {
+      endedColumnOk = false; // banco sem o SQL 0005: carrega do jeito antigo
+      return loadPromotions();
+    }
     if (error) {
       showFatalError(`Erro ao carregar as promoções: ${error.message}`);
       return;
@@ -336,8 +341,10 @@ function render() {
   const empty = document.getElementById('empty');
 
   // 1) período + busca + palavra-chave; 2) junta anúncios repetidos; 3) chips de marketplace e de grupo.
-  let base = applyDateFilter(allPromotions);
-  base = applySearch(base);
+  const isEnded = (p) => !!p.ended_at && p.status !== 'IGNORED';
+  let base = applySearch(applyDateFilter(allPromotions.filter((p) => !isEnded(p))));
+  // Finalizadas têm o período contado pela data em que FINALIZARAM (não pela data em que foram achadas).
+  const endedBase = applySearch(applyDateFilter(allPromotions.filter(isEnded), 'ended_at'));
 
   // O mesmo produto vendido por vários vendedores aparece UMA vez só (a mais barata, ou a que você já afiliou),
   // com um aviso de quantos anúncios iguais existem. As ignoradas ficam só na aba "Ignoradas".
@@ -346,10 +353,11 @@ function render() {
 
   const mpOk = (p) => !filters.marketplaces.size || filters.marketplaces.has(p.marketplaces?.slug);
   const grOk = (p) => !filters.groups.size || filters.groups.has(promoGroupKey(p));
-  renderFilterChips(collapsedAll, mpOk, grOk);
+  renderFilterChips(currentStatus === 'ENDED' ? endedBase : collapsedAll, mpOk, grOk);
 
   const visible = collapsedAll.filter((p) => mpOk(p) && grOk(p));
   const ignored = ignoredAll.filter((p) => mpOk(p) && grOk(p));
+  const endedList = endedBase.filter((p) => mpOk(p) && grOk(p));
 
   document.getElementById('cappedNote').style.display = promotionsCapped ? 'block' : 'none';
 
@@ -358,9 +366,11 @@ function render() {
   document.getElementById('countAll').textContent = hasResults ? visible.length : '–';
   document.getElementById('countPending').textContent = hasResults ? visible.filter((p) => p.status === 'PENDING').length : '–';
   document.getElementById('countAffiliated').textContent = hasResults ? visible.filter((p) => p.status === 'AFFILIATED').length : '–';
+  document.getElementById('countEnded').textContent = endedList.length || '–';
 
   let list = visible;
   if (currentStatus === 'IGNORED') list = ignored;
+  else if (currentStatus === 'ENDED') list = endedList;
   else if (currentStatus !== 'ALL') list = visible.filter((p) => p.status === currentStatus);
   list = sortList(list);
 
@@ -419,7 +429,7 @@ function toLocalDateKey(dateStr) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-function applyDateFilter(list) {
+function applyDateFilter(list, field = 'detected_at') {
   if (currentDateFilter === 'ALL') return list;
 
   const today = new Date();
@@ -427,26 +437,26 @@ function applyDateFilter(list) {
 
   if (currentDateFilter === 'TODAY') {
     // Só o que foi encontrado pela PRIMEIRA vez hoje (produto reencontrado não conta como novo).
-    return list.filter((p) => toLocalDateKey(p.detected_at) === todayKey);
+    return list.filter((p) => toLocalDateKey(p[field] || p.detected_at) === todayKey);
   }
 
   if (currentDateFilter === 'TODAY_SEEN') {
     // Tudo que a busca viu hoje, inclusive produtos antigos que apareceram de novo.
-    return list.filter((p) => toLocalDateKey(p.last_seen_at || p.detected_at) === todayKey);
+    return list.filter((p) => toLocalDateKey((field === 'ended_at' ? p.ended_at : p.last_seen_at) || p.detected_at) === todayKey);
   }
 
   if (currentDateFilter === 'YESTERDAY') {
     const yesterday = new Date(today);
     yesterday.setDate(yesterday.getDate() - 1);
     const yKey = toLocalDateKey(yesterday);
-    return list.filter((p) => toLocalDateKey(p.detected_at) === yKey);
+    return list.filter((p) => toLocalDateKey(p[field] || p.detected_at) === yKey);
   }
 
   if (currentDateFilter === 'CUSTOM') {
     const from = document.getElementById('dateFrom').value;
     const to = document.getElementById('dateTo').value;
     return list.filter((p) => {
-      const key = toLocalDateKey(p.detected_at);
+      const key = toLocalDateKey(p[field] || p.detected_at);
       if (from && key < from) return false;
       if (to && key > to) return false;
       return true;
@@ -471,7 +481,7 @@ function renderCard(promo) {
   const discount = promo.discount_rate ? `-${Math.round(promo.discount_rate)}%` : '';
 
   return `
-    <div class="card">
+    <div class="card ${promo.ended_at && promo.status !== 'IGNORED' ? 'is-ended' : ''}">
       <div class="card-media">
         <div class="tag-row">
           <span class="tag" style="background:${label.color}; color:${label.textColor}">${label.name}</span>
@@ -492,6 +502,7 @@ function renderCard(promo) {
           <span class="status-dot"></span>
           Achada em ${detectedAt}${revisto} · ${STATUS_LABEL[promo.status] || promo.status}
         </div>
+        ${promo.ended_at ? `<div class="ended-note" title="${escapeHtml(promo.ended_reason || '')}">⏹ Promoção finalizada em ${new Date(promo.ended_at).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}${promo.ended_reason ? ` — ${escapeHtml(promo.ended_reason)}` : ''}</div>` : ''}
         <div class="actions">
           <a href="${promo.original_url}" target="_blank" rel="noopener">Abrir original</a>
           ${promo.affiliate_url ? `
