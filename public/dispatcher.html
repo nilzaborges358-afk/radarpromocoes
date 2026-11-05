@@ -57,6 +57,13 @@
   details summary { cursor:pointer; color: var(--accent); }
   details ol { margin:8px 0 0 18px; padding:0; line-height:1.6; }
 
+  .ntabs { display:flex; gap:8px; flex-wrap:wrap; margin:0 0 6px; }
+  .ntab { display:inline-flex; align-items:center; gap:7px; padding:8px 16px; border:1px solid var(--line, #2a2a2a); background:transparent; color:inherit; font:inherit; font-size:13px; cursor:pointer; border-radius:999px; }
+  .ntab:hover { border-color: var(--accent, #7bd88f); }
+  .ntab.on { background: color-mix(in srgb, var(--accent, #7bd88f) 18%, transparent); border-color: var(--accent, #7bd88f); font-weight:600; }
+  .ntab .live { width:8px; height:8px; border-radius:50%; background:#7bd88f; box-shadow:0 0 8px #7bd88f; animation: ntpulse 1.6s infinite; }
+  @keyframes ntpulse { 50% { opacity:.35; } }
+  .nnote { font-size:12px; color: var(--muted); margin:0 0 16px; }
   .groups-box { display:flex; flex-wrap:wrap; gap:6px 16px; padding-top:4px; max-height:220px; overflow-y:auto; }
   .check { display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; }
 
@@ -136,7 +143,10 @@
   <!-- 2. Envio -->
   <div class="block">
     <div class="block-title">2. Envio</div>
-    <p class="block-sub">Só entram na fila promoções que têm link de afiliado, que a busca viu nas últimas 24 horas (e o sistema confere o preço de novo na hora de enviar), e que ainda não foram enviadas a esse destino nas últimas 2 semanas. Vão primeiro as de maior desconto.</p>
+    <p class="block-sub">Só entram na fila promoções que têm link de afiliado, que apareceram na ÚLTIMA busca daquele nicho (o que foi achado numa busca anterior e não apareceu na de agora fica de fora) e que ainda não foram enviadas a esse destino nas últimas 2 semanas. O sistema confere o preço de novo na hora de enviar e não dispara desconto suspeito (tipo "90% OFF"). Vão primeiro as de maior desconto.</p>
+
+    <div class="ntabs" id="nicheTabs"></div>
+    <div class="nnote" id="nicheNote"></div>
 
     <div class="grid">
       <div class="field"><label>Destino</label><select id="destSelect"></select></div>
@@ -325,7 +335,10 @@ async function loadAll() {
   renderDestinations(d.status === 'rejected' ? d.reason.message : null);
   renderGroups();
   restoreSettings();
+  initNiche();
   applyJobToUI();
+  forceNicheGroups();
+  renderNicheTabs();
   updateModeUI();
   jobs.forEach((j) => { lastSeen[j.id] = jobSig(j); });
   renderJob();
@@ -375,6 +388,64 @@ function mergedGroups() {
     if (!/[A-Z\u00c0-\u00de]/.test(map.get(key).name) && /[A-Z\u00c0-\u00de]/.test(cleaned)) map.get(key).name = cleaned;
   });
   return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+}
+
+// ---------- abas por nicho ----------
+// Cada nicho (grupo da busca) tem sua aba: ao clicar, só aquele nicho entra na fila e o destino que você usou
+// nele da última vez volta sozinho. Assim um grupo de WhatsApp = um nicho, bem separado.
+let activeNiche = 'ALL';
+function nicheDestMap() { try { return JSON.parse(localStorage.getItem('dispatcherNicheDest') || '{}'); } catch { return {}; } }
+function nicheTabs() {
+  return [
+    { key: 'ALL', name: 'Todos os nichos', value: null },
+    ...mergedGroups().map((g) => ({ key: g.name.toLowerCase(), name: g.name, value: g.ids.join(',') })),
+    { key: 'none', name: 'Sem grupo', value: 'none' },
+  ];
+}
+function renderNicheTabs() {
+  const map = nicheDestMap();
+  $('nicheTabs').innerHTML = nicheTabs().map((t) => {
+    const did = map[t.key];
+    const running = did && jobs.some((j) => j.destination_id === did && j.status === 'running');
+    return `<button type="button" class="ntab ${activeNiche === t.key ? 'on' : ''}" data-niche="${escapeHtml(t.key)}">${running ? '<span class="live" title="disparo rodando"></span>' : ''}${escapeHtml(t.name)}</button>`;
+  }).join('');
+  const d = destinations.find((x) => x.id === map[activeNiche]);
+  $('nicheNote').textContent = activeNiche === 'ALL' || activeNiche === 'CUSTOM'
+    ? 'Escolha um nicho para disparar só dele. Cada nicho lembra o destino (grupo do WhatsApp ou canal) que você usou nele.'
+    : d ? `Destino deste nicho: ${d.name}. Pode trocar no seletor abaixo.` : 'Escolha abaixo o destino deste nicho e inicie o disparo: da próxima vez ele já vem selecionado.';
+}
+function forceNicheGroups() {
+  if (activeNiche === 'ALL' || activeNiche === 'CUSTOM') return;
+  const t = nicheTabs().find((x) => x.key === activeNiche);
+  if (!t || !t.value) { activeNiche = 'ALL'; return; }
+  checkGroups(t.value.split(','));
+}
+function initNiche() {
+  const saved = localStorage.getItem('dispatcherNiche') || 'ALL';
+  activeNiche = nicheTabs().some((t) => t.key === saved) ? saved : 'ALL';
+  if (activeNiche === 'ALL') return;
+  const did = nicheDestMap()[activeNiche];
+  if (did && destinations.some((d) => d.id === did)) $('destSelect').value = did;
+}
+function setNiche(key) {
+  activeNiche = key;
+  localStorage.setItem('dispatcherNiche', key);
+  if (key === 'ALL') {
+    document.querySelectorAll('.grp').forEach((c) => { c.checked = true; });
+  } else {
+    const did = nicheDestMap()[key];
+    if (did && destinations.some((d) => d.id === did)) {
+      $('destSelect').value = did;
+      const d = selectedDest();
+      $('waGroup').value = d && d.chat_id && isWa(d) ? d.chat_id : '';
+      applyJobToUI(); updateModeUI(); renderJob();
+    }
+    forceNicheGroups();
+  }
+  saveSettings();
+  renderNicheTabs();
+  $('queueInfo').textContent = '';
+  refreshQueue();
 }
 
 function renderGroups() {
@@ -585,7 +656,7 @@ async function refreshQueue() {
     const f = filters();
     const r = await api({ action: 'queue', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace });
     if (!r.count) {
-      $('queueInfo').textContent = 'Fila vazia: nenhuma promo\u00e7\u00e3o com link de afiliado, vista nas \u00faltimas 24 horas, que ainda n\u00e3o tenha ido para esse destino. Rode uma busca no Painel geral.';
+      $('queueInfo').textContent = 'Fila vazia: nenhuma promo\u00e7\u00e3o da \u00faltima busca deste nicho, com link de afiliado, que ainda n\u00e3o tenha ido para esse destino. Rode uma busca desse nicho no Painel geral.';
     } else {
       const n = r.next;
       $('queueInfo').textContent = `Na fila: ${r.count}. Pr\u00f3xima: ${n.title.slice(0, 70)} \u2014 R$ ${Number(n.price).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${n.discount ? ` (${Math.round(n.discount)}% OFF)` : ''}${n.marketplace ? ` \u00b7 ${n.marketplace}` : ''}`;
@@ -739,6 +810,9 @@ async function startRun() {
       : 'O disparo fica salvo no servidor: pode recarregar a p\u00e1gina ou trocar de aba.';
   if (!confirm(`Enviar 1 promo\u00e7\u00e3o a cada ${interval} min para "${dest.name}", at\u00e9 ${maxSends} envios.${janela}\n\n${aviso}\n\nCome\u00e7ar?`)) return;
 
+  if (activeNiche !== 'ALL' && activeNiche !== 'CUSTOM') {
+    const m = nicheDestMap(); m[activeNiche] = dest.id; localStorage.setItem('dispatcherNicheDest', JSON.stringify(m));
+  }
   unlockAudio();
   try { if (manual && 'Notification' in window && Notification.permission === 'default') await Notification.requestPermission(); } catch { /* ignora */ }
   saveSettings();
@@ -915,7 +989,9 @@ $('newPlatform').addEventListener('change', () => {
   document.querySelectorAll('.new-wa').forEach((el) => el.classList.toggle('hidden', $('newPlatform').value !== 'whatsapp_manual'));
 });
 $('addDestBtn').addEventListener('click', addDestination);
-$('destSelect').addEventListener('change', () => { const d = selectedDest(); $('waGroup').value = d && d.chat_id && isWa(d) ? d.chat_id : ''; applyJobToUI(); updateModeUI(); renderJob(); saveSettings(); $('queueInfo').textContent = ''; });
+$('nicheTabs').addEventListener('click', (e) => { const b = e.target.closest('[data-niche]'); if (b) setNiche(b.dataset.niche); });
+$('groupBox').addEventListener('change', () => { activeNiche = 'CUSTOM'; renderNicheTabs(); saveSettings(); });
+$('destSelect').addEventListener('change', () => { const d = selectedDest(); $('waGroup').value = d && d.chat_id && isWa(d) ? d.chat_id : ''; applyJobToUI(); forceNicheGroups(); renderNicheTabs(); updateModeUI(); renderJob(); saveSettings(); $('queueInfo').textContent = ''; });
 $('waMode').addEventListener('change', () => { updateModeUI(); renderJob(); saveSettings(); });
 
 // Atualiza a luzinha "robo conectado" mesmo sem disparo rodando.
