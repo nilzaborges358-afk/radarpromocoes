@@ -120,43 +120,138 @@ async function checkCoupons() {
 
 let allCoupons = [];
 let editingId = null;
+let cpFilter = 'valid';
+
+function todayKey() { return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' }); }
+
+// Situação de um cupom cadastrado: vencido? quantos dias faltam? foi testado recentemente?
+function couponState(c) {
+  const today = todayKey();
+  const until = c.valid_until ? String(c.valid_until).slice(0, 10) : null;
+  const expired = !!(until && until < today);
+  const daysLeft = until ? Math.round((new Date(`${until}T00:00:00`) - new Date(`${today}T00:00:00`)) / 864e5) : null;
+  const verDays = c.last_verified_at ? Math.floor((Date.now() - new Date(c.last_verified_at).getTime()) / 864e5) : null;
+  return { expired, daysLeft, verDays, fresh: verDays !== null && verDays <= 3, usable: !!c.active && !expired };
+}
+
+function couponWeight(c) {
+  const v = Number(c.discount_value) || 0;
+  return c.discount_type === 'percent' ? v * 10 : v; // só para ordenar (% pesa mais que R$ do mesmo número)
+}
+
+function expiryBadge(st) {
+  if (st.expired) return '<span class="cp-badge bad">vencido</span>';
+  if (st.daysLeft === 0) return '<span class="cp-badge warn">vence hoje</span>';
+  if (st.daysLeft === 1) return '<span class="cp-badge warn">vence amanhã</span>';
+  if (st.daysLeft !== null && st.daysLeft <= 3) return `<span class="cp-badge warn">vence em ${st.daysLeft} dias</span>`;
+  return '';
+}
+
+function mlCouponMessage(c) {
+  const until = c.valid_until ? `${String(c.valid_until).slice(8, 10)}/${String(c.valid_until).slice(5, 7)}` : null;
+  const val = c.discount_type === 'percent' ? `${Number(c.discount_value)}% OFF` : `R$ ${brl(c.discount_value)} OFF`;
+  return [
+    '🏷️ CUPOM MERCADO LIVRE',
+    `${c.title} — ${val}${c.min_purchase ? ` acima de R$ ${brl(c.min_purchase)}` : ''}${c.max_discount ? ` (até R$ ${brl(c.max_discount)})` : ''}`,
+    c.code ? `✅ Código: ${c.code}` : '✅ Aplica automaticamente',
+    c.notes ? `⚠️ ${c.notes}` : '',
+    until ? `⏰ Válido até ${until}` : '',
+  ].filter(Boolean).join('\n');
+}
 
 async function loadCoupons() {
   const list = document.getElementById('cp-all');
   try {
     const data = await couponApi({ action: 'coupons_list' });
     allCoupons = data.coupons || [];
-    if (!allCoupons.length) {
-      list.innerHTML = '<div class="cp-item"><span class="cp-meta">Nenhum cupom cadastrado ainda.</span></div>';
-      return;
-    }
-    list.innerHTML = allCoupons.map((c) => `
-      <div class="cp-item" style="${c.active ? '' : 'opacity:.55'}">
-        <div>
-          <div class="cp-name">${esc(c.title)} ${c.code ? `<span class="cp-code">${esc(c.code)}</span>` : '<span class="cp-badge">automático</span>'}</div>
-          <div class="cp-meta">${esc(couponDesc(c))}${c.category_ids ? ` · categorias: ${esc(c.category_ids)}` : ''}${c.seller_ids ? ` · vendedores: ${esc(c.seller_ids)}` : ''}</div>
-          <div class="cp-meta">${verifiedBadge(c)}${c.active ? '' : ' <span class="cp-badge">desativado</span>'}</div>
-        </div>
-        <div class="cp-actions">
-          <button data-v="${c.id}">Confirmei hoje</button>
-          <button data-e="${c.id}">Editar</button>
-          <button data-t="${c.id}">${c.active ? 'Desativar' : 'Ativar'}</button>
-          <button class="danger" data-d="${c.id}">Remover</button>
-        </div>
-      </div>`).join('');
-    list.querySelectorAll('[data-v]').forEach((b) => b.addEventListener('click', async () => { await couponApi({ action: 'coupons_verify', id: b.dataset.v }); loadCoupons(); }));
-    list.querySelectorAll('[data-t]').forEach((b) => b.addEventListener('click', async () => {
-      const c = allCoupons.find((x) => x.id === b.dataset.t);
-      await couponApi({ action: 'coupons_toggle', id: c.id, active: !c.active }); loadCoupons();
-    }));
-    list.querySelectorAll('[data-d]').forEach((b) => b.addEventListener('click', async () => {
-      if (!confirm('Remover esse cupom?')) return;
-      await couponApi({ action: 'coupons_delete', id: b.dataset.d }); loadCoupons();
-    }));
-    list.querySelectorAll('[data-e]').forEach((b) => b.addEventListener('click', () => startEdit(b.dataset.e)));
+    renderCoupons();
   } catch (err) {
     list.innerHTML = `<div class="cp-item"><span class="cp-meta" style="color:var(--bad)">Erro ao carregar cupons: ${esc(err.message)}</span></div>`;
   }
+}
+
+function renderCoupons() {
+  const list = document.getElementById('cp-all');
+  if (!allCoupons.length) {
+    list.innerHTML = '<div class="cp-item"><span class="cp-meta">Nenhum cupom cadastrado ainda.</span></div>';
+    document.getElementById('cp-sum').textContent = '';
+    document.getElementById('cp-clean').style.display = 'none';
+    return;
+  }
+  const rows = allCoupons.map((c) => ({ c, st: couponState(c) }));
+  const nValid = rows.filter((r) => r.st.usable).length;
+  const nExpired = rows.filter((r) => r.st.expired).length;
+  const nStale = rows.filter((r) => r.st.usable && !r.st.fresh).length;
+  document.getElementById('cp-sum').textContent = `${nValid} válido(s)${nStale ? ` (${nStale} sem teste recente)` : ''} · ${nExpired} vencido(s) · ${rows.length} no total`;
+  document.getElementById('cp-clean').style.display = nExpired ? '' : 'none';
+
+  let shown = rows;
+  if (cpFilter === 'valid') shown = rows.filter((r) => r.st.usable);
+  else if (cpFilter === 'expired') shown = rows.filter((r) => r.st.expired);
+  else if (cpFilter === 'off') shown = rows.filter((r) => !r.c.active);
+  // Bons primeiro: válidos testados recentemente, depois válidos sem teste, depois o resto; dentro disso, maior desconto.
+  const rank = (r) => (r.st.usable ? (r.st.fresh ? 0 : 1) : (r.st.expired ? 3 : 2));
+  shown = [...shown].sort((a, b) => rank(a) - rank(b) || couponWeight(b.c) - couponWeight(a.c));
+
+  if (!shown.length) {
+    list.innerHTML = `<div class="cp-item"><span class="cp-meta">${cpFilter === 'valid' ? 'Nenhum cupom válido agora. Cadastre um novo acima ou mude o filtro para "Todos".' : 'Nada neste filtro.'}</span></div>`;
+    return;
+  }
+  list.innerHTML = shown.map(({ c, st }) => `
+    <div class="cp-item ${st.usable && st.fresh ? 'best' : ''}" style="${st.usable ? '' : 'opacity:.55'}">
+      <div>
+        <div class="cp-name">${esc(c.title)} ${c.code ? `<span class="cp-code">${esc(c.code)}</span>` : '<span class="cp-badge">automático</span>'}</div>
+        <div class="cp-meta">${esc(couponDesc(c))}${c.category_ids ? ` · categorias: ${esc(c.category_ids)}` : ''}${c.seller_ids ? ` · vendedores: ${esc(c.seller_ids)}` : ''}</div>
+        <div class="cp-meta">${expiryBadge(st)} ${verifiedBadge(c)}${c.active ? '' : ' <span class="cp-badge">desativado</span>'}</div>
+      </div>
+      <div class="cp-actions">
+        ${st.usable ? `<button data-cm="${c.id}">Copiar mensagem</button><button data-cw="${c.id}">WhatsApp</button>` : ''}
+        <button data-v="${c.id}">Confirmei hoje</button>
+        <button data-e="${c.id}">Editar</button>
+        <button data-t="${c.id}">${c.active ? 'Desativar' : 'Ativar'}</button>
+        <button class="danger" data-d="${c.id}">Remover</button>
+      </div>
+    </div>`).join('');
+  const byId = (id) => allCoupons.find((x) => x.id === id);
+  list.querySelectorAll('[data-v]').forEach((b) => b.addEventListener('click', async () => { await couponApi({ action: 'coupons_verify', id: b.dataset.v }); loadCoupons(); }));
+  list.querySelectorAll('[data-t]').forEach((b) => b.addEventListener('click', async () => {
+    const c = byId(b.dataset.t);
+    await couponApi({ action: 'coupons_toggle', id: c.id, active: !c.active }); loadCoupons();
+  }));
+  list.querySelectorAll('[data-d]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('Remover esse cupom?')) return;
+    await couponApi({ action: 'coupons_delete', id: b.dataset.d }); loadCoupons();
+  }));
+  list.querySelectorAll('[data-e]').forEach((b) => b.addEventListener('click', () => startEdit(b.dataset.e)));
+  list.querySelectorAll('[data-cm]').forEach((b) => b.addEventListener('click', async () => {
+    await navigator.clipboard.writeText(mlCouponMessage(byId(b.dataset.cm)));
+    const t = b.textContent; b.textContent = 'Copiado!'; setTimeout(() => { b.textContent = t; }, 1500);
+  }));
+  list.querySelectorAll('[data-cw]').forEach((b) => b.addEventListener('click', () => {
+    window.open(`https://wa.me/?text=${encodeURIComponent(mlCouponMessage(byId(b.dataset.cw)))}`, '_blank');
+  }));
+}
+
+// "Colar texto do cupom": lê porcentagem/valor, compra mínima, teto, código e validade e preenche o formulário.
+function fillFromText(text) {
+  const t = String(text || '');
+  const num = (v) => String(v).replace(/\./g, '').replace(',', '.');
+  const pct = t.match(/(\d{1,2}(?:,\d+)?)\s*%/);
+  const fixed = t.match(/R\$\s*([\d.]+(?:,\d{1,2})?)\s*(?:de\s+)?(?:desconto|off)\b/i) || t.match(/(?:desconto|off)\b[^.\d%]{0,20}R\$\s*([\d.]+(?:,\d{1,2})?)/i);
+  const min = t.match(/(?:acima de|a partir de|compras? (?:de|acima de)|m[ií]nimo de|m[ií]nima de)\s*R\$\s*([\d.]+(?:,\d{1,2})?)/i);
+  const max = t.match(/(?:at[eé]|teto de|limite de|m[aá]ximo de)\s*R\$\s*([\d.]+(?:,\d{1,2})?)/i);
+  const code = t.match(/c[oó]d(?:igo)?\.?:?\s*([A-Z0-9]{4,20})\b/i) || t.match(/\b([A-Z][A-Z0-9]{5,19})\b/);
+  const date = t.match(/(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?/);
+  if (pct) { F('f-type').value = 'percent'; F('f-value').value = num(pct[1]); }
+  else if (fixed) { F('f-type').value = 'fixed'; F('f-value').value = num(fixed[1]); }
+  if (min) F('f-min').value = num(min[1]);
+  if (max && !(fixed && max[1] === fixed[1])) F('f-max').value = num(max[1]);
+  if (code) F('f-code').value = code[1].toUpperCase();
+  if (date) {
+    const y = date[3] ? (date[3].length === 2 ? `20${date[3]}` : date[3]) : String(new Date().getFullYear());
+    F('f-until').value = `${y}-${date[2].padStart(2, '0')}-${date[1].padStart(2, '0')}`;
+  }
+  if (!F('f-title').value) F('f-title').value = t.replace(/\s+/g, ' ').trim().slice(0, 60);
 }
 
 const F = (id) => document.getElementById(id);
@@ -203,6 +298,14 @@ async function saveCoupon() {
 }
 
 F('cp-btn').addEventListener('click', checkCoupons);
+F('f-paste-btn').addEventListener('click', () => { fillFromText(F('f-paste').value); F('cp-form').scrollIntoView({ behavior: 'smooth', block: 'center' }); });
+F('cp-filter').addEventListener('change', (e) => { cpFilter = e.target.value; renderCoupons(); });
+F('cp-clean').addEventListener('click', async () => {
+  const dead = allCoupons.filter((c) => couponState(c).expired);
+  if (!dead.length || !confirm(`Remover ${dead.length} cupom(ns) vencido(s)?`)) return;
+  for (const c of dead) await couponApi({ action: 'coupons_delete', id: c.id });
+  loadCoupons();
+});
 F('cp-url').addEventListener('keydown', (e) => { if (e.key === 'Enter') checkCoupons(); });
 F('f-save').addEventListener('click', saveCoupon);
 F('f-cancel').addEventListener('click', resetForm);
@@ -252,23 +355,65 @@ async function nsCopy(btn, text) {
   const t = btn.textContent; btn.textContent = 'Copiado!'; setTimeout(() => { btn.textContent = t; }, 1500);
 }
 
+let nsMeta = null;
+let nsView = { onlyCode: false, sort: 'best', q: '' };
+
+function nsDaysLeft(d) {
+  const day = String(d || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
+  return Math.round((new Date(`${day}T00:00:00`) - new Date(`${todayKey()}T00:00:00`)) / 864e5);
+}
+
+// Nota de qualidade só para ordenar: com código > sem código; maior desconto lido do texto; "até X%" vale menos.
+function nsScore(c) {
+  const p = c.parsed || {};
+  let s = c.code ? 1000 : 0;
+  if (p.type === 'percent') s += p.value * 10;
+  else if (p.type === 'fixed') s += p.value;
+  if (p.approx) s -= 5;
+  return s;
+}
+
 function nsRender(r) {
+  nsCoupons = (r.coupons || []).map((c, i) => ({ ...c, _i: i })); // _i = posição original (os botões usam)
+  nsMeta = r;
   const box = F('ns-result');
-  nsCoupons = r.coupons || [];
-  let html = '';
   if (!nsCoupons.length) {
-    html += `<div class="cp-note"><b>A Rakuten não devolveu nenhum cupom ativo para a Netshoes.</b> ${r.expired ? `(${r.expired} já vencido(s) foram ignorados.) ` : ''}Pode ser que a Netshoes não tenha cupom para afiliados agora, ou que sua conta ainda não tenha acesso a esse serviço.${r.rawSample ? `<details class="cp-excluded"><summary>resposta recebida da Rakuten</summary><div style="margin-top:6px; word-break:break-all;">${esc(r.rawSample)}</div></details>` : ''}</div>`;
-    box.innerHTML = html;
+    box.innerHTML = `<div class="cp-note"><b>A Rakuten não devolveu nenhum cupom ativo para a Netshoes.</b> ${r.expired ? `(${r.expired} já vencido(s) foram ignorados.) ` : ''}Pode ser que a Netshoes não tenha cupom para afiliados agora, ou que sua conta ainda não tenha acesso a esse serviço.${r.rawSample ? `<details class="cp-excluded"><summary>resposta recebida da Rakuten</summary><div style="margin-top:6px; word-break:break-all;">${esc(r.rawSample)}</div></details>` : ''}</div>`;
     return;
   }
-  html += `<div class="cp-note" style="margin-top:4px;">${r.total} cupom(ns)/oferta(s) ativo(s), ${r.withCode} com código.${r.expired ? ` ${r.expired} vencido(s) ocultado(s).` : ''}</div>`;
-  html += `<div class="cp-list">` + nsCoupons.map((c, i) => {
+  box.innerHTML = `<div class="cp-toolbar">
+      <span class="cp-sum" id="ns-sum"></span>
+      <input type="text" id="ns-q" placeholder="Filtrar (marca, categoria, texto…)" />
+      <label><input type="checkbox" id="ns-onlycode" /> só com código</label>
+      <select id="ns-sort"><option value="best">Melhores primeiro</option><option value="soon">Vencem primeiro</option></select>
+    </div><div id="ns-list"></div>`;
+  F('ns-q').value = nsView.q; F('ns-onlycode').checked = nsView.onlyCode; F('ns-sort').value = nsView.sort;
+  F('ns-q').addEventListener('input', (e) => { nsView.q = e.target.value; nsRenderList(); });
+  F('ns-onlycode').addEventListener('change', (e) => { nsView.onlyCode = e.target.checked; nsRenderList(); });
+  F('ns-sort').addEventListener('change', (e) => { nsView.sort = e.target.value; nsRenderList(); });
+  nsRenderList();
+}
+
+function nsRenderList() {
+  const r = nsMeta;
+  const q = nsView.q.trim().toLowerCase();
+  let rows = nsCoupons.filter((c) => (!nsView.onlyCode || c.code)
+    && (!q || `${c.description || ''} ${c.restriction || ''} ${c.code || ''} ${(c.categories || []).join(' ')}`.toLowerCase().includes(q)));
+  rows = [...rows].sort(nsView.sort === 'soon'
+    ? (a, b) => String(a.endsAt || '9999').localeCompare(String(b.endsAt || '9999'))
+    : (a, b) => nsScore(b) - nsScore(a) || String(a.endsAt || '9999').localeCompare(String(b.endsAt || '9999')));
+  F('ns-sum').textContent = `${rows.length} de ${r.total} cupom(ns)/oferta(s) ativo(s) · ${r.withCode} com código${r.expired ? ` · ${r.expired} vencido(s) ocultado(s)` : ''}`;
+  F('ns-list').innerHTML = rows.length ? `<div class="cp-list">` + rows.map((c) => {
+    const i = c._i;
     const until = nsDate(c.endsAt);
+    const left = nsDaysLeft(c.endsAt);
     const parsed = nsParsedLabel(c);
+    const soon = left === 0 ? '<span class="cp-badge warn">vence hoje</span>' : left === 1 ? '<span class="cp-badge warn">vence amanhã</span>' : (left !== null && left <= 3 ? `<span class="cp-badge warn">vence em ${left} dias</span>` : '');
     return `<div class="cp-item" data-i="${i}" style="flex-direction:column; align-items:stretch;">
       <div style="display:flex; gap:12px; align-items:center; justify-content:space-between; flex-wrap:wrap;">
         <div style="flex:1; min-width:220px;">
-          <div class="cp-name">${esc(c.description || '(sem descrição)')} ${c.code ? `<span class="cp-code">${esc(c.code)}</span>` : '<span class="cp-badge">sem código (oferta)</span>'}</div>
+          <div class="cp-name">${esc(c.description || '(sem descrição)')} ${c.code ? `<span class="cp-code">${esc(c.code)}</span>` : '<span class="cp-badge">sem código (oferta)</span>'} ${soon}</div>
           <div class="cp-meta">${until ? `válido até ${until}` : 'sem data de validade informada'}${parsed ? ` · <span style="color:var(--accent)">${esc(parsed)}</span>` : ''}${c.categories && c.categories.length ? ` · ${esc(c.categories.slice(0, 3).join(', '))}` : ''}</div>
           ${c.restriction ? `<div class="cp-meta"><b>Restrição:</b> ${esc(c.restriction)}</div>` : ''}
         </div>
@@ -281,8 +426,7 @@ function nsRender(r) {
       </div>
       <div class="ns-products" id="ns-p-${i}" style="display:none; margin-top:12px;"></div>
     </div>`;
-  }).join('') + `</div>`;
-  box.innerHTML = html;
+  }).join('') + `</div>` : '<div class="cp-note">Nenhum cupom com esse filtro.</div>';
 }
 
 function nsOpenProducts(i) {
