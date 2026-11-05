@@ -18,6 +18,9 @@ function lifecycle() { try { return require('../src/core/lifecycle'); } catch { 
 // Precisa das tabelas dispatch_destinations e dispatch_log (SQL em supabase/migrations/0002_disparador.sql).
 
 const QUEUE_DAYS_SEEN = 1;     // so promocoes vistas pela busca nas ultimas 24h (precos de hoje)
+const LATEST_SCAN_WINDOW_MS = 45 * 60 * 1000; // so entra a promocao da ULTIMA busca de cada nicho/marketplace (uma busca leva alguns minutos)
+const MAX_DISCOUNT_PCT = 70;          // acima disso quase sempre e preco de tabela inflado ("90% OFF") — nao dispara
+const MAX_DISCOUNT_LISTED_PCT = 60;   // desconto so de tabela (Shopee) tem teto menor
 const NO_REPEAT_DAYS = 14;     // n\u00e3o repete a mesma promo\u00e7\u00e3o no mesmo destino por 2 semanas
 const MIN_GAP_SECONDS = 20;    // trava anti-duplo-clique
 const COUPON_CACHE_MS = 10 * 60 * 1000;
@@ -98,35 +101,25 @@ function categoryEmoji(title) {
   return null;
 }
 
-// Monta o texto. "turn" gira entre os modelos, entao duas mensagens seguidas nunca saem iguais.
-// Tom: quem esta compartilhando achou uma oferta boa. Nada de aviso tecnico/"link de afiliado" no texto.
+// Monta o texto: sempre o MESMO formato, para o grupo nao enjoar de textinhos diferentes:
+//   nome do produto (como esta no anuncio)
+//   De ~R$ X~ por *R$ Y* (Z% OFF)
+//   cupom, se houver
+//   link de afiliado
 function buildMessage(p, turn, footer) {
-  const head = categoryEmoji(p.title) || pick(OPENERS, turn + p.title.length);
-  const go = pick(LINK_EMOJIS, turn);
   const title = esc(p.title);
   const link = esc(p.affiliate_url);
   const { price, listPrice, coupon, finalPrice } = p.view;
   const off = p.view.discount ? Math.round(p.view.discount) : null;
   const hasList = listPrice && listPrice > price;
-  const now = coupon ? finalPrice : price;
+  const offTxt = off ? ` (${off}% OFF)` : '';
 
   const priceLine = hasList
-    ? `\ud83d\udcb8 De <s>R$ ${money(listPrice)}</s> por <b>R$ ${money(now)}</b>${off ? ` (${off}% OFF)` : ''}`
-    : `\ud83d\udcb8 Por apenas <b>R$ ${money(now)}</b>${off ? ` (${off}% OFF)` : ''}`;
-  const couponLine = coupon ? `\ud83d\udecd\ufe0f Use o cupom <b>${esc(coupon)}</b> no carrinho` : null;
-  const storeLine = coupon ? `Pre\u00e7o na loja: R$ ${money(price)}` : null;
-  const warn = '\u26a0\ufe0f Pre\u00e7o e estoque podem mudar a qualquer momento';
+    ? `\ud83d\udcb8 De <s>R$ ${money(listPrice)}</s> por <b>R$ ${money(price)}</b>${coupon ? '' : offTxt}`
+    : `\ud83d\udcb8 Por <b>R$ ${money(price)}</b>${coupon ? '' : offTxt}`;
+  const couponLine = coupon ? `\ud83c\udf9f\ufe0f Com o cupom <b>${esc(coupon)}</b>: <b>R$ ${money(finalPrice)}</b>${offTxt}` : null;
 
-  const templates = [
-    () => [`${head} <b>Olha o que a gente encontrou!</b>`, '', title, '', priceLine, couponLine, '', `${go} Aproveite: ${link}`],
-    () => [`${head} <b>Oferta boa demais pra deixar passar</b>`, '', title, '', priceLine, couponLine, '', warn, '', `${go} ${link}`],
-    () => [`\ud83e\udd29 <b>Separamos essa pra voc\u00ea</b>`, '', `${head === '\ud83e\udd29' ? '' : head + ' '}${title}`, priceLine, storeLine, couponLine, '', `Garanta aqui ${go}`, link],
-    () => [`${head} <b>Achado do dia</b>`, title, '', priceLine, couponLine, '', `${go} ${link}`],
-    () => [`\ud83d\udd25 <b>Pre\u00e7o bom apareceu!</b>`, '', `${head === '\ud83d\udd25' ? '' : head + ' '}${title}`, '', priceLine, couponLine, '', warn, '', `${go} Corre ver: ${link}`],
-    () => [`\ud83c\udfaf <b>Recomenda\u00e7\u00e3o do dia</b>`, '', `${head === '\ud83c\udfaf' ? '' : head + ' '}${title}`, '', priceLine, couponLine, '', `${go} Confira aqui: ${link}`],
-  ];
-
-  const lines = templates[Math.abs(turn) % templates.length]().filter((l) => l !== null && l !== undefined);
+  const lines = [title, '', priceLine, couponLine, '', `\ud83d\udc49 ${link}`].filter((l) => l !== null && l !== undefined);
   const cleaned = [];
   for (const l of lines) { if (l === '' && (cleaned.length === 0 || cleaned[cleaned.length - 1] === '')) continue; cleaned.push(l); }
   // Linha final opcional - mas nunca deixa sair aviso de "afiliado".
@@ -254,8 +247,8 @@ async function loadQueue(destId, body) {
     .neq('status', 'IGNORED')
     .gt('current_price', 0)
     .or(`last_seen_at.gte.${since},and(last_seen_at.is.null,detected_at.gte.${since})`)
-    .order('discount_rate', { ascending: false, nullsFirst: false })
-    .limit(600);
+    .order('last_seen_at', { ascending: false, nullsFirst: false })
+    .limit(1000);
   if (hasEnded) q = q.is('ended_at', null);
   const { data, error } = await q;
   if (error) throw new Error(dbError(error));
@@ -265,11 +258,35 @@ async function loadQueue(destId, body) {
   if (logErr) throw new Error(dbError(logErr));
   const already = new Set((logs || []).map((l) => l.promotion_id));
 
+  // Quando foi a ULTIMA busca de cada nicho em cada marketplace (inclui o que ainda nao tem link de afiliado).
+  // So entra na fila o que essa ultima busca viu: o que foi achado de manha e nao apareceu na busca de agora
+  // pode ja nao estar em promocao, entao nao sai.
+  const newestByKey = new Map();
+  {
+    let nq = supabaseAdmin.from('promotions').select('watch_group_id, last_seen_at, detected_at, marketplaces(slug)').neq('status', 'IGNORED').or(`last_seen_at.gte.${since},and(last_seen_at.is.null,detected_at.gte.${since})`).order('last_seen_at', { ascending: false, nullsFirst: false }).limit(1000);
+    if (hasEnded) nq = nq.is('ended_at', null);
+    const { data: seenRows } = await nq;
+    for (const r of seenRows || []) {
+      const k = `${r.watch_group_id || 'none'}|${r.marketplaces ? r.marketplaces.slug : ''}`;
+      const t = new Date(r.last_seen_at || r.detected_at).getTime();
+      if (t && (!newestByKey.has(k) || t > newestByKey.get(k))) newestByKey.set(k, t);
+    }
+  }
+  const inLatestScan = (p) => {
+    const newest = newestByKey.get(`${p.watch_group_id || 'none'}|${p.marketplaces ? p.marketplaces.slug : ''}`);
+    if (!newest) return true;
+    const t = new Date(p.last_seen_at || p.detected_at).getTime();
+    return t >= newest - LATEST_SCAN_WINDOW_MS;
+  };
+  const suspiciousDiscount = (p) => Number(p.discount_rate) > (p.source === 'shopee_listed_price' ? MAX_DISCOUNT_LISTED_PCT : MAX_DISCOUNT_PCT);
+
   const wantNone = groupIds.includes('none');
   const mp = body.marketplace || null;
 
   let list = (data || []).filter((p) => {
     if (already.has(p.id)) return false;
+    if (!inLatestScan(p)) return false;
+    if (suspiciousDiscount(p)) return false;
     if (!/^https?:\/\//i.test(p.affiliate_url || '')) return false;
     if (mp && (!p.marketplaces || p.marketplaces.slug !== mp)) return false;
     if (groupIds.length) {
@@ -282,7 +299,7 @@ async function loadQueue(destId, body) {
   // Promocoes com queda de preco COMPROVADA saem antes das que so tem "desconto de tabela" informado
   // pela Shopee (preco de tabela inflado e comum). Dentro de cada faixa, maior desconto primeiro.
   const rank = (p) => (p.source === 'shopee_listed_price' ? 1 : 0);
-  list = list.map((p, i) => ({ p, i })).sort((a, b) => (rank(a.p) - rank(b.p)) || (a.i - b.i)).map((x) => x.p);
+  list = list.map((p, i) => ({ p, i })).sort((a, b) => (rank(a.p) - rank(b.p)) || ((Number(b.p.discount_rate) || 0) - (Number(a.p.discount_rate) || 0)) || (a.i - b.i)).map((x) => x.p);
 
   // Mesmo PRODUTO (outro vendedor, outro link) nao pode sair duas vezes:
   //  1) nao repete produto parecido com algo ja ENVIADO a este destino nas ultimas 2 semanas;
@@ -478,6 +495,11 @@ async function prepareNext(dest, body) {
     }
     // 2) preco/cupom de agora
     const v = await buildView(p);
+    if (v && v.discount && v.discount > MAX_DISCOUNT_PCT) {
+      await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: 'pulada: desconto suspeito' });
+      skippedInfo.push({ title: p.title, reason: `desconto de ${Math.round(v.discount)}% parece pre\u00e7o de tabela inflado` });
+      continue;
+    }
     if (v) { chosen = p; view = v; break; }
     await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: 'pulada: cupom n\u00e3o confirmado' });
     skippedInfo.push({ title: p.title, reason: 'o cupom dessa oferta n\u00e3o est\u00e1 mais v\u00e1lido' });
