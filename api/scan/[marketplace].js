@@ -64,6 +64,9 @@ const NETSHOES_HISTORY_MIN_GAP_HOURS = 6; // não grava o mesmo produto de novo 
 const SHOPEE_MIN_DROP_PCT = 3;              // queda real mínima contra o histórico (era 5)
 const SHOPEE_ACCEPT_LISTED_DISCOUNT = true;  // true = aceita também o "desconto de tabela" (marcado como tal; false = só queda comprovada)
 const SHOPEE_LISTED_MIN_PCT = 30;           // desconto de tabela mínimo para entrar (usado só se a linha acima for true)
+// Teto: vendedor que inflou o preço de tabela aparece como "90% OFF" (De R$ 1.990 por R$ 199) — quase sempre falso.
+// Acima disso o desconto de tabela é descartado; só entra se a QUEDA de verdade estiver no histórico do sistema.
+const SHOPEE_LISTED_MAX_PCT = 60;
 
 // Netshoes por CUPOM: o feed da Rakuten não informa promoção de produto, mas informa os cupons ativos.
 // Produto + cupom válido para ele = oferta real ("R$ X na loja, R$ Y com o cupom CÓDIGO").
@@ -1211,7 +1214,7 @@ async function processShopeeOffers(offers, marketplaceId, group, keyword, creds,
     if (drop < SHOPEE_MIN_DROP_PCT) {
       // Sem queda comprovada. Só aceita o "desconto de tabela" se o dono ligou essa opção.
       if (c.listedRate >= MIN_DISCOUNT_PCT) stats.listedOnly += 1;
-      if (SHOPEE_ACCEPT_LISTED_DISCOUNT && c.listedRate >= SHOPEE_LISTED_MIN_PCT) {
+      if (SHOPEE_ACCEPT_LISTED_DISCOUNT && c.listedRate >= SHOPEE_LISTED_MIN_PCT && c.listedRate <= SHOPEE_LISTED_MAX_PCT) {
         reference = Number((c.price / (1 - c.listedRate / 100)).toFixed(2));
         drop = c.listedRate;
         source = 'shopee_listed_price';
