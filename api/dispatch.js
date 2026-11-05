@@ -1,4 +1,4 @@
-const VERSION = 'dispatch-v2026-10-17.1';
+const VERSION = 'dispatch-v2026-11-04.1';
 
 // Carregamento protegido: se alguma peca faltar no deploy, a API responde dizendo QUAL (em vez de cair com erro 500).
 let supabaseAdmin = null;
@@ -8,6 +8,7 @@ catch (e) { LOAD_ERROR = `Nao consegui carregar o banco (src/core/database/supab
 function coupons() { try { return require('../src/core/coupons'); } catch { return {}; } }
 function shopeeClient() { try { return require('../src/integrations/shopee/client'); } catch { return {}; } }
 function dedupeLib() { try { return require('../src/core/dedupe'); } catch { return null; } }
+function lifecycle() { try { return require('../src/core/lifecycle'); } catch { return null; } }
 
 // Disparador de promo--es (Telegram autom-tico / WhatsApp assistido).
 // GET  /api/dispatch                      -> lista destinos
@@ -218,6 +219,20 @@ async function ignorePromotion(p, why) {
   await supabaseAdmin.from('integration_logs').insert({ marketplace_id: null, level: 'warn', message: `Disparador removeu da fila "${String(p.title).slice(0, 60)}": ${why}` }).then(() => {}, () => {});
 }
 
+// Promoção que acabou (anúncio removido, preço subiu, sem desconto): fica no painel como FINALIZADA,
+// com o motivo, e sai da fila de disparo. (Antes era marcada como "ignorada" ou só pulada.)
+async function endPromotion(p, why) {
+  const lc = lifecycle();
+  if (lc && await lc.endedSupported(supabaseAdmin)) {
+    await lc.markEnded(supabaseAdmin, [p.id], why);
+  } else if (why && /removido|n.o devolve/i.test(why)) {
+    await ignorePromotion(p, why); // sem o SQL 0005, mantém o comportamento antigo
+  }
+  await supabaseAdmin.from('integration_logs').insert({ marketplace_id: null, level: 'info', message: `Disparador finalizou a promocao \"${String(p.title).slice(0, 60)}\": ${why}` }).then(() => {}, () => {});
+}
+
+const isDupError = (e) => !!e && (e.code === '23505' || /duplicate key|unique constraint/i.test(e.message || ''));
+
 // ---------------- fila ----------------
 
 async function getDestination(id) {
@@ -230,6 +245,8 @@ async function loadQueue(destId, body) {
   const groupIds = Array.isArray(body.group_ids) ? body.group_ids : [];
   const since = isoAgo(QUEUE_DAYS_SEEN * DAY);
 
+  const lc = lifecycle();
+  const hasEnded = !!(lc && await lc.endedSupported(supabaseAdmin)); // promocao finalizada nunca entra na fila
   let q = supabaseAdmin
     .from('promotions')
     .select('id, title, image_url, original_url, current_price, previous_price, discount_rate, source, status, affiliate_url, watch_group_id, last_seen_at, detected_at, marketplaces(slug, name)')
@@ -239,6 +256,7 @@ async function loadQueue(destId, body) {
     .or(`last_seen_at.gte.${since},and(last_seen_at.is.null,detected_at.gte.${since})`)
     .order('discount_rate', { ascending: false, nullsFirst: false })
     .limit(600);
+  if (hasEnded) q = q.is('ended_at', null);
   const { data, error } = await q;
   if (error) throw new Error(dbError(error));
 
@@ -440,7 +458,7 @@ async function prepareNext(dest, body) {
       if (check.kind === 'badlink') {
         return { error: { status: 409, message: `Parei por seguran\u00e7a: ${check.reason}. Confira o ID de afiliado em Marketplaces antes de continuar.`, extra: { code: 'bad_link' } } };
       }
-      if (check.kind === 'dead') await ignorePromotion(p, check.reason);
+      if (check.kind === 'dead' || check.kind === 'stale') await endPromotion(p, check.reason);
       await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: `pulada: ${check.reason}` });
       skippedInfo.push({ title: p.title, reason: check.reason });
       continue;
@@ -449,6 +467,7 @@ async function prepareNext(dest, body) {
     if (check.livePrice && Math.abs(check.livePrice - Number(p.current_price)) >= 0.01) {
       const prev = p.previous_price ? Number(p.previous_price) : null;
       if (prev && check.livePrice >= prev) {
+        await endPromotion(p, 'o pre\u00e7o voltou ao normal (sem desconto agora)');
         await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: 'pulada: sem desconto agora' });
         skippedInfo.push({ title: p.title, reason: 'o pre\u00e7o atual n\u00e3o est\u00e1 mais em promo\u00e7\u00e3o' });
         continue;
@@ -484,10 +503,16 @@ async function sendNext(res, body) {
 
   if (dest.platform === 'whatsapp_manual') {
     const plain = toWhatsApp(html);
-    await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: plain });
+    const { error: logErr } = await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: plain });
+    if (isDupError(logErr)) return fail(res, 409, 'Essa promo\u00e7\u00e3o j\u00e1 foi enviada a este destino (evitei repetir).', { code: 'duplicate' });
     return res.status(200).json({ ok: true, manual: true, message: plain, promotion: { title: chosen.title, coupon: view.coupon }, remaining, skipped: skippedInfo });
   }
 
+  // RESERVA antes de enviar: se o servidor cair depois do envio, a promocao ja consta como enviada e nao repete.
+  // (O indice unico do SQL 0005 impede dois envios da mesma promocao ao mesmo destino, mesmo em disputa.)
+  const reserve = await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: toPlain(html) }).select('id').maybeSingle();
+  if (isDupError(reserve.error)) return fail(res, 409, 'Essa promo\u00e7\u00e3o j\u00e1 foi enviada a este destino (evitei repetir).', { code: 'duplicate' });
+  const reservedId = reserve.data ? reserve.data.id : null;
   try {
     let done = false;
     if (chosen.image_url && /^https:\/\//i.test(chosen.image_url) && html.length <= 1000) {
@@ -498,11 +523,12 @@ async function sendNext(res, body) {
     }
     if (!done) await telegram(dest.bot_token, 'sendMessage', { chat_id: dest.chat_id, text: html, parse_mode: 'HTML', disable_web_page_preview: false });
   } catch (err) {
+    // Nao foi enviado: libera a reserva para a promocao poder sair depois.
+    if (reservedId) await supabaseAdmin.from('dispatch_log').delete().eq('id', reservedId);
     if (err.status === 429) return fail(res, 429, 'Telegram pediu para ir mais devagar.', { code: 'rate_limited', retryAfter: err.retryAfter || 60 });
     return fail(res, 502, friendlyTelegramError(err));
   }
 
-  await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: toPlain(html) });
   res.status(200).json({ ok: true, sent: { title: chosen.title, marketplace: slugName, coupon: view.coupon }, remaining, skipped: skippedInfo });
 }
 
@@ -669,6 +695,7 @@ async function processJob(job) {
   const code = j.code;
   const msg = j.error || 'Falha ao enviar.';
   if (code === 'daily_limit' || code === 'bad_link') { await finish({ status: 'stopped', pending: null, last_error: msg }); return; }
+  if (code === 'duplicate') { await finish({ next_run_at: new Date(Date.now() + 5000).toISOString(), last_event: 'Pulei uma promocao que ja tinha sido enviada.', last_error: null }); return; }
   if (code === 'rate_limited') { await finish({ next_run_at: new Date(Date.now() + ((j.retryAfter || 60) + 1) * 1000).toISOString(), last_error: msg }); return; }
   const streak = (job.error_streak || 0) + 1;
   if (streak >= 30) { await finish({ status: 'stopped', error_streak: streak, last_error: `${msg} (parei apos 30 falhas seguidas)` }); return; }
@@ -729,8 +756,13 @@ async function prepareForBot(job) {
 
     const message = toWhatsApp(prep.html);
     // Registra JA, antes do robo enviar: se o robo cair no meio, a promocao nao se repete depois.
-    const { data: logRow } = await supabaseAdmin.from('dispatch_log')
+    const { data: logRow, error: logErr } = await supabaseAdmin.from('dispatch_log')
       .insert({ destination_id: dest.id, promotion_id: prep.chosen.id, skipped: false, message }).select('id').maybeSingle();
+    if (logErr) {
+      // Sem registro nao ha como garantir "nunca repete": nao entrega ao robo. Duplicata = ja foi enviada; tenta a proxima logo.
+      await release({ next_run_at: new Date(Date.now() + (isDupError(logErr) ? 5000 : 60000)).toISOString(), last_error: isDupError(logErr) ? null : `Nao consegui registrar o envio: ${logErr.message}`.slice(0, 200) });
+      return null;
+    }
     const imageUrl = prep.chosen.image_url && /^https:\/\//i.test(prep.chosen.image_url) ? prep.chosen.image_url : null;
     const pending = {
       log_id: logRow ? logRow.id : null, message, image_url: imageUrl, title: prep.chosen.title,
