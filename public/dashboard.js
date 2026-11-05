@@ -502,6 +502,7 @@ function renderCard(promo) {
           <span class="status-dot"></span>
           Achada em ${detectedAt}${revisto} · ${STATUS_LABEL[promo.status] || promo.status}
         </div>
+        ${Number(promo.discount_rate) > 70 ? '<div class="ended-note" title="Vendedores inflam o preço de tabela para parecer desconto. Confira o preço antes de divulgar.">⚠️ Desconto suspeito (acima de 70%) — confira antes de divulgar</div>' : ''}
         ${promo.ended_at ? `<div class="ended-note" title="${escapeHtml(promo.ended_reason || '')}">⏹ Promoção finalizada em ${new Date(promo.ended_at).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}${promo.ended_reason ? ` — ${escapeHtml(promo.ended_reason)}` : ''}</div>` : ''}
         <div class="actions">
           <a href="${promo.original_url}" target="_blank" rel="noopener">Abrir original</a>
