@@ -50,6 +50,12 @@ module.exports = async function handler(req, res) {
       ? Number((((previous_price - current_price) / previous_price) * 100).toFixed(2))
       : null;
 
+    const { data: already } = await supabaseAdmin.from('promotions').select('id, status').eq('marketplace_id', marketplace.id).eq('original_url', original_url).neq('status', 'IGNORED').limit(1);
+    if (already && already[0]) {
+      res.status(409).json({ error: 'Essa promoção já está cadastrada (mesmo link neste marketplace).' });
+      return;
+    }
+
     const { data, error } = await supabaseAdmin.from('promotions').insert({
       marketplace_id: marketplace.id,
       watch_group_id: watch_group_id || null,
