@@ -254,6 +254,12 @@ function matchCoupons(coupons, ctx) {
 
     if (reasons.length) { excluded.push({ coupon: c, reasons }); continue; }
 
+    // Cupom do ML não tem API: a única garantia é você ter testado no site. Avisa quando faz tempo.
+    const verDays = c.last_verified_at ? Math.floor((Date.now() - new Date(c.last_verified_at).getTime()) / 864e5) : null;
+    if (verDays === null) warnings.push('nunca confirmado no site: teste antes de divulgar');
+    else if (verDays > 3) warnings.push(`não confirmado há ${verDays} dias: teste antes de divulgar`);
+    if (c.valid_until && String(c.valid_until).slice(0, 10) === today) warnings.push('vence hoje');
+
     let discount = null;
     let finalPrice = null;
     if (price) {
