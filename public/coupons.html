@@ -70,6 +70,13 @@
   .cp-badge { font-size:11px; padding:2px 7px; border:1px solid var(--line); color: var(--muted); }
   .cp-badge.ok { color: var(--good); border-color: var(--good); }
   .cp-badge.warn { color: var(--accent); border-color: var(--accent); }
+  .cp-badge.bad { color: var(--bad); border-color: var(--bad); }
+  .cp-toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:14px 0 10px; }
+  .cp-toolbar select, .cp-toolbar input[type=text] { background:var(--inset); border:1px solid var(--line); color:var(--ink); padding:7px 10px; font-family:var(--font-body); font-size:12.5px; }
+  .cp-toolbar label { font-size:12.5px; color:var(--muted); display:inline-flex; gap:6px; align-items:center; cursor:pointer; }
+  .cp-sum { font-size:12.5px; color:var(--muted); flex:1; min-width:180px; }
+  .cp-paste { display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap; }
+  .cp-paste textarea { flex:1; min-width:240px; min-height:44px; background:var(--inset); border:1px solid var(--line); color:var(--ink); padding:8px 10px; font-family:var(--font-body); font-size:12.5px; resize:vertical; }
   .cp-actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   .cp-actions button, .cp-form button.small { font-size:12px; padding:6px 10px; background:transparent; border:1px solid var(--line); color: var(--ink); cursor:pointer; }
   .cp-actions button.danger { color: var(--bad); border-color: var(--bad); }
@@ -133,6 +140,10 @@
   <div class="card-block">
     <div class="card-title"><span class="mp-dot" style="background:#e7b24a;"></span> Cupons que posso divulgar</div>
     <p class="card-sub">Cadastre os cupons que você encontra e pode passar adiante (campanhas do Mercado Livre, cupons de divulgação etc.). Nada aqui é sobre vender produto seu: é só a sua lista de cupons de comprador, porque o Mercado Livre não tem nenhuma API que liste ou teste esses cupons. Use "Confirmei hoje" depois de testar um cupom no site.</p>
+    <div class="cp-paste">
+      <textarea id="f-paste" placeholder="Atalho: cole aqui o texto do cupom (ex: &quot;Cupom R$30 OFF acima de R$200, código ECONOMIZE30, válido até 15/11&quot;) e eu preencho os campos abaixo."></textarea>
+      <button class="small" id="f-paste-btn" type="button">Preencher campos</button>
+    </div>
     <div class="cp-form" id="cp-form">
       <div><label>Nome do cupom *</label><input type="text" id="f-title" placeholder="Ex: R$30 acima de R$200" /></div>
       <div><label>Código (vazio = automático)</label><input type="text" id="f-code" placeholder="Ex: ECONOMIZE30" /></div>
@@ -151,6 +162,11 @@
       <div class="full"><button class="primary" id="f-save">Salvar cupom</button> <button class="small" id="f-cancel" style="display:none;">Cancelar edição</button></div>
     </div>
     <div class="msg" id="f-msg"></div>
+    <div class="cp-toolbar">
+      <span class="cp-sum" id="cp-sum"></span>
+      <select id="cp-filter"><option value="valid">Só os válidos</option><option value="all">Todos</option><option value="expired">Vencidos</option><option value="off">Desativados</option></select>
+      <button class="small danger" id="cp-clean" style="display:none;">Remover vencidos</button>
+    </div>
     <div class="cp-list" id="cp-all"></div>
   </div>
 
