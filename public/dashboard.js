@@ -185,6 +185,15 @@ function promotionsSinceISO() {
   return null; // "Todos os dias"
 }
 
+// Quais linhas buscar para o período: as achadas no período, as que FINALIZARAM nele e (só em "todas as vistas")
+// as revistas. Antes entrava tudo que foi "visto" desde ontem — milhares de linhas que o filtro jogava fora.
+function promotionsPeriodFilter(since) {
+  const parts = [`detected_at.gte.${since}`];
+  if (endedColumnOk) parts.push(`ended_at.gte.${since}`);
+  if (currentDateFilter === 'TODAY_SEEN') parts.push(`last_seen_at.gte.${since}`);
+  return parts.join(',');
+}
+
 async function loadPromotions() {
   const seq = ++loadSeq;
   const since = promotionsSinceISO();
@@ -198,7 +207,7 @@ async function loadPromotions() {
       .order('detected_at', { ascending: false })
       .order('id', { ascending: true })
       .range(from, from + PROMO_PAGE - 1);
-    if (since) query = query.or(`detected_at.gte.${since},last_seen_at.gte.${since}${endedColumnOk ? `,ended_at.gte.${since}` : ''}`);
+    if (since) query = query.or(promotionsPeriodFilter(since));
 
     const { data, error } = await query;
     if (error && endedColumnOk && /ended_at/i.test(error.message || '')) {
@@ -785,7 +794,7 @@ async function confirmScan() {
   const marketplaceNames = { mercadolivre: 'Mercado Livre', shopee: 'Shopee', amazon: 'Amazon', netshoes: 'Netshoes' };
   const marketplaceName = marketplaceNames[marketplace] || marketplace;
 
-  const agg = { found: 0, checked: 0, kwDone: 0, notes: [], errors: [], retry: [], failures: 0, lastError: '', categories: undefined };
+  const agg = { found: 0, checked: 0, kwDone: 0, kwFailed: 0, notes: [], errors: [], retry: [], failures: 0, lastError: '', categories: undefined };
   const totalKw = keywords.length;
 
   // Monta os lotes. Amazon busca por categoria (um pedido só). O primeiro lote também confere os produtos vigiados.
@@ -809,6 +818,7 @@ async function confirmScan() {
         if (data.categoriesScanned !== undefined) agg.categories = (agg.categories || 0) + data.categoriesScanned;
         const skipped = Array.isArray(data.skippedKeywords) ? data.skippedKeywords : [];
         agg.kwDone += (typeof data.keywordsSearched === 'number' ? data.keywordsSearched : Math.max(0, batch.kws.length - skipped.length));
+        agg.kwFailed += (typeof data.keywordsFailed === 'number' ? data.keywordsFailed : 0);
         skipped.forEach((k) => agg.retry.push(k));
         (data.errors || []).forEach((er) => agg.errors.push(er));
         if (data.note && !agg.notes.includes(data.note)) agg.notes.push(data.note);
@@ -834,10 +844,10 @@ async function confirmScan() {
 
     if (agg.kwDone === 0 && agg.checked === 0 && agg.failures > 0 && agg.lastError) throw new Error(agg.lastError);
 
-    const pending = marketplace === 'amazon' ? 0 : Math.max(0, totalKw - agg.kwDone);
+    const pending = marketplace === 'amazon' ? 0 : Math.max(0, totalKw - agg.kwDone - agg.kwFailed);
     const scannedLabel = agg.categories !== undefined
       ? `${agg.categories} categoria(s)`
-      : totalKw ? `${agg.kwDone} de ${totalKw} palavra(s)-chave` : `${agg.checked} produto(s)`;
+      : totalKw ? `${agg.kwDone} de ${totalKw} palavra(s)-chave${agg.kwFailed ? ` (${agg.kwFailed} recusada(s) pelo marketplace)` : ''}` : `${agg.checked} produto(s)`;
     const notes = agg.notes.slice(0, 2).join(' ');
     const moreNotes = agg.notes.length > 2 ? ` (+${agg.notes.length - 2} aviso(s))` : '';
     const pendingNote = pending > 0 ? ` — ${pending} palavra(s) não foram buscadas${agg.lastError ? ` (${agg.lastError})` : ''}; clique em buscar de novo para completar` : '';
