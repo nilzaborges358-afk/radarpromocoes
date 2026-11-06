@@ -56,8 +56,10 @@ async function graphqlRequest(appId, appSecret, query, variables) {
  * daquele anúncio, não uma oferta relâmpago com prazo. Isso é um limite real
  * da API pública de afiliados, não algo que dá pra contornar aqui.
  */
+let extendedFieldsWork = true; // vira false (até reiniciar) se a Shopee recusar os campos extras
+
 async function searchProductOffers(appId, appSecret, keyword, { page = 1, limit = 40, sortType = 2 } = {}) {
-  const query = `
+  const build = (extra) => `
     query ProductOfferQuery($keyword: String, $page: Int, $limit: Int, $sortType: Int) {
       productOfferV2(keyword: $keyword, page: $page, limit: $limit, sortType: $sortType) {
         nodes {
@@ -70,11 +72,23 @@ async function searchProductOffers(appId, appSecret, keyword, { page = 1, limit 
           imageUrl
           offerLink
           productLink
+          ${extra}
         }
       }
     }
   `;
-  const data = await graphqlRequest(appId, appSecret, query, { keyword, page, limit, sortType });
+  // Campos extras (vendas, nota, loja) alimentam o "score de venda". Se a Shopee não aceitar algum deles,
+  // volta sozinho para a consulta simples — a busca nunca deixa de funcionar por causa disso.
+  if (extendedFieldsWork) {
+    try {
+      const data = await graphqlRequest(appId, appSecret, build('sales\n          ratingStar\n          shopName'), { keyword, page, limit, sortType });
+      return data?.productOfferV2?.nodes || [];
+    } catch (err) {
+      if (/Cannot query field|Unknown field|FieldUndefined|validation/i.test(String(err.message))) extendedFieldsWork = false;
+      else throw err;
+    }
+  }
+  const data = await graphqlRequest(appId, appSecret, build(''), { keyword, page, limit, sortType });
   return data?.productOfferV2?.nodes || [];
 }
 
