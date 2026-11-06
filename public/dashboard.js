@@ -14,8 +14,9 @@ let endedColumnOk = true; // vira false se o SQL 0005 ainda não foi rodado (col
 let client = null;
 let currentStatus = 'ALL';
 // Filtros novos: uma busca livre + "chips" clicáveis (podem marcar vários). Sem listas em cascata.
-const filters = { q: '', marketplaces: new Set(), groups: new Set(), keyword: null, keywordLabel: '' };
-let currentSort = 'recent';
+const DEFAULT_TIERS = () => new Set(['top', 'good']); // funil: por padrão só Destaques e Boas (as Comuns ficam escondidas)
+const filters = { q: '', marketplaces: new Set(), groups: new Set(), keyword: null, keywordLabel: '', tiers: DEFAULT_TIERS(), top12: false };
+let currentSort = 'score';
 let currentDateFilter = 'TODAY';
 let allPromotions = [];
 let knownGroups = [];
@@ -244,15 +245,19 @@ function applySearch(list) {
 function sortList(list) {
   const arr = [...list];
   const num = (v) => Number(v) || 0;
-  if (currentSort === 'discount') arr.sort((a, b) => num(b.discount_rate) - num(a.discount_rate));
+  if (currentSort === 'score') arr.sort((a, b) => ((b._sc ? b._sc.score : 0) - (a._sc ? a._sc.score : 0)) || (num(b.discount_rate) - num(a.discount_rate)));
+  else if (currentSort === 'discount') arr.sort((a, b) => num(b.discount_rate) - num(a.discount_rate));
   else if (currentSort === 'price_asc') arr.sort((a, b) => num(a.current_price) - num(b.current_price));
   else if (currentSort === 'price_desc') arr.sort((a, b) => num(b.current_price) - num(a.current_price));
   else arr.sort((a, b) => String(b.detected_at).localeCompare(String(a.detected_at)));
   return arr;
 }
 
+function tiersAreDefault() {
+  return filters.tiers.size === 2 && filters.tiers.has('top') && filters.tiers.has('good');
+}
 function hasActiveFilters() {
-  return !!(filters.q.trim() || filters.marketplaces.size || filters.groups.size || filters.keyword);
+  return !!(filters.q.trim() || filters.marketplaces.size || filters.groups.size || filters.keyword || !tiersAreDefault() || filters.top12);
 }
 
 function clearAllFilters() {
@@ -261,12 +266,14 @@ function clearAllFilters() {
   filters.groups.clear();
   filters.keyword = null;
   filters.keywordLabel = '';
-  currentSort = 'recent';
+  currentSort = 'score';
+  filters.tiers = DEFAULT_TIERS();
+  filters.top12 = false;
   const dateChanged = currentDateFilter !== 'TODAY';
   currentDateFilter = 'TODAY';
   document.getElementById('searchInput').value = '';
   document.getElementById('searchBox').classList.remove('has-text');
-  document.getElementById('sortFilter').value = 'recent';
+  document.getElementById('sortFilter').value = 'score';
   document.getElementById('dateFilter').value = 'TODAY';
   document.getElementById('customDateRange').classList.remove('show');
   if (dateChanged) loadPromotions(); else render();
@@ -285,6 +292,9 @@ function onFilterBarClick(e) {
   else if (type === 'mp') toggleInSet(filters.marketplaces, value);
   else if (type === 'group-all') filters.groups.clear();
   else if (type === 'group') toggleInSet(filters.groups, value);
+  else if (type === 'tier-all') filters.tiers = new Set(['top', 'good', 'common']);
+  else if (type === 'tier') { toggleInSet(filters.tiers, value); if (!filters.tiers.size) filters.tiers = DEFAULT_TIERS(); }
+  else if (type === 'top12') filters.top12 = !filters.top12;
   else if (type === 'kw-remove') { filters.keyword = null; filters.keywordLabel = ''; }
   render();
 }
@@ -333,7 +343,32 @@ function renderFilterChips(collapsedAll, mpOk, grOk) {
   }
   active.style.display = parts.length ? '' : 'none';
   document.getElementById('activeChips').innerHTML = parts.join('');
-  document.getElementById('clearFilters').style.display = (hasActiveFilters() || currentSort !== 'recent' || currentDateFilter !== 'TODAY') ? '' : 'none';
+  document.getElementById('clearFilters').style.display = (hasActiveFilters() || currentSort !== 'score' || currentDateFilter !== 'TODAY') ? '' : 'none';
+}
+
+// Chips de qualidade (o funil). Os números respeitam os outros filtros.
+function renderQualityChips(items) {
+  const n = { top: 0, good: 0, common: 0 };
+  items.forEach((p) => { n[p._sc.tier] += 1; });
+  document.getElementById('qualChips').innerHTML =
+    chipHtml({ type: 'tier', value: 'top', label: '🔥 Destaques', count: n.top, on: filters.tiers.has('top') }) +
+    chipHtml({ type: 'tier', value: 'good', label: '✅ Boas', count: n.good, on: filters.tiers.has('good') }) +
+    chipHtml({ type: 'tier', value: 'common', label: 'Comuns', count: n.common, on: filters.tiers.has('common') }) +
+    chipHtml({ type: 'tier-all', label: 'Todas', on: filters.tiers.size === 3 }) +
+    `<button type="button" class="chip ${filters.top12 ? 'on' : ''}" data-chip="top12" title="Mostra só as 12 melhores, variando loja e nicho — a lista pronta para divulgar hoje">⭐ Top 12 do dia</button>`;
+}
+
+// Seleção "de influenciador": as 12 de maior score, mas variando — no máximo 3 do mesmo nicho e 6 da mesma loja,
+// para o cliente não receber 12 produtos iguais.
+function pickTop12(sorted) {
+  const out = []; const perGroup = new Map(); const perMp = new Map();
+  for (const p of sorted) {
+    if (out.length >= 12) break;
+    const g = promoGroupKey(p); const m = p.marketplaces?.slug || '?';
+    if ((perGroup.get(g) || 0) >= 3 || (perMp.get(m) || 0) >= 6) continue;
+    out.push(p); perGroup.set(g, (perGroup.get(g) || 0) + 1); perMp.set(m, (perMp.get(m) || 0) + 1);
+  }
+  return out;
 }
 
 function render() {
@@ -351,11 +386,16 @@ function render() {
   const ignoredAll = base.filter((p) => p.status === 'IGNORED');
   const collapsedAll = collapseDuplicates(base.filter((p) => p.status !== 'IGNORED'));
 
+  // FUNIL: cada promoção ganha um score de venda (0-100) e uma faixa: Destaque / Boa / Comum.
+  collapsedAll.forEach((p) => { p._sc = window.Score ? window.Score.compute(p) : { score: 60, tier: 'good', good: [], bad: [] }; });
+
   const mpOk = (p) => !filters.marketplaces.size || filters.marketplaces.has(p.marketplaces?.slug);
   const grOk = (p) => !filters.groups.size || filters.groups.has(promoGroupKey(p));
-  renderFilterChips(currentStatus === 'ENDED' ? endedBase : collapsedAll, mpOk, grOk);
+  const tierOk = (p) => filters.tiers.has(p._sc.tier);
+  renderFilterChips(currentStatus === 'ENDED' ? endedBase : collapsedAll.filter(tierOk), mpOk, grOk);
+  renderQualityChips(collapsedAll.filter((p) => mpOk(p) && grOk(p)));
 
-  const visible = collapsedAll.filter((p) => mpOk(p) && grOk(p));
+  let visible = collapsedAll.filter((p) => mpOk(p) && grOk(p) && tierOk(p));
   const ignored = ignoredAll.filter((p) => mpOk(p) && grOk(p));
   const endedList = endedBase.filter((p) => mpOk(p) && grOk(p));
 
@@ -373,6 +413,10 @@ function render() {
   else if (currentStatus === 'ENDED') list = endedList;
   else if (currentStatus !== 'ALL') list = visible.filter((p) => p.status === currentStatus);
   list = sortList(list);
+  if (filters.top12 && currentStatus !== 'IGNORED' && currentStatus !== 'ENDED') list = pickTop12(list);
+  const hiddenCommon = filters.tiers.has('common') ? 0 : collapsedAll.filter((p) => mpOk(p) && grOk(p) && p._sc.tier === 'common').length;
+  document.getElementById('hiddenNote').textContent = hiddenCommon ? `${hiddenCommon} promoção(ões) comum(ns) escondida(s) pelo funil — clique em “Comuns” para ver.` : '';
+  document.getElementById('hiddenNote').style.display = hiddenCommon ? 'block' : 'none';
 
   if (list.length === 0) {
     grid.innerHTML = '';
@@ -502,6 +546,7 @@ function renderCard(promo) {
           <span class="status-dot"></span>
           Achada em ${detectedAt}${revisto} · ${STATUS_LABEL[promo.status] || promo.status}
         </div>
+        ${promo._sc ? `<div class="score-pill tier-${promo._sc.tier}" title="${escapeHtml([...(promo._sc.good || []).map((t) => '✔ ' + t), ...(promo._sc.bad || []).map((t) => '✖ ' + t)].join('\n'))}">${promo._sc.tier === 'top' ? '🔥' : promo._sc.tier === 'good' ? '✅' : '•'} Score ${promo._sc.score} · ${window.Score ? window.Score.TIER_LABEL[promo._sc.tier] : ''}</div>` : ''}
         ${Number(promo.discount_rate) > 70 ? '<div class="ended-note" title="Vendedores inflam o preço de tabela para parecer desconto. Confira o preço antes de divulgar.">⚠️ Desconto suspeito (acima de 70%) — confira antes de divulgar</div>' : ''}
         ${promo.ended_at ? `<div class="ended-note" title="${escapeHtml(promo.ended_reason || '')}">⏹ Promoção finalizada em ${new Date(promo.ended_at).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}${promo.ended_reason ? ` — ${escapeHtml(promo.ended_reason)}` : ''}</div>` : ''}
         <div class="actions">
