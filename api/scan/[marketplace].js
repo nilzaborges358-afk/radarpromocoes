@@ -1,1330 +1,969 @@
-const mlClient = require('../../src/integrations/mercadolivre/client');
-const { searchProductOffers, generateShortLink } = require('../../src/integrations/shopee/client');
-const netshoesClient = require('../../src/integrations/netshoes/client');
-const { supabaseAdmin } = require('../../src/core/database/supabaseClient');
-const { loadNetshoesCoupons, bestNetshoesCoupon } = require('../../src/core/coupons');
-const { loadRecentIndex } = require('../../src/core/dedupe');
-// "Promoção finalizada" (src/core/lifecycle.js). Se esse arquivo ainda não foi publicado, a busca segue normal,
-// só sem finalizar promoções — nunca derruba a busca inteira.
-let lifecycle;
-try { lifecycle = require('../../src/core/lifecycle'); } catch { lifecycle = null; }
-const reviveFields = async (...a) => (lifecycle ? lifecycle.reviveFields(...a) : {});
-const markEnded = async (...a) => (lifecycle ? lifecycle.markEnded(...a) : 0);
-const sweepStale = async (...a) => (lifecycle ? lifecycle.sweepStale(...a) : 0);
+const VERSION = 'dispatch-v2026-11-05.2';
 
-// Mercado Livre (lista de vigilância): a busca por categoria/palavra-chave do ML (/sites/MLB/search)
-// responde 403 para apps comuns, então o scan confere os PRODUTOS da lista de vigilância um a um.
-// Promoção = o ML informa preço "de" maior que o atual (sale_price) OU o preço atual caiu contra o
-// que o sistema já viu nos últimos 7 dias (mesmo método da Shopee/Netshoes).
-const ML_CONCURRENCY = 4;
-const ML_MIN_DROP_PCT = 3;   // era 5 — mais produtos vigiados entram como promoção
-const ML_HISTORY_DAYS = 7;
-// Descoberta automática por palavra-chave (catálogo do ML): quantos produtos pedir por palavra, de
-// quantas "páginas" sortear (variedade a cada busca) e o teto total por busca.
-const ML_DISCOVERY_PAGE_SIZE = 10;
-const ML_DISCOVERY_MAX_PAGE = 5;
-const ML_DISCOVERY_MAX_CANDIDATES = 200;
-const ML_DISCOVERY_CONCURRENCY = 8;
-const ML_DISCOVERY_MIN_DISCOUNT_PCT = 7;  // era 10 — para voltar ao mais exigente, ponha 10
+// Carregamento protegido: se alguma peca faltar no deploy, a API responde dizendo QUAL (em vez de cair com erro 500).
+let supabaseAdmin = null;
+let LOAD_ERROR = null;
+try { supabaseAdmin = require('../src/core/database/supabaseClient').supabaseAdmin; }
+catch (e) { LOAD_ERROR = `Nao consegui carregar o banco (src/core/database/supabaseClient.js): ${e.message}`; }
+function coupons() { try { return require('../src/core/coupons'); } catch { return {}; } }
+function shopeeClient() { try { return require('../src/integrations/shopee/client'); } catch { return {}; } }
+function dedupeLib() { try { return require('../src/core/dedupe'); } catch { return null; } }
+function scoreLib() { try { return require('../public/score.js'); } catch { return null; } }
+function lifecycle() { try { return require('../src/core/lifecycle'); } catch { return null; } }
 
-const MIN_DISCOUNT_PCT = 10; // era 15 — baixei pra achar mais resultado em categorias mais de nicho
+// Disparador de promo--es (Telegram autom-tico / WhatsApp assistido).
+// GET  /api/dispatch                      -> lista destinos
+// POST /api/dispatch { action: ... }      -> create_destination | delete_destination | test | queue | verify | send_next | job_start | job_stop | job_ack | tick | bot_poll | bot_ack
+// Modo ROBO (WhatsApp 100% automatico): o servidor prepara a mensagem na hora certa e o robo que roda no
+// notebook (robo-whatsapp) busca em bot_poll, envia no WhatsApp e confirma em bot_ack.
+// Precisa das tabelas dispatch_destinations e dispatch_log (SQL em supabase/migrations/0002_disparador.sql).
 
-// Variedade na Shopee: a cada busca, sorteia a ordenação (1 relevância, 2 mais
-// vendidos, 5 maior comissão) e a página (1 a 3). Sem isso, a mesma lista de
-// campeões de venda volta todos os dias.
-const SHOPEE_SORT_ROTATION = [1, 2, 5];
+const QUEUE_DAYS_SEEN = 1;     // so promocoes vistas pela busca nas ultimas 24h (precos de hoje)
+const LATEST_SCAN_WINDOW_MS = 45 * 60 * 1000; // so entra a promocao da ULTIMA busca de cada nicho/marketplace (uma busca leva alguns minutos)
+const MAX_DISCOUNT_PCT = 70;          // acima disso quase sempre e preco de tabela inflado ("90% OFF") — nao dispara
+const MAX_DISCOUNT_LISTED_PCT = 60;   // desconto so de tabela (Shopee) tem teto menor
+const NO_REPEAT_DAYS = 14;     // n\u00e3o repete a mesma promo\u00e7\u00e3o no mesmo destino por 2 semanas
+const MIN_GAP_SECONDS = 20;    // trava anti-duplo-clique
+const COUPON_CACHE_MS = 10 * 60 * 1000;
+let couponCache = { at: 0, list: null };
 
-// Tempo máximo gasto buscando (a função da Vercel é configurada para 60s no vercel.json).
-// Passou disso, a busca para de abrir novas consultas e avisa quantas ficaram pra próxima.
-const SCAN_BUDGET_MS = 48000;
-const NETSHOES_CONCURRENCY = 3;
-// Shopee: quantos produtos pedir POR palavra-chave (fixo — antes era 40 dividido pelo nº de palavras do grupo,
-// então quanto mais palavras, menos produtos cada uma trazia) e quantas palavras buscar ao mesmo tempo.
-const SHOPEE_PER_KEYWORD_LIMIT = 40;
-const SHOPEE_CONCURRENCY = 2;
-// Quantos produtos pedir por palavra-chave e de quantas páginas sortear. Antes eram só 30 por
-// palavra (sempre os mesmos 30 do topo) — por isso o total parecia "fixo" em ~120 produtos.
-const NETSHOES_PAGE_SIZE = 100;
-const NETSHOES_MAX_PAGE = 3;
+// ---------------- utilit-rios ----------------
 
-// Netshoes: não existe mais um "10% fixo". O produto entra como promoção quando o preço atual
-// está abaixo do preço "normal" dele, qualquer que seja o tamanho da queda (5%, 8%, 23%...).
-// - Preço normal = mediana dos preços que o sistema registrou nos últimos 7 dias.
-// - Produto visto pela primeira vez (sem histórico ainda): usa o preço "de" informado pela Netshoes.
-// NETSHOES_MIN_DROP_PCT é só um piso para ignorar variação de centavos (ponha 0 se quiser tudo).
-const NETSHOES_MIN_DROP_PCT = 2;
-const NETSHOES_HISTORY_DAYS = 7;       // janela de comparação
-const NETSHOES_HISTORY_KEEP_DAYS = 30; // histórico mais velho que isso é apagado
-const NETSHOES_HISTORY_MIN_GAP_HOURS = 6; // não grava o mesmo produto de novo em menos de 6h
+const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const money = (n) => Number(n).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const r2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+const isoAgo = (ms) => new Date(Date.now() - ms).toISOString();
+const DAY = 24 * 60 * 60 * 1000;
 
-// Shopee: o campo priceDiscountRate da API é só "preço de tabela vs preço de venda" do anúncio —
-// muitos vendedores deixam um preço de tabela inflado PARA SEMPRE, então ele aparece como "desconto"
-// em toda busca, sem nunca ter havido queda real. Por isso a Shopee agora usa o mesmo método da
-// Netshoes: só é promoção quando o preço ATUAL está abaixo do que o sistema já viu nos últimos 7 dias.
-const SHOPEE_MIN_DROP_PCT = 3;              // queda real mínima contra o histórico (era 5)
-const SHOPEE_ACCEPT_LISTED_DISCOUNT = true;  // true = aceita também o "desconto de tabela" (marcado como tal; false = só queda comprovada)
-const SHOPEE_LISTED_MIN_PCT = 30;           // desconto de tabela mínimo para entrar (usado só se a linha acima for true)
-// Teto: vendedor que inflou o preço de tabela aparece como "90% OFF" (De R$ 1.990 por R$ 199) — quase sempre falso.
-// Acima disso o desconto de tabela é descartado; só entra se a QUEDA de verdade estiver no histórico do sistema.
-const SHOPEE_LISTED_MAX_PCT = 60;
-
-// Netshoes por CUPOM: o feed da Rakuten não informa promoção de produto, mas informa os cupons ativos.
-// Produto + cupom válido para ele = oferta real ("R$ X na loja, R$ Y com o cupom CÓDIGO").
-const NETSHOES_COUPON_MIN_PCT = 5;          // desconto mínimo do cupom para virar oferta
-const NETSHOES_COUPON_MAX_PER_SCAN = 20;    // teto de ofertas por cupom em cada busca (cupom do site todo vale pra tudo)
-
-// GET  /api/scan/mercadolivre?groups=id1,id2,none
-// POST /api/scan/mercadolivre   { groups: ['id1','id2','none'] }   (usado pelo painel — não tem limite de tamanho de URL)
-// GET /api/scan/shopee?groups=id1,id2
-// Antes eram 2 functions separadas — juntei num arquivo dinâmico só.
-module.exports = async function handler(req, res) {
-  const slug = req.query.marketplace;
-  if (slug === 'mercadolivre') return scanMercadoLivre(req, res);
-  if (slug === 'shopee') return scanShopee(req, res);
-  if (slug === 'amazon') return scanAmazon(req, res);
-  if (slug === 'netshoes') return scanNetshoes(req, res);
-  res.status(404).json({ error: `Marketplace "${slug}" não suportado.` });
-};
-
-// ---------------- Utilitários de grupos ----------------
-
-function cleanText(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim();
+function fail(res, status, error, extra) {
+  res.status(status).json({ error, ...(extra || {}) });
 }
 
-function normKey(value) {
-  return cleanText(value).toLowerCase();
+function tableMissing(error) {
+  const m = String((error && (error.message || error)) || '');
+  return (error && error.code === '42P01') || /does not exist|schema cache|relation .* not found/i.test(m);
 }
 
-function splitKeywords(value) {
-  return String(value || '').split(',').map(cleanText).filter(Boolean);
-}
-
-// Lista de ids de grupos escolhidos no painel (null = sem filtro, vale tudo).
-function getGroupsParam(req) {
-  if (req.method === 'POST') {
-    const list = req.body && req.body.groups;
-    if (Array.isArray(list)) return list.map(String).filter(Boolean);
-    if (typeof list === 'string' && list) return list.split(',').filter(Boolean);
-    return null;
+function dbError(error) {
+  if (tableMissing(error)) {
+    return 'As tabelas do disparador ainda nao existem no Supabase. Rode os SQLs 0002_disparador.sql e 0003_disparo_continuo.sql (SQL Editor > New query) e tente de novo.';
   }
-  return req.query.groups ? String(req.query.groups).split(',').filter(Boolean) : null;
+  return `banco de dados: ${error.message || error}`;
 }
 
-// Lote de palavras-chave escolhido pelo painel (null = todas as palavras dos grupos escolhidos).
-// O painel manda as palavras em lotes pequenos, para nenhuma ficar de fora por limite de tempo.
-function getKeywordsParam(req) {
-  const raw = req.method === 'POST'
-    ? (req.body && req.body.keywords)
-    : (req.query.keywords ? String(req.query.keywords).split('|') : null);
-  if (!Array.isArray(raw)) return null;
-  const set = new Set(raw.map(normKey).filter(Boolean));
-  return set.size ? set : null;
-}
-
-// Mantém só as palavras do lote dentro de cada grupo (e descarta grupos que ficaram sem palavra).
-function filterGroupKeywords(groups, keywordSet) {
-  if (!keywordSet) return groups;
-  return (groups || [])
-    .map((g) => {
-      const kws = g.keywords.filter((k) => keywordSet.has(normKey(k)));
-      return { ...g, keywords: kws, search_keyword: kws.join(', ') };
-    })
-    .filter((g) => g.keywords.length > 0);
-}
-
-// Cada grupo escolhe em quais marketplaces roda (coluna watch_groups.marketplaces).
-// Vazio/ausente = roda em todos (é o caso dos grupos antigos).
-function groupRunsOn(row, slug) {
-  const list = row && row.marketplaces;
-  return !Array.isArray(list) || list.length === 0 || list.includes(slug);
-}
-
-// Tudo que tem o MESMO nome vira UM grupo só, com todas as palavras-chave somadas
-// (sem repetir). Assim 30 linhas "Beleza" viram 1 grupo "Beleza" — e a mesma palavra
-// nunca é buscada duas vezes.
-function mergeGroupsByName(rows) {
-  const sorted = [...(rows || [])].sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
-  const map = new Map();
-  for (const g of sorted) {
-    const key = normKey(g.name);
-    if (!map.has(key)) map.set(key, { id: g.id, ids: [], name: cleanText(g.name), keywords: [] });
-    const merged = map.get(key);
-    merged.ids.push(g.id);
-    for (const kw of splitKeywords(g.search_keyword || g.name)) {
-      if (!merged.keywords.some((k) => normKey(k) === normKey(kw))) merged.keywords.push(kw);
-    }
-  }
-  return [...map.values()].map((m) => ({ ...m, search_keyword: m.keywords.join(', ') }));
-}
-
-// ---------------- Mercado Livre ----------------
-
-async function scanMercadoLivre(req, res) {
+async function telegram(token, method, payload) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 12000);
   try {
-    const startedAt = Date.now();
-    const { data: marketplace } = await supabaseAdmin
-      .from('marketplaces')
-      .select('id')
-      .eq('slug', 'mercadolivre')
-      .single();
-
-    const { data: allProducts } = await supabaseAdmin
-      .from('products')
-      .select('*')
-      .eq('marketplace_id', marketplace.id);
-
-    const groupsParam = getGroupsParam(req);
-    const keywordSet = getKeywordsParam(req);
-    // Em lotes, os produtos vigiados só são conferidos no primeiro lote (o painel manda products:false nos demais).
-    const includeProducts = !(req.method === 'POST' && req.body && req.body.products === false);
-    const products = !includeProducts ? [] : groupsParam
-      ? (allProducts || []).filter((p) => groupsParam.includes(p.watch_group_id || 'none'))
-      : allProducts || [];
-
-    // Grupos marcados no painel (menos "Sem grupo") com palavras-chave = busca automática de promoções.
-    const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
-    const selectedGroups = groupsParam
-      ? (allGroups || []).filter((g) => groupsParam.includes(g.id))
-      : allGroups || [];
-    const discoveryGroups = filterGroupKeywords(mergeGroupsByName(selectedGroups.filter((g) => groupRunsOn(g, 'mercadolivre'))), keywordSet).filter((g) => g.keywords.length > 0);
-
-    if (products.length === 0 && discoveryGroups.length === 0) {
-      res.status(200).json({
-        ok: true,
-        productsChecked: 0,
-        promotionsFound: 0,
-        errors: [],
-        note: 'Nada para buscar: não há produtos na lista de vigilância do Mercado Livre nem grupos com palavras-chave marcados.',
-      });
-      return;
-    }
-
-    // Token da sua conta, renovado se vencido (a doc do ML exige "Authorization: Bearer" nas chamadas).
-    const { token, reason: tokenReason } = await mlClient.getAccessToken(supabaseAdmin);
-
-    // Histórico dos últimos 7 dias de todos os produtos, numa consulta só (em lotes de 100 ids).
-    const since = new Date(Date.now() - ML_HISTORY_DAYS * 86400000).toISOString();
-    const history = new Map();
-    for (const ids of chunk(products.map((p) => p.id), 100)) {
-      const { data: rows } = await supabaseAdmin
-        .from('product_price_history')
-        .select('product_id, price')
-        .in('product_id', ids)
-        .gte('checked_at', since);
-      for (const r of rows || []) {
-        if (!history.has(r.product_id)) history.set(r.product_id, []);
-        history.get(r.product_id).push(Number(r.price));
-      }
-    }
-
-    const ctx = { token, history, marketplaceId: marketplace.id };
-    const stats = { found: 0, checked: 0, skipped: 0, via: {}, statuses: {}, errors: [] };
-
-    for (const batch of chunk(products, ML_CONCURRENCY)) {
-      if (Date.now() - startedAt > SCAN_BUDGET_MS) {
-        stats.skipped += batch.length;
-        continue;
-      }
-      await Promise.all(
-        batch.map(async (product) => {
-          try {
-            const r = await checkMlProduct(product, ctx);
-            stats.checked += 1;
-            stats.found += r.found;
-            stats.via[r.source] = (stats.via[r.source] || 0) + 1;
-          } catch (err) {
-            stats.errors.push(`${product.source_item_id}: ${err.message}`);
-            for (const st of err.statuses || []) stats.statuses[st] = (stats.statuses[st] || 0) + 1;
-          }
-        })
-      );
-    }
-
-    // ----- Descoberta automática por palavra-chave (o ML bloqueia /sites/MLB/search; usa o catálogo) -----
-    const disc = { searched: 0, candidates: 0, checked: 0, found: 0, searchErrors: [], statuses: {}, reasons: {}, skippedKeywords: [] };
-    if (discoveryGroups.length > 0 && Date.now() - startedAt < SCAN_BUDGET_MS) {
-      await discoverMlPromotions({ groups: discoveryGroups, ctx, startedAt, disc });
-      stats.found += disc.found;
-    }
-
-    const swept = (stats.checked + disc.searched) > 0 ? await sweepStale(supabaseAdmin, marketplace.id) : 0;
-
-    if (stats.errors.length) {
-      await supabaseAdmin.from('integration_logs').insert({
-        marketplace_id: marketplace.id,
-        level: 'error',
-        message: `Scan ML: ${stats.errors.length} de ${products.length} produtos falharam. Exemplo: ${stats.errors[0]}`.slice(0, 900),
-      });
-    }
-
-    const notes = [];
-    if (!token) notes.push(`Sem token válido da sua conta do ML: ${tokenReason}.`);
-    if (swept > 0) notes.push(`${swept} promoção(ões) marcada(s) como finalizada(s) (sem aparecer nas buscas há dias).`);
-    const via = Object.entries(stats.via).map(([k, v]) => `${v} via ${k}`).join(', ');
-    if (via) notes.push(`Leitura: ${via}.`);
-    if (stats.skipped) notes.push(`${stats.skipped} produto(s) ficaram para a próxima busca (tempo máximo do servidor).`);
-    if (discoveryGroups.length > 0) {
-      if (disc.searched > 0) {
-        notes.push(
-          `Busca automática: ${disc.searched} palavra(s) pesquisada(s) no catálogo, ${disc.candidates} produto(s) avaliado(s), ${disc.found} promoção(ões) nova(s).`
-        );
-      }
-      const topReasons = Object.entries(disc.reasons).sort((a, b) => b[1] - a[1]).slice(0, 3);
-      if (topReasons.length > 0) {
-        notes.push(`Motivos de produtos sem preço: ${topReasons.map(([m, n]) => `${n}× ${m}`).join(' | ')}`);
-      }
-      if (disc.searchErrors.length > 0) {
-        const all403 = disc.searched === 0 && (disc.statuses[403] || 0) > 0;
-        notes.push(
-          all403
-            ? 'A busca por palavra-chave no catálogo do ML também respondeu 403 para o seu app — nesse caso o ML não libera descoberta automática e só resta a lista de vigilância (ou pedir liberação em Suporte → Acessos → Desbloqueio/Forbidden).'
-            : `Busca automática com erro: ${disc.searchErrors[0]}`
-        );
-      }
-    }
-    if (stats.errors.length && stats.checked === 0 && (stats.statuses[403] || 0) > 0) {
-      notes.push(
-        'O Mercado Livre respondeu 403 (bloqueio) para todas as consultas. Confira no DevCenter do ML se o app NÃO tem lista de IPs permitidos (a Vercel usa IPs variáveis), reconecte a conta em /api/auth/mercadolivre e, se persistir, abra pedido em Suporte → Acessos → Desbloqueio/Forbidden.'
-      );
-    }
-    if (stats.checked > 0 && stats.found === 0) {
-      notes.push(
-        `${stats.checked} produto(s) consultado(s), nenhum em promoção agora (sem preço "de" maior e sem queda de ${ML_MIN_DROP_PCT}% ou mais contra os últimos ${ML_HISTORY_DAYS} dias — a comparação com o histórico só passa a valer depois de algumas buscas).`
-      );
-    }
-
-    res.status(200).json({
-      ok: true,
-      productsChecked: stats.checked + disc.checked,
-      promotionsFound: stats.found,
-      keywordsSearched: disc.searched,
-      skippedKeywords: disc.skippedKeywords,
-      errors: stats.errors,
-      note: notes.join(' ') || undefined,
+    const r = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {}),
+      signal: ctrl.signal,
     });
-  } catch (err) {
-    res.status(500).json({ error: `Erro no servidor: ${err.message}` });
+    const data = await r.json().catch(() => ({}));
+    if (!data.ok) {
+      const err = new Error(data.description || `Telegram respondeu ${r.status}`);
+      err.status = data.error_code || r.status;
+      err.retryAfter = data.parameters && data.parameters.retry_after;
+      throw err;
+    }
+    return data.result;
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('O Telegram demorou demais para responder.');
+    throw e;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-// Salva/atualiza a promoção de um produto do Mercado Livre. A chave é o PRODUTO (não o preço):
-// se o preço mudou, atualiza a mesma linha em vez de criar outra — assim o mesmo produto não vira duas
-// promoções (nem é disparado duas vezes só porque caiu mais 2 reais).
-async function saveMlPromotion(ctx, { product, snap, previousPrice, discountRate, groupId, keyword, source }) {
-  const now = new Date().toISOString();
-  const { data: rows } = await supabaseAdmin
+function friendlyTelegramError(err) {
+  const m = String(err.message || '');
+  if (/unauthorized|not found/i.test(m) && err.status === 401) return 'Token do bot inv\u00e1lido. Copie de novo no @BotFather.';
+  if (/chat not found/i.test(m)) return 'Chat n\u00e3o encontrado. Confira o @canal (ou id) e se o bot foi adicionado ao canal/grupo.';
+  if (/not enough rights|have no rights|administrator|forbidden/i.test(m)) return 'O bot n\u00e3o tem permiss\u00e3o para postar. Em canal, torne o bot administrador com permiss\u00e3o de postar.';
+  return m;
+}
+
+// ---------------- mensagens (v-rias varia--es) ----------------
+
+// Paleta de emojis (escolhida pelo dono): - - - -- - - - - - - - -- -
+const OPENERS = ['\ud83d\udd25', '\ud83d\udc40', '\ud83e\udd29', '\ud83d\udecd\ufe0f', '\ud83c\udfaf'];
+const LINK_EMOJIS = ['\ud83d\udc49', '\ud83d\udcf2', '\ud83d\udd17'];
+
+function pick(arr, n) { return arr[Math.abs(n) % arr.length]; }
+
+// Emoji do assunto, pelo que o produto e (cozinha, casa, eletronicos).
+function categoryEmoji(title) {
+  const t = String(title || '').toLowerCase();
+  if (/panela|frigideira|cozinha|air ?fryer|fritadeira|talher|prato|copo|garrafa|esponja|marmita|assadeira|faca|utens[i\u00ed]lio/.test(t)) return '\ud83c\udf73';
+  if (/celular|smartphone|fone|carregador|cabo |usb|bluetooth|caixa de som|smartwatch|mouse|teclado|notebook|tablet|c[a\u00e2]mera|inteligente|led /.test(t)) return '\ud83d\udcf1';
+  if (/toalha|lixeira|banheiro|cama|len[c\u00e7]ol|travesseiro|organizador|cesto|tapete|cortina|sof[a\u00e1]|limpeza|vassoura|rodo|aspirador|sensor/.test(t)) return '\ud83c\udfe0';
+  return null;
+}
+
+// Monta o texto: sempre o MESMO formato, para o grupo nao enjoar de textinhos diferentes:
+//   nome do produto (como esta no anuncio)
+//   De ~R$ X~ por *R$ Y* (Z% OFF)
+//   cupom, se houver
+//   link de afiliado
+function buildMessage(p, turn, footer) {
+  const title = esc(p.title);
+  const link = esc(p.affiliate_url);
+  const { price, listPrice, coupon, finalPrice } = p.view;
+  const off = p.view.discount ? Math.round(p.view.discount) : null;
+  const hasList = listPrice && listPrice > price;
+  const offTxt = off ? ` (${off}% OFF)` : '';
+
+  const priceLine = hasList
+    ? `\ud83d\udcb8 De <s>R$ ${money(listPrice)}</s> por <b>R$ ${money(price)}</b>${coupon ? '' : offTxt}`
+    : `\ud83d\udcb8 Por <b>R$ ${money(price)}</b>${coupon ? '' : offTxt}`;
+  const couponLine = coupon ? `\ud83c\udf9f\ufe0f Com o cupom <b>${esc(coupon)}</b>: <b>R$ ${money(finalPrice)}</b>${offTxt}` : null;
+
+  const lines = [title, '', priceLine, couponLine, '', `\ud83d\udc49 ${link}`].filter((l) => l !== null && l !== undefined);
+  const cleaned = [];
+  for (const l of lines) { if (l === '' && (cleaned.length === 0 || cleaned[cleaned.length - 1] === '')) continue; cleaned.push(l); }
+  // Linha final opcional - mas nunca deixa sair aviso de "afiliado".
+  const safeFooter = footer && !/afiliad/i.test(footer) ? footer : '';
+  if (safeFooter) cleaned.push('', esc(safeFooter));
+  return cleaned.join('\n');
+}
+
+// Vers-o sem HTML para o WhatsApp (que n-o entende <b>/<s>).
+function toPlain(html) {
+  return html.replace(/<\/?(b|s)>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+// Versao para WhatsApp: negrito vira *texto* e riscado vira ~texto~ (o WhatsApp entende os dois).
+function toWhatsApp(html) {
+  return html.replace(/<\/?b>/g, '*').replace(/<\/?s>/g, '~').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+
+// ---------------- valida--o antes de enviar ----------------
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const DEAD_RE = /o produto n[\u00e3a]o existe|produto n[\u00e3a]o encontrado|p[\u00e1a]gina n[\u00e3a]o encontrada|produto indispon[\u00edi]vel|product (does not exist|not found)/i;
+const BADLINK_RE = /invalid publisher code|partnership status/i;
+
+// Abre o link como um cliente abriria e procura sinais claros de problema.
+// S- reprova quando o sinal - claro; se o site bloquear/der erro de rede, segue (inconclusivo).
+async function checkLink(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const r = await fetch(url, { redirect: 'follow', signal: ctrl.signal, headers: { 'User-Agent': UA, 'Accept-Language': 'pt-BR,pt;q=0.9', Accept: 'text/html,*/*' } });
+    if (r.status === 404 || r.status === 410) return { ok: false, kind: 'dead', reason: `a p\u00e1gina do produto n\u00e3o existe mais (erro ${r.status})` };
+    const text = (await r.text().catch(() => '')).slice(0, 40000);
+    if (BADLINK_RE.test(text)) return { ok: false, kind: 'badlink', reason: 'a rede de afiliados recusou o link (ID/parceria inv\u00e1lidos)' };
+    if (DEAD_RE.test(text)) return { ok: false, kind: 'dead', reason: 'a loja informa que o produto n\u00e3o existe' };
+    return { ok: true };
+  } catch { return { ok: true, inconclusive: true }; }
+  finally { clearTimeout(timer); }
+}
+
+function shopeeIds(url) {
+  const u = String(url || '');
+  let m = u.match(/\/product\/(\d+)\/(\d+)/) || u.match(/-i\.(\d+)\.(\d+)/);
+  return m ? { shopId: m[1], itemId: m[2] } : null;
+}
+
+let shopeeCreds;
+async function getShopeeCreds() {
+  if (shopeeCreds !== undefined) return shopeeCreds;
+  const { data: mp } = await supabaseAdmin.from('marketplaces').select('id').eq('slug', 'shopee').maybeSingle();
+  if (!mp) return (shopeeCreds = null);
+  const { data: c } = await supabaseAdmin.from('marketplace_credentials').select('client_id, client_secret').eq('marketplace_id', mp.id).maybeSingle();
+  return (shopeeCreds = c && c.client_id && c.client_secret ? c : null);
+}
+
+// Confirma na API oficial da Shopee que o an-ncio ainda existe e qual o pre-o de hoje.
+async function checkShopee(p) {
+  const ids = shopeeIds(p.original_url);
+  const creds = await getShopeeCreds();
+  if (!ids || !creds) return { ok: true, inconclusive: true };
+  try {
+    const sc = shopeeClient();
+    if (!sc.getProductOffer) return { ok: true, inconclusive: true };
+    const node = await sc.getProductOffer(creds.client_id, creds.client_secret, ids.itemId);
+    if (!node) return { ok: false, kind: 'dead', reason: 'a Shopee n\u00e3o devolve mais esse an\u00fancio (produto removido)' };
+    const live = Number(String(node.priceMin).replace(',', '.'));
+    return { ok: true, livePrice: Number.isFinite(live) && live > 0 ? live : null };
+  } catch { return { ok: true, inconclusive: true }; }
+}
+
+// Retorna { ok, kind, reason, livePrice }
+async function validatePromotion(p) {
+  const slug = p.marketplaces && p.marketplaces.slug;
+  let live = null;
+  if (slug === 'shopee') {
+    const sh = await checkShopee(p);
+    if (!sh.ok) return sh;
+    live = sh.livePrice || null;
+    if (live && Number(p.current_price) > 0 && live > Number(p.current_price) * 1.05) {
+      return { ok: false, kind: 'stale', reason: `o pre\u00e7o subiu (de R$ ${money(p.current_price)} para R$ ${money(live)})` };
+    }
+  }
+  const lk = await checkLink(p.affiliate_url);
+  return lk.ok ? { ...lk, livePrice: live } : lk;
+}
+
+async function ignorePromotion(p, why) {
+  await supabaseAdmin.from('promotions').update({ status: 'IGNORED' }).eq('id', p.id);
+  await supabaseAdmin.from('integration_logs').insert({ marketplace_id: null, level: 'warn', message: `Disparador removeu da fila "${String(p.title).slice(0, 60)}": ${why}` }).then(() => {}, () => {});
+}
+
+// Promoção que acabou (anúncio removido, preço subiu, sem desconto): fica no painel como FINALIZADA,
+// com o motivo, e sai da fila de disparo. (Antes era marcada como "ignorada" ou só pulada.)
+async function endPromotion(p, why) {
+  const lc = lifecycle();
+  if (lc && await lc.endedSupported(supabaseAdmin)) {
+    await lc.markEnded(supabaseAdmin, [p.id], why);
+  } else if (why && /removido|n.o devolve/i.test(why)) {
+    await ignorePromotion(p, why); // sem o SQL 0005, mantém o comportamento antigo
+  }
+  await supabaseAdmin.from('integration_logs').insert({ marketplace_id: null, level: 'info', message: `Disparador finalizou a promocao \"${String(p.title).slice(0, 60)}\": ${why}` }).then(() => {}, () => {});
+}
+
+const isDupError = (e) => !!e && (e.code === '23505' || /duplicate key|unique constraint/i.test(e.message || ''));
+
+// ---------------- fila ----------------
+
+async function getDestination(id) {
+  const { data, error } = await supabaseAdmin.from('dispatch_destinations').select('*').eq('id', id).maybeSingle();
+  if (error) throw new Error(dbError(error));
+  return data;
+}
+
+async function loadQueue(destId, body) {
+  const groupIds = Array.isArray(body.group_ids) ? body.group_ids : [];
+  const since = isoAgo(QUEUE_DAYS_SEEN * DAY);
+
+  const lc = lifecycle();
+  const hasEnded = !!(lc && await lc.endedSupported(supabaseAdmin)); // promocao finalizada nunca entra na fila
+  let q = supabaseAdmin
     .from('promotions')
-    .select('id, watch_group_id')
-    .eq('product_id', product.id)
-    .order('detected_at', { ascending: false })
-    .limit(1);
-  const existing = rows && rows[0];
-  if (existing) {
-    await supabaseAdmin.from('promotions').update({
-      current_price: snap.price,
-      previous_price: previousPrice,
-      discount_rate: discountRate,
-      watch_group_id: existing.watch_group_id || groupId || null,
-      ...(await reviveFields(supabaseAdmin)),
-      last_seen_at: now,
-    }).eq('id', existing.id);
-    return false;
-  }
-  const { error, duplicate } = await insertPromotions({
-    marketplace_id: ctx.marketplaceId,
-    product_id: product.id,
-    watch_group_id: groupId || null,
-    matched_keyword: keyword || null,
-    title: product.title || snap.title,
-    image_url: product.image_url || snap.thumbnail,
-    original_url: product.permalink || snap.permalink,
-    current_price: snap.price,
-    previous_price: previousPrice,
-    discount_rate: discountRate,
-    source,
-    status: 'PENDING',
-    last_seen_at: now,
-  });
-  return !error && !duplicate;
-}
+    .select('*, marketplaces(slug, name)')
+    .not('affiliate_url', 'is', null)
+    .neq('status', 'IGNORED')
+    .gt('current_price', 0)
+    .or(`last_seen_at.gte.${since},and(last_seen_at.is.null,detected_at.gte.${since})`)
+    .order('last_seen_at', { ascending: false, nullsFirst: false })
+    .limit(1000);
+  if (hasEnded) q = q.is('ended_at', null);
+  const { data, error } = await q;
+  if (error) throw new Error(dbError(error));
 
-async function discoverMlPromotions({ groups, ctx, startedAt, disc }) {
-  // 1) palavras-chave -> produtos de catálogo (página sorteada para variar a cada busca)
-  const candidates = new Map(); // id -> { id, title, group }
-  const tasks = [];
-  for (const g of groups) for (const kw of g.keywords) tasks.push({ group: g, kw });
-  shuffle(tasks);
-  for (const batch of chunk(tasks, 3)) {
-    if (Date.now() - startedAt > SCAN_BUDGET_MS * 0.5) { // metade do tempo para buscar, metade para conferir preços
-      batch.forEach((t) => disc.skippedKeywords.push(t.kw));
-      continue;
+  const { data: logs, error: logErr } = await supabaseAdmin
+    .from('dispatch_log').select('promotion_id, skipped').eq('destination_id', destId).gte('sent_at', isoAgo(NO_REPEAT_DAYS * DAY));
+  if (logErr) throw new Error(dbError(logErr));
+  const already = new Set((logs || []).map((l) => l.promotion_id));
+
+  // Quando foi a ULTIMA busca de cada nicho em cada marketplace (inclui o que ainda nao tem link de afiliado).
+  // So entra na fila o que essa ultima busca viu: o que foi achado de manha e nao apareceu na busca de agora
+  // pode ja nao estar em promocao, entao nao sai.
+  const newestByKey = new Map();
+  {
+    let nq = supabaseAdmin.from('promotions').select('watch_group_id, last_seen_at, detected_at, marketplaces(slug)').neq('status', 'IGNORED').or(`last_seen_at.gte.${since},and(last_seen_at.is.null,detected_at.gte.${since})`).order('last_seen_at', { ascending: false, nullsFirst: false }).limit(1000);
+    if (hasEnded) nq = nq.is('ended_at', null);
+    const { data: seenRows } = await nq;
+    for (const r of seenRows || []) {
+      const k = `${r.watch_group_id || 'none'}|${r.marketplaces ? r.marketplaces.slug : ''}`;
+      const t = new Date(r.last_seen_at || r.detected_at).getTime();
+      if (t && (!newestByKey.has(k) || t > newestByKey.get(k))) newestByKey.set(k, t);
     }
-    await Promise.all(
-      batch.map(async ({ group, kw }) => {
-        const offset = Math.floor(Math.random() * ML_DISCOVERY_MAX_PAGE) * ML_DISCOVERY_PAGE_SIZE;
-        try {
-          const list = await mlClient.searchCatalogProducts({
-            q: kw, token: ctx.token, limit: ML_DISCOVERY_PAGE_SIZE, offset,
-          });
-          disc.searched += 1;
-          for (const r of list) if (!candidates.has(r.id)) candidates.set(r.id, { ...r, group, keyword: kw });
-        } catch (err) {
-          disc.searchErrors.push(`"${kw}": ${err.message}`);
-          if (err.status) disc.statuses[err.status] = (disc.statuses[err.status] || 0) + 1;
-        }
-      })
-    );
   }
+  const inLatestScan = (p) => {
+    const newest = newestByKey.get(`${p.watch_group_id || 'none'}|${p.marketplaces ? p.marketplaces.slug : ''}`);
+    if (!newest) return true;
+    const t = new Date(p.last_seen_at || p.detected_at).getTime();
+    return t >= newest - LATEST_SCAN_WINDOW_MS;
+  };
+  const suspiciousDiscount = (p) => Number(p.discount_rate) > (p.source === 'shopee_listed_price' ? MAX_DISCOUNT_LISTED_PCT : MAX_DISCOUNT_PCT);
 
-  // 2) confere preço de cada candidato; só vira promoção se o ML mostra preço "de" maior com desconto mínimo
-  const list = [...candidates.values()].slice(0, ML_DISCOVERY_MAX_CANDIDATES);
-  disc.candidates = list.length;
-  for (const batch of chunk(list, ML_DISCOVERY_CONCURRENCY)) {
-    if (Date.now() - startedAt > SCAN_BUDGET_MS) break;
-    await Promise.all(
-      batch.map(async (cand) => {
-        try {
-          const snap = await mlClient.getItemSnapshot({ id: cand.id, kind: 'catalog', token: ctx.token });
-          disc.checked += 1;
-          if (!snap.regularPrice || snap.regularPrice <= snap.price) return;
-          const pct = ((snap.regularPrice - snap.price) / snap.regularPrice) * 100;
-          if (pct < ML_DISCOVERY_MIN_DISCOUNT_PCT) return;
+  const wantNone = groupIds.includes('none');
+  const mp = body.marketplace || null;
 
-          const { data: product } = await supabaseAdmin
-            .from('products')
-            .upsert(
-              {
-                marketplace_id: ctx.marketplaceId,
-                source_item_id: cand.id,
-                title: snap.title || cand.title || 'Produto do Mercado Livre',
-                image_url: snap.thumbnail,
-                permalink: `https://www.mercadolivre.com.br/p/${cand.id}`,
-                watch_group_id: cand.group.id,
-                last_checked_at: new Date().toISOString(),
-              },
-              { onConflict: 'marketplace_id,source_item_id' }
-            )
-            .select()
-            .single();
-          if (!product) return;
-
-          await supabaseAdmin.from('product_price_history').insert({ product_id: product.id, price: snap.price });
-
-          const created = await saveMlPromotion(ctx, {
-            product, snap, previousPrice: snap.regularPrice, discountRate: Number(pct.toFixed(2)),
-            groupId: cand.group.id, keyword: cand.keyword, source: 'catalog_search',
-          });
-          if (created) disc.found += 1;
-        } catch (err) {
-          if (err.status) disc.statuses[err.status] = (disc.statuses[err.status] || 0) + 1;
-          // agrupa por motivo (sem o código do produto) para o relatório mostrar o padrão, não só o 1º erro
-          const reason = String(err.message).replace(/MLB\d+/g, 'MLB…').slice(0, 220);
-          disc.reasons[reason] = (disc.reasons[reason] || 0) + 1;
-        }
-      })
-    );
-  }
-}
-
-async function checkMlProduct(product, ctx) {
-  const snap = await mlClient.getItemSnapshot({
-    id: product.source_item_id,
-    kind: mlClient.kindFromStored(product.source_item_id, product.permalink),
-    token: ctx.token,
-    url: product.permalink,
+  let list = (data || []).filter((p) => {
+    if (already.has(p.id)) return false;
+    if (!inLatestScan(p)) return false;
+    if (suspiciousDiscount(p)) return false;
+    if (!/^https?:\/\//i.test(p.affiliate_url || '')) return false;
+    if (mp && (!p.marketplaces || p.marketplaces.slug !== mp)) return false;
+    if (groupIds.length) {
+      if (p.watch_group_id) { if (!groupIds.includes(p.watch_group_id)) return false; }
+      else if (!wantNone) return false;
+    }
+    return true;
   });
 
-  await supabaseAdmin
-    .from('products')
-    .update({ last_checked_at: new Date().toISOString() })
-    .eq('id', product.id);
-
-  await supabaseAdmin.from('product_price_history').insert({ product_id: product.id, price: snap.price });
-
-  // 1) O próprio ML marca promoção (preço "de" maior que o atual ou promotion_id).
-  const listedPromo = Boolean(snap.promotionId) || Boolean(snap.regularPrice && snap.regularPrice > snap.price);
-
-  // 2) Queda real contra o que o sistema já viu (precisa de pelo menos 2 registros anteriores).
-  const prior = ctx.history.get(product.id) || [];
-  const normal = prior.length >= 2 ? median(prior) : null;
-  const realDrop = Boolean(normal && snap.price < normal * (1 - ML_MIN_DROP_PCT / 100));
-
-  if (!listedPromo && !realDrop) {
-    // O próprio produto foi conferido e não está em promoção: o que estava salvo dele é promoção finalizada.
-    const { data: active } = await supabaseAdmin.from('promotions').select('id').eq('product_id', product.id).neq('status', 'IGNORED');
-    await markEnded(supabaseAdmin, (active || []).map((r) => r.id), 'O Mercado Livre não mostra mais promoção neste produto');
-    return { found: 0, source: snap.source };
+  // Promocoes com queda de preco COMPROVADA saem antes das que so tem "desconto de tabela" informado
+  // pela Shopee (preco de tabela inflado e comum). Dentro de cada faixa, maior desconto primeiro.
+  // FUNIL: cada promocao ganha um score de venda (0-100, o mesmo do painel). Sai primeiro a de maior chance de
+  // converter; e o disparo pode exigir um score minimo (so destaques / boas / tudo).
+  const S = scoreLib();
+  const minScore = Number(body.min_score) || 0;
+  if (S) {
+    list.forEach((p) => { p._score = S.compute(p).score; });
+    if (minScore > 0) list = list.filter((p) => p._score >= minScore);
   }
+  const rank = (p) => (p.source === 'shopee_listed_price' ? 1 : 0);
+  list = list.map((p, i) => ({ p, i })).sort((a, b) => (((b.p._score || 0) - (a.p._score || 0)) || (rank(a.p) - rank(b.p)) || ((Number(b.p.discount_rate) || 0) - (Number(a.p.discount_rate) || 0)) || (a.i - b.i))).map((x) => x.p);
 
-  const previousPrice = snap.regularPrice && snap.regularPrice > snap.price ? snap.regularPrice : realDrop ? normal : null;
-  const discountRate = previousPrice
-    ? Number((((previousPrice - snap.price) / previousPrice) * 100).toFixed(2))
-    : null;
-
-  const created = await saveMlPromotion(ctx, {
-    product, snap, previousPrice, discountRate,
-    groupId: product.watch_group_id, keyword: null, source: 'watchlist_check',
-  });
-  return { found: created ? 1 : 0, source: snap.source };
-}
-
-// ---------------- Amazon ----------------
-//
-// A Creators API da Amazon (que substituiu a antiga PA-API, desativada em 2026)
-// só libera consulta de catálogo depois que a conta de Associado tiver pelo
-// menos 10 vendas qualificadas nos últimos 30 dias — é uma trava da própria
-// Amazon, documentada por eles. Enquanto isso, não dá pra implementar a
-// chamada de verdade sem arriscar inventar um endpoint que eu não confirmei.
-// Assim que a conta atingir o requisito e a documentação completa abrir,
-// essa função troca por uma implementação real.
-async function scanAmazon(req, res) {
-  try {
-    const { data: marketplace } = await supabaseAdmin
-      .from('marketplaces')
-      .select('id')
-      .eq('slug', 'amazon')
-      .single();
-
-    const { data: creds } = await supabaseAdmin
-      .from('marketplace_credentials')
-      .select('client_id, client_secret, extra_credential')
-      .eq('marketplace_id', marketplace.id)
-      .maybeSingle();
-
-    if (!creds?.client_id || !creds?.client_secret || !creds?.extra_credential) {
-      res.status(400).json({ error: 'Credenciais da Amazon não cadastradas. Vá em /marketplaces.html.' });
-      return;
-    }
-
-    res.status(200).json({
-      ok: true,
-      productsChecked: 0,
-      promotionsFound: 0,
-      errors: [],
-      note:
-        'Credenciais salvas, mas a Creators API da Amazon só libera consulta depois que sua conta tiver 10 vendas qualificadas nos últimos 30 dias. Assim que isso acontecer, me avise pra eu implementar a busca de verdade.',
-    });
-  } catch (err) {
-    res.status(500).json({ error: `Erro no servidor: ${err.message}` });
-  }
-}
-
-// ---------------- Netshoes (via Rakuten Advertising) ----------------
-
-async function scanNetshoes(req, res) {
-  try {
-    const { data: marketplace } = await supabaseAdmin
-      .from('marketplaces')
-      .select('id')
-      .eq('slug', 'netshoes')
-      .single();
-
-    const { data: creds } = await supabaseAdmin
-      .from('marketplace_credentials')
-      .select('client_id, client_secret, extra_credential, extra_credential_2, extra_credential_3')
-      .eq('marketplace_id', marketplace.id)
-      .maybeSingle();
-
-    if (!creds?.extra_credential || !creds?.extra_credential_2) {
-      res.status(400).json({ error: 'Credenciais da Netshoes/Rakuten incompletas. Vá em /marketplaces.html.' });
-      return;
-    }
-
-    const publisherId = creds.extra_credential;
-    const mid = creds.extra_credential_2;
-
-    // A busca de produtos da Rakuten usa até DOIS tokens:
-    //  1) o token do Web Services (painel Rakuten: link "APIs" no rodapé da página), fixo;
-    //  2) um token OAuth, gerado a cada busca (vale ~4h) com Client ID/Secret.
-    const webServicesToken = creds.extra_credential_3;
-    if (!webServicesToken) {
-      res.status(400).json({
-        error: 'Falta o Web Services Token da Rakuten (painel Rakuten: link "APIs" no rodapé da página). Cole em /marketplaces.html.',
-      });
-      return;
-    }
-    if (!creds.client_id || !creds.client_secret) {
-      res.status(400).json({ error: 'Faltam o Client ID e o Client Secret da Rakuten em /marketplaces.html.' });
-      return;
-    }
-
-    // Se o login automático falhar, ainda dá pra tentar as outras formas (só com o Web Services Token).
-    // O motivo da falha entra no relatório final em vez de derrubar a busca inteira.
-    const auth = { accessToken: null, webServicesToken, strategy: null };
-    let tokenError = null;
-    try {
-      auth.accessToken = await netshoesClient.getAccessToken(creds.client_id, creds.client_secret, publisherId);
-    } catch (err) {
-      tokenError = err.message;
-    }
-
-    // Cupons ativos da Netshoes (para montar ofertas "produto + cupom"). Falha aqui não derruba a busca.
-    let couponList = [];
-    let couponNote = null;
-    try {
-      const loaded = await loadNetshoesCoupons({ auth, mid, tokenError });
-      if (loaded.error) couponNote = loaded.error;
-      else couponList = loaded.coupons.filter((c) => c.code);
-    } catch (err) {
-      couponNote = err.message;
-    }
-    const couponCtx = { list: couponList, left: NETSHOES_COUPON_MAX_PER_SCAN, deals: 0 };
-
-    const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
-    const groupsParam = getGroupsParam(req);
-    const selectedRows = groupsParam ? (allGroups || []).filter((g) => groupsParam.includes(g.id)) : allGroups;
-    // Só entram grupos configurados para rodar na Netshoes (e, se o painel mandou um lote, só as palavras do lote).
-    const groups = filterGroupKeywords(mergeGroupsByName((selectedRows || []).filter((g) => groupRunsOn(g, 'netshoes'))), getKeywordsParam(req));
-
-    // Produtos já salvos nos últimos 14 dias (para não repetir o mesmo produto de outro vendedor).
-    const recent = await loadRecentIndex(supabaseAdmin, marketplace.id);
-    const dedupeCtx = { index: recent.index };
-
-    if (groups.length === 0) {
-      res.status(200).json({
-        ok: true,
-        groupsSearched: 0,
-        productsChecked: 0,
-        promotionsFound: 0,
-        errors: [],
-        note: 'Nenhum grupo para buscar na Netshoes — ela busca por palavra-chave, então marque pelo menos um grupo que esteja configurado para rodar na Netshoes (Lista de vigilância > caixinhas "Roda em").',
-      });
-      return;
-    }
-
-    // Uma tarefa por palavra-chave (cada palavra só é buscada uma vez, mesmo que apareça em dois grupos).
-    const tasks = [];
-    const seenKeywords = new Set();
-    for (const group of groups) {
-      for (const keyword of group.keywords) {
-        const key = normKey(keyword);
-        if (seenKeywords.has(key)) continue;
-        seenKeywords.add(key);
-        tasks.push({ group, keyword });
+  // Mesmo PRODUTO (outro vendedor, outro link) nao pode sair duas vezes:
+  //  1) nao repete produto parecido com algo ja ENVIADO a este destino nas ultimas 2 semanas;
+  //  2) entre parecidos na propria fila, fica so o mais barato.
+  const dd = dedupeLib();
+  if (dd && list.length) {
+    const sentIds = (logs || []).filter((l) => !l.skipped).map((l) => l.promotion_id).filter(Boolean);
+    if (sentIds.length) {
+      const sentIndex = new dd.SimilarIndex();
+      for (let i = 0; i < sentIds.length; i += 100) {
+        const { data: sentRows } = await supabaseAdmin.from('promotions').select('id, title').in('id', sentIds.slice(i, i + 100));
+        (sentRows || []).forEach((r) => sentIndex.add(r.title, r));
       }
+      if (sentIndex.size) list = list.filter((p) => !sentIndex.findSimilar(p.title));
     }
-    shuffle(tasks);
-
-    const startedAt = Date.now();
-    const seenUrls = new Set();
-    const errors = [];
-    const emptySamples = [];
-    let found = 0;
-    let itemsSeen = 0;
-    let withDiscount = 0;
-    let done = 0;
-    let skipped = 0;
-    const skippedKeywords = [];
-    let loggedErrors = 0;
-    let nextTask = 0;
-    const totals = { withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0, changed: 0, rose: 0, oldestMs: 0, duplicates: 0, ended: 0 };
-
-    async function worker() {
-      while (nextTask < tasks.length) {
-        const task = tasks[nextTask++];
-        if (Date.now() - startedAt > SCAN_BUDGET_MS) { skipped += 1; skippedKeywords.push(task.keyword); continue; }
-        try {
-          const page = 1 + Math.floor(Math.random() * NETSHOES_MAX_PAGE);
-          const items = await netshoesClient.searchProducts(auth, mid, task.keyword, { max: NETSHOES_PAGE_SIZE, page });
-          done += 1;
-          itemsSeen += items.length;
-          if (!items.length && items.rawSample && emptySamples.length < 1) emptySamples.push(`"${task.keyword}": ${items.rawSample}`);
-          const result = await processNetshoesItems(items, marketplace.id, task.group, publisherId, mid, seenUrls, couponCtx, dedupeCtx, task.keyword);
-          found += result.found;
-          withDiscount += result.withDiscount;
-          totals.withSale += result.stats.withSale;
-          totals.maxDiscount = Math.max(totals.maxDiscount, result.stats.maxDiscount);
-          if (!totals.sample) totals.sample = result.stats.sample;
-          totals.withHistory += result.stats.withHistory;
-          totals.newlyTracked += result.stats.newlyTracked;
-          totals.withFeedDiscount += result.stats.withFeedDiscount;
-          totals.parsedItems += result.stats.parsedItems;
-          totals.changed += result.stats.changed;
-          totals.rose += result.stats.rose;
-          totals.duplicates += result.stats.duplicates;
-          totals.ended += result.stats.ended || 0;
-          if (result.stats.oldestMs && (!totals.oldestMs || result.stats.oldestMs < totals.oldestMs)) totals.oldestMs = result.stats.oldestMs;
-          if (!totals.historyError && result.stats.historyError) totals.historyError = result.stats.historyError;
-        } catch (err) {
-          errors.push(`${task.group.name} / "${task.keyword}": ${err.message}`);
-          if (loggedErrors < 5) {
-            loggedErrors += 1;
-            await supabaseAdmin.from('integration_logs').insert({
-              marketplace_id: marketplace.id,
-              level: 'error',
-              message: `Falha ao buscar produtos Netshoes para "${task.keyword}" (grupo ${task.group.name}) [web services token ${String(webServicesToken).length} caracteres]${tokenError ? ` [login automático falhou: ${tokenError}]` : ''}: ${err.message}`,
-            });
-          }
-        }
-      }
-    }
-    await Promise.all(Array.from({ length: Math.min(NETSHOES_CONCURRENCY, tasks.length) }, worker));
-
-    // Limpeza: histórico com mais de 30 dias não serve para nada (a comparação usa 7).
-    if (!totals.historyError) {
-      const keepSince = new Date(Date.now() - NETSHOES_HISTORY_KEEP_DAYS * 864e5).toISOString();
-      await supabaseAdmin.from('promotion_price_history').delete().eq('marketplace_id', marketplace.id).lt('checked_at', keepSince);
-    }
-
-    const swept = done > 0 ? await sweepStale(supabaseAdmin, marketplace.id) : 0;
-    const couponDiag = couponNote
-      ? ` Cupons da Netshoes: não consegui ler (${couponNote}).`
-      : ` Cupons ativos com código: ${couponList.length}${couponCtx.deals ? `; ${couponCtx.deals} oferta(s) criada(s) por cupom` : ''}.`;
-    const attempted = done + errors.length;
-    const allFailed = attempted > 0 && errors.length === attempted;
-    const parts = [];
-    if (allFailed) {
-      parts.push(`Todas as buscas da Netshoes falharam. ${errors[0]}${tokenError ? ` (login automático: ${tokenError})` : ''}`);
-    } else if (itemsSeen === 0) {
-      parts.push(`A Netshoes não devolveu nenhum produto para ${done} palavra(s)-chave.${emptySamples.length ? ` Exemplo da resposta recebida — ${emptySamples[0]}` : ''}`);
-    } else if (found === 0) {
-      const historyDays = totals.oldestMs ? Math.max(0, Math.floor((Date.now() - totals.oldestMs) / 864e5)) : 0;
-      const frozen = totals.withHistory >= 50 && totals.changed === 0
-        ? ' Nenhum dos produtos acompanhados mudou de preço desde que comecei a registrar: o feed da Rakuten parece não refletir as promoções da Netshoes.'
-        : '';
-      const diag = `Diagnóstico: ${totals.parsedItems} produto(s) lidos, ${totals.withFeedDiscount} com preço "de" maior que o atual no feed da Netshoes, ${totals.withHistory} com histórico de preço (${totals.newlyTracked} registrados agora; histórico mais antigo: ${historyDays} dia(s)); ${totals.changed} já tiveram o preço alterado (${totals.rose} subiram); maior queda vista: ${Math.round(totals.maxDiscount)}%.${frozen}${totals.sample ? ` Exemplo da resposta: ${totals.sample}.` : ''}`;
-      if (withDiscount) {
-        parts.push(`A Netshoes devolveu ${itemsSeen} produto(s); ${withDiscount} em promoção, mas todos já estavam salvos no painel. ${diag}${couponDiag}`);
-      } else {
-        parts.push(`A Netshoes devolveu ${itemsSeen} produto(s) pela busca de palavra-chave (a busca traz produtos do catálogo, não só os em promoção), mas nenhum está abaixo do preço normal (queda mínima de ${NETSHOES_MIN_DROP_PCT}%) nem tem cupom que valha para ele. ${diag}${couponDiag}`);
-      }
-    }
-    if (totals.duplicates) parts.push(`${totals.duplicates} produto(s) repetido(s) (mesmo produto, outro anúncio) foram descartados.`);
-    if (totals.ended + swept > 0) parts.push(`${totals.ended + swept} promoção(ões) marcada(s) como finalizada(s).`);
-    if (found > 0 && couponNote) parts.push(`Aviso: não consegui ler os cupons da Netshoes (${couponNote}).`);
-    if (found > 0 && couponCtx.deals) parts.push(`${couponCtx.deals} das ofertas vieram de cupom ativo da Netshoes.`);
-    if (totals.historyError) parts.push(`Histórico de preços indisponível (${totals.historyError}). Rode o arquivo 0003_promotion_price_history.sql no Supabase; enquanto isso a comparação usa só o preço "de" da Netshoes.`);
-    if (skipped) parts.push(`${skipped} palavra(s)-chave ficaram para a próxima busca (limite de tempo). Clique em buscar de novo para continuar.`);
-    if (!allFailed && errors.length) parts.push(`${errors.length} palavra(s)-chave falharam: ${errors[0]}`);
-
-    res.status(200).json({
-      ok: true,
-      groupsSearched: groups.length,
-      keywordsSearched: done,
-      skippedKeywords,
-      endedPromotions: totals.ended + swept,
-      productsChecked: itemsSeen,
-      promotionsFound: found,
-      errors,
-      note: parts.length ? parts.join(' ') : undefined,
-    });
-  } catch (err) {
-    res.status(500).json({ error: `Erro no servidor: ${err.message}` });
-  }
-}
-
-// Converte "199.90", "199,90", "1.299,90" ou "1,299.90" em número.
-// O último separador (ponto ou vírgula) é o decimal; o outro é separador de milhar.
-function parsePrice(value) {
-  if (value === null || value === undefined || value === '') return null;
-  let s = String(value).replace(/[^\d.,-]/g, '');
-  if (!s) return null;
-  const lastDot = s.lastIndexOf('.');
-  const lastComma = s.lastIndexOf(',');
-  if (lastDot >= 0 && lastComma >= 0) {
-    if (lastComma > lastDot) s = s.replace(/\./g, '').replace(',', '.');
-    else s = s.replace(/,/g, '');
-  } else if (lastComma >= 0) {
-    s = s.replace(',', '.');
-  }
-  const n = parseFloat(s);
-  return Number.isFinite(n) ? Math.round(n * 100) / 100 : null; // sempre 2 casas
-}
-
-// Embaralha a lista NO LUGAR. Com listas grandes de palavras-chave, o tempo de busca acaba antes de
-// chegar nas últimas — sem embaralhar, as mesmas palavras do fim da lista nunca eram buscadas.
-// Embaralhando, cada busca cobre palavras diferentes e, rodando algumas vezes, tudo é coberto.
-// Salva promoção(ões) novas. Guarda também a palavra-chave que a achou (matched_keyword).
-// Se a coluna ainda não existir no banco (SQL 0010 não rodado), salva igual, só sem a palavra.
-async function insertPromotions(rows) {
-  const many = Array.isArray(rows);
-  const strip = ({ matched_keyword, ...rest }) => rest;
-  const isDup = (e) => e && (e.code === '23505' || /duplicate key|unique constraint/i.test(e.message || ''));
-  let payload = rows;
-  let { error } = await supabaseAdmin.from('promotions').insert(payload);
-  if (error && /matched_keyword/i.test(error.message || '')) {
-    payload = many ? rows.map(strip) : strip(rows);
-    ({ error } = await supabaseAdmin.from('promotions').insert(payload));
-  }
-  // Trava do banco contra duplicata (índice único do SQL 0005): outra busca gravou o mesmo link um instante antes.
-  // Não é erro — o produto já está no painel. Em lote, regrava um por um pulando só os repetidos.
-  if (isDup(error)) {
-    if (!many) return { error: null, duplicate: true };
-    let firstError = null;
-    for (const row of payload) {
-      const r = await supabaseAdmin.from('promotions').insert(row);
-      if (r.error && !isDup(r.error) && !firstError) firstError = r.error;
-    }
-    return { error: firstError };
-  }
-  return { error };
-}
-
-// Para promoções já salvas que ainda não têm palavra-chave: preenche. (Só se a coluna existir.)
-function keywordPatch(existing, keyword) {
-  return ('matched_keyword' in existing && !existing.matched_keyword && keyword) ? { matched_keyword: keyword } : {};
-}
-
-function shuffle(list) {
-  for (let i = list.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [list[i], list[j]] = [list[j], list[i]];
+    list = dd.keepCheapestOfEach(list, (p) => p.title, (p) => Number(p.current_price));
   }
   return list;
 }
 
-function chunk(list, size) {
-  const out = [];
-  for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
-  return out;
+async function netshoesCoupons() {
+  if (couponCache.list && Date.now() - couponCache.at < COUPON_CACHE_MS) return couponCache.list;
+  try {
+    const cp = coupons();
+    if (!cp.getNetshoesContext || !cp.loadNetshoesCoupons) return null;
+    const ctx = await cp.getNetshoesContext(supabaseAdmin);
+    if (ctx.error) return null;
+    const loaded = await cp.loadNetshoesCoupons(ctx);
+    if (loaded.error) return null;
+    couponCache = { at: Date.now(), list: loaded.coupons || [] };
+    return couponCache.list;
+  } catch { return null; }
 }
 
-function median(values) {
-  const sorted = [...values].sort((x, y) => x - y);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
+// Calcula o que vai aparecer na mensagem. Retorna null se a promo--o n-o vale mais (ex.: cupom venceu).
+async function buildView(p) {
+  const slug = p.marketplaces && p.marketplaces.slug;
+  let price = Number(p.current_price);
+  let listPrice = p.previous_price ? Number(p.previous_price) : null;
+  let coupon = null; let finalPrice = null;
 
-// Os campos vêm da leitura do XML da Rakuten (ver parseProductSearchXml no client.js).
-// Grava em LOTE (poucas idas ao banco por palavra-chave, em vez de 2-3 por produto) —
-// era isso que deixava a busca lenta a ponto de estourar o tempo da Vercel.
-//
-// Regra de promoção (sem porcentagem fixa):
-//   preço normal = mediana dos preços registrados nos últimos 7 dias
-//                  (se o produto ainda não tem histórico: o preço "de" da Netshoes)
-//   é promoção quando preço atual < preço normal em pelo menos NETSHOES_MIN_DROP_PCT.
-async function processNetshoesItems(items, marketplaceId, group, publisherId, mid, seenUrls, couponCtx, dedupeCtx, keyword) {
-  const stats = { ended: 0, withSale: 0, maxDiscount: 0, sample: null, withHistory: 0, historyError: null, newlyTracked: 0, withFeedDiscount: 0, parsedItems: 0, changed: 0, rose: 0, oldestMs: 0, duplicates: 0 };
-
-  // 1) Lê os itens (um por link, mesmo que apareça em mais de uma palavra-chave)
-  const parsed = [];
-  for (const item of items) {
-    if (!stats.sample) stats.sample = `${String(item.itemName || '').slice(0, 50)} (price: ${item.price}, saleprice: ${item.salePrice})`;
-    const title = item.itemName;
-    const productUrl = item.productUrl || item.linkUrl;
-    const regularPrice = parsePrice(item.price);
-    const price = parsePrice(item.salePrice) || regularPrice;
-
-    if (!title || !productUrl || !price) continue; // resposta em formato inesperado — pula sem quebrar o resto
-    if (seenUrls.has(productUrl)) continue;        // mesmo produto já tratado em outra palavra-chave
-    seenUrls.add(productUrl);
-    parsed.push({ title, productUrl, price, regularPrice, imageUrl: item.imageUrl || item.image || null });
-  }
-  stats.parsedItems = parsed.length;
-  if (!parsed.length) return { found: 0, withDiscount: 0, stats };
-
-  // 2) Histórico de preços desses links nos últimos 7 dias
-  const historyByUrl = new Map(); // url -> { prices: [], lastAt: ms }
-  const windowStart = new Date(Date.now() - NETSHOES_HISTORY_DAYS * 864e5).toISOString();
-  let historyOk = true;
-  for (const part of chunk(parsed.map((c) => c.productUrl), 10)) {
-    const { data, error } = await supabaseAdmin
-      .from('promotion_price_history')
-      .select('product_url, price, checked_at')
-      .eq('marketplace_id', marketplaceId)
-      .in('product_url', part)
-      .gte('checked_at', windowStart);
-    if (error) { historyOk = false; stats.historyError = error.message; break; }
-    for (const row of data || []) {
-      if (!historyByUrl.has(row.product_url)) historyByUrl.set(row.product_url, { prices: [], lastAt: 0 });
-      const h = historyByUrl.get(row.product_url);
-      h.prices.push(Number(row.price));
-      const at = new Date(row.checked_at).getTime();
-      h.lastAt = Math.max(h.lastAt, at);
-      if (!stats.oldestMs || at < stats.oldestMs) stats.oldestMs = at;
+  if (slug === 'netshoes') {
+    const fromCoupon = p.source === 'netshoes_coupon';
+    // Em ofertas por cupom, current_price j- - o pre-o COM cupom e previous_price - o pre-o da loja.
+    const storePrice = fromCoupon ? Number(p.previous_price) : price;
+    const list = await netshoesCoupons();
+    const best = list && storePrice > 0 && coupons().bestNetshoesCoupon ? coupons().bestNetshoesCoupon(list, { title: p.title, price: storePrice, category: null }) : null;
+    if (best) {
+      coupon = best.coupon.code; finalPrice = r2(best.finalPrice); price = r2(storePrice);
+      listPrice = fromCoupon ? null : listPrice;
+    } else if (fromCoupon) {
+      return null; // a oferta dependia de um cupom que n\u00e3o consigo confirmar agora
     }
   }
 
-  // 3) Decide quem está em promoção
-  const candidates = [];
-  const couponCandidates = [];
-  let withDiscount = 0;
-  for (const c of parsed) {
-    const h = historyByUrl.get(c.productUrl);
-    // Duas fontes de "preço normal", vale a MAIOR que seja acima do preço atual:
-    //  a) o preço "de" que a própria Netshoes informa no feed (price > saleprice);
-    //  b) a mediana dos preços que o sistema registrou nos últimos 7 dias.
-    // Antes, se o produto já tinha histórico, o preço "de" do feed era IGNORADO — e como o
-    // histórico guardava o preço já promocional, a queda sempre dava 0%.
-    const feedRef = c.regularPrice && c.regularPrice > c.price ? c.regularPrice : null;
-    if (feedRef) stats.withFeedDiscount += 1;
-    let historyRef = null;
-    if (h && h.prices.length) {
-      stats.withHistory += 1;
-      const med = median(h.prices);
-      if (med > c.price) historyRef = med;
-      // diagnóstico: o preço desse produto já mudou alguma vez desde que começamos a registrar?
-      if (h.prices.some((p) => Math.abs(p - c.price) >= 0.01)) stats.changed += 1;
-      if (med < c.price - 0.01) stats.rose += 1;
-    }
-    const reference = Math.max(feedRef || 0, historyRef || 0) || null;
+  const base = coupon ? finalPrice : price;
+  const ref = listPrice && listPrice > price ? listPrice : (coupon ? price : null);
+  const discount = ref && base < ref ? ((ref - base) / ref) * 100 : (p.discount_rate ? Number(p.discount_rate) : null);
+  return { price: r2(price), listPrice: listPrice ? r2(listPrice) : null, coupon, finalPrice, discount };
+}
 
-    const drop = reference && reference > c.price ? ((reference - c.price) / reference) * 100 : 0;
-    if (drop > 0) {
-      stats.withSale += 1;
-      stats.maxDiscount = Math.max(stats.maxDiscount, drop);
-    }
-    if (drop <= 0 || drop < NETSHOES_MIN_DROP_PCT) {
-      // Sem queda de preço: vê se algum cupom ativo vale para este produto (oferta "produto + cupom").
-      if (couponCtx && couponCtx.list.length) {
-        const best = bestNetshoesCoupon(couponCtx.list, { title: c.title, price: c.price, category: null });
-        if (best) {
-          const pct = (best.discount / c.price) * 100;
-          if (pct >= NETSHOES_COUPON_MIN_PCT) {
-            couponCandidates.push({ ...c, regularPrice: c.price, price: best.finalPrice, discountRate: Number(pct.toFixed(2)), source: 'netshoes_coupon', _pct: pct });
-          }
-        }
+// ---------------- a--es ----------------
+
+async function createDestination(res, body) {
+  const platform = body.platform === 'whatsapp_manual' ? 'whatsapp_manual' : 'telegram';
+  const name = String(body.name || '').replace(/\s+/g, ' ').trim();
+  if (!name) return fail(res, 400, 'D\u00ea um nome ao destino (ex.: Achadinhos).');
+  const dailyLimit = Math.min(Math.max(parseInt(body.daily_limit, 10) || 60, 1), 200);
+
+  // No WhatsApp, chat_id guarda o NOME do grupo (usado pelo robo). No Telegram, o @canal/id.
+  const row = { name: name.slice(0, 80), platform, daily_limit: dailyLimit, chat_id: platform === 'whatsapp_manual' ? (String(body.chat_id || '').replace(/\s+/g, ' ').trim().slice(0, 120) || null) : null, bot_token: null };
+  let botUsername = null;
+
+  if (platform === 'telegram') {
+    const chat = String(body.chat_id || '').trim();
+    const token = String(body.bot_token || '').trim();
+    if (!chat) return fail(res, 400, 'Preencha o Chat (@nome_do_canal ou o id num\u00e9rico).');
+    if (!/^\d+:[\w-]{20,}$/.test(token)) return fail(res, 400, 'Token do bot com formato estranho. Ele parece com 123456789:ABCdef... (copie inteiro do @BotFather).');
+    try { botUsername = (await telegram(token, 'getMe')).username; }
+    catch (err) { return fail(res, 400, friendlyTelegramError(err)); }
+    row.chat_id = /^-?\d+$/.test(chat) || chat.startsWith('@') ? chat : `@${chat}`;
+    row.bot_token = token;
+  }
+
+  const { error } = await supabaseAdmin.from('dispatch_destinations').insert(row);
+  if (error) return fail(res, 500, dbError(error));
+  res.status(200).json({ ok: true, botUsername });
+}
+
+async function listDestinations(res) {
+  // bot_seen_at e criado pelo SQL 0004; se ele ainda nao foi rodado, cai para a consulta antiga.
+  let q = await supabaseAdmin.from('dispatch_destinations').select('id, name, platform, chat_id, daily_limit, created_at, bot_seen_at').order('created_at');
+  if (q.error && /bot_seen_at/i.test(String(q.error.message || ''))) {
+    q = await supabaseAdmin.from('dispatch_destinations').select('id, name, platform, chat_id, daily_limit, created_at').order('created_at');
+  }
+  const { data, error } = q;
+  if (error) return fail(res, 500, dbError(error));
+  const since = isoAgo(DAY);
+  const [counts, payload] = await Promise.all([
+    Promise.all((data || []).map((d) => supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true })
+      .eq('destination_id', d.id).eq('skipped', false).gte('sent_at', since).then((r) => r.count || 0, () => 0))),
+    jobsPayload(),
+  ]);
+  const out = (data || []).map((d, i) => ({ ...d, sentLast24h: counts[i] }));
+  res.status(200).json({ destinations: out, jobs: payload.jobs, now: payload.now, botSeenAt: payload.botSeenAt || null, version: VERSION });
+}
+
+async function sendTest(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+  const text = '\u2705 Teste do Radar de Promo\u00e7\u00f5es: se voc\u00ea est\u00e1 lendo isso, o destino est\u00e1 funcionando.\n\n\ud83d\udc40 \ud83d\udd25 \ud83e\udd29 \ud83d\udecd\ufe0f \ud83d\udcb8 \ud83c\udfe0 \ud83d\udcf1 \ud83c\udf73 \ud83c\udfaf \ud83d\udcf2 \ud83d\udc49 \u26a0\ufe0f \ud83d\udd17';
+  if (dest.platform === 'whatsapp_manual') return res.status(200).json({ ok: true, manual: true, message: text });
+  try { await telegram(dest.bot_token, 'sendMessage', { chat_id: dest.chat_id, text }); }
+  catch (err) { return fail(res, 400, friendlyTelegramError(err)); }
+  res.status(200).json({ ok: true });
+}
+
+async function queue(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+  const list = await loadQueue(dest.id, body);
+  if (!list.length) return res.status(200).json({ count: 0 });
+  const n = list[0];
+  res.status(200).json({
+    count: list.length,
+    next: { title: n.title, price: Number(n.current_price), discount: n.discount_rate ? Number(n.discount_rate) : null, marketplace: n.marketplaces ? n.marketplaces.name : null },
+    newestSeenAt: list.reduce((m, p) => { const t = p.last_seen_at || p.detected_at; return t && (!m || t > m) ? t : m; }, null),
+  });
+}
+
+
+// Confere os pr-ximos da fila SEM enviar nada. Quem n-o existe mais - removido (vai para "Ignoradas").
+async function verifyQueue(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+  const list = await loadQueue(dest.id, body);
+  const sample = list.slice(0, 12);
+  const out = { total: list.length, checked: 0, ok: 0, removed: [], warnings: [] };
+  for (const p of sample) {
+    const check = await validatePromotion(p);
+    out.checked += 1;
+    if (check.ok) { out.ok += 1; continue; }
+    if (check.kind === 'badlink') { out.warnings.push(check.reason); break; }
+    if (check.kind === 'dead') await ignorePromotion(p, check.reason);
+    out.removed.push({ title: p.title, reason: check.reason });
+  }
+  res.status(200).json(out);
+}
+
+// Escolhe e confere a proxima promocao (sem enviar nada). Devolve:
+//  { error: { status, message, extra } } | { empty: true, skipped } | { chosen, view, html, remaining, skippedInfo }
+async function prepareNext(dest, body) {
+  // limite diario e trava anti-duplo-clique
+  const { count: sent24 } = await supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true })
+    .eq('destination_id', dest.id).eq('skipped', false).gte('sent_at', isoAgo(DAY));
+  if ((sent24 || 0) >= dest.daily_limit) return { error: { status: 429, message: `Limite de ${dest.daily_limit} envios em 24h atingido para "${dest.name}".`, extra: { code: 'daily_limit' } } };
+
+  const { data: last } = await supabaseAdmin.from('dispatch_log').select('sent_at').eq('destination_id', dest.id).eq('skipped', false)
+    .order('sent_at', { ascending: false }).limit(1);
+  if (last && last[0] && Date.now() - new Date(last[0].sent_at).getTime() < MIN_GAP_SECONDS * 1000) {
+    return { error: { status: 429, message: 'Envio muito r\u00e1pido, aguardando alguns segundos.', extra: { code: 'too_fast' } } };
+  }
+
+  const list = await loadQueue(dest.id, body);
+  let chosen = null; let view = null; let tries = 0;
+  const skippedInfo = [];
+  const t0 = Date.now();
+  for (const p of list) {
+    if (tries >= 8 || Date.now() - t0 > 16000) break; // a funcao da Vercel morre em 30s: deixa folga
+    tries += 1;
+    // 1) o produto/link ainda existe e funciona?
+    const check = await validatePromotion(p);
+    if (!check.ok) {
+      if (check.kind === 'badlink') {
+        return { error: { status: 409, message: `Parei por seguran\u00e7a: ${check.reason}. Confira o ID de afiliado em Marketplaces antes de continuar.`, extra: { code: 'bad_link' } } };
       }
+      if (check.kind === 'dead' || check.kind === 'stale') await endPromotion(p, check.reason);
+      await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: `pulada: ${check.reason}` });
+      skippedInfo.push({ title: p.title, reason: check.reason });
       continue;
     }
-
-    withDiscount += 1;
-    candidates.push({ ...c, regularPrice: reference, discountRate: Number(drop.toFixed(2)), source: 'netshoes_rakuten_api' });
-  }
-
-  // Ofertas por cupom: as de maior desconto primeiro, respeitando o teto da busca inteira.
-  if (couponCandidates.length && couponCtx.left > 0) {
-    couponCandidates.sort((a, b) => b._pct - a._pct);
-    const take = couponCandidates.slice(0, couponCtx.left);
-    couponCtx.left -= take.length;
-    couponCtx.deals += take.length;
-    withDiscount += take.length;
-    candidates.push(...take);
-  }
-
-  // 4) Registra o preço de hoje no histórico (só quem não foi registrado nas últimas 6h)
-  if (historyOk) {
-    const gapMs = NETSHOES_HISTORY_MIN_GAP_HOURS * 36e5;
-    const nowMs = Date.now();
-    const rows = parsed
-      .filter((c) => { const h = historyByUrl.get(c.productUrl); return !h || nowMs - h.lastAt >= gapMs; })
-      .map((c) => ({ marketplace_id: marketplaceId, product_url: c.productUrl, price: c.price }));
-    if (rows.length) {
-      const { error } = await supabaseAdmin.from('promotion_price_history').insert(rows);
-      if (error) stats.historyError = error.message;
-      else stats.newlyTracked = rows.length;
-    }
-  }
-
-  // 5) Quais desses links já estão salvos? (candidatos E não candidatos, em blocos de 10 para não estourar a consulta)
-  const existingByUrl = new Map();
-  for (const part of chunk(parsed.map((c) => c.productUrl), 10)) {
-    const { data, error } = await supabaseAdmin
-      .from('promotions')
-      .select('*')
-      .eq('marketplace_id', marketplaceId)
-      .in('original_url', part);
-    if (error) { if (candidates.length) throw new Error(`banco de dados: ${error.message}`); break; }
-    (data || []).forEach((row) => existingByUrl.set(row.original_url, row));
-  }
-
-  // Quem já estava no painel e o preço voltou a subir (3% ou mais) = promoção finalizada.
-  const candidateUrls = new Set(candidates.map((c) => c.productUrl));
-  const endIds = [];
-  const stillIds = [];
-  for (const c of parsed) {
-    if (candidateUrls.has(c.productUrl)) continue;
-    const ex = existingByUrl.get(c.productUrl);
-    if (!ex) continue;
-    if (!ex.ended_at && ex.status !== 'IGNORED' && Number(ex.current_price) > 0 && c.price >= Number(ex.current_price) * 1.03) endIds.push(ex.id);
-    else stillIds.push(ex.id);
-  }
-  if (endIds.length) stats.ended = await markEnded(supabaseAdmin, endIds, 'O preço voltou a subir (a Netshoes não mostra mais a promoção)');
-  for (const part of chunk(stillIds, 100)) await supabaseAdmin.from('promotions').update({ last_seen_at: new Date().toISOString() }).in('id', part);
-
-  if (!candidates.length) return { found: 0, withDiscount, stats };
-  const revive = await reviveFields(supabaseAdmin);
-
-  const now = new Date().toISOString();
-  const toInsert = [];
-  const updates = [];
-
-  // Do mais barato para o mais caro: entre anúncios repetidos do mesmo produto, o mais barato entra primeiro.
-  candidates.sort((a, b) => a.price - b.price);
-
-  for (const c of candidates) {
-    const existing = existingByUrl.get(c.productUrl);
-    if (existing) {
-      updates.push({ existing, c });
-    } else {
-      // Mesmo produto (outro vendedor/anúncio) já salvo ou já aceito nesta busca? Descarta.
-      if (dedupeCtx && dedupeCtx.index.findSimilar(c.title)) { stats.duplicates += 1; continue; }
-      if (dedupeCtx) dedupeCtx.index.add(c.title, { title: c.title, current_price: c.price, original_url: c.productUrl });
-      toInsert.push({
-        marketplace_id: marketplaceId,
-        watch_group_id: group.id,
-        matched_keyword: keyword || null,
-        title: c.title,
-        image_url: c.imageUrl,
-        original_url: c.productUrl,
-        current_price: c.price,
-        previous_price: c.regularPrice,
-        discount_rate: c.discountRate,
-        source: c.source || 'netshoes_rakuten_api',
-        status: 'PENDING',
-        last_seen_at: now,
-        affiliate_url: netshoesClient.buildAffiliateLink(publisherId, mid, c.productUrl),
-        affiliate_url_added_at: now,
-      });
-    }
-  }
-
-  if (toInsert.length) {
-    const { error } = await insertPromotions(toInsert);
-    if (error) throw new Error(`banco de dados: ${error.message}`);
-  }
-
-  for (const part of chunk(updates, 10)) {
-    await Promise.all(part.map(({ existing, c }) => supabaseAdmin
-      .from('promotions')
-      .update({
-        current_price: c.price,
-        previous_price: c.regularPrice,
-        discount_rate: c.discountRate,
-        source: c.source || 'netshoes_rakuten_api',
-        watch_group_id: existing.watch_group_id || group.id,
-        ...keywordPatch(existing, keyword),
-        ...revive,
-        last_seen_at: now,
-        // Refaz o link de afiliado (corrige links antigos gerados com ID errado), exceto os que você já marcou como afiliados.
-        ...(existing.status === 'AFFILIATED' ? {} : { affiliate_url: netshoesClient.buildAffiliateLink(publisherId, mid, c.productUrl) }),
-      })
-      .eq('id', existing.id)));
-  }
-
-  return { found: toInsert.length, withDiscount, stats };
-}
-
-// ---------------- Shopee ----------------
-
-async function scanShopee(req, res) {
-  try {
-    const startedAt = Date.now();
-    const { data: marketplace } = await supabaseAdmin
-      .from('marketplaces')
-      .select('id')
-      .eq('slug', 'shopee')
-      .single();
-
-    const { data: creds } = await supabaseAdmin
-      .from('marketplace_credentials')
-      .select('client_id, client_secret')
-      .eq('marketplace_id', marketplace.id)
-      .maybeSingle();
-
-    if (!creds?.client_id || !creds?.client_secret) {
-      res.status(400).json({ error: 'Credenciais da Shopee não cadastradas. Vá em /marketplaces.html.' });
-      return;
-    }
-
-    const { data: allGroups } = await supabaseAdmin.from('watch_groups').select('*');
-    const groupsParam = getGroupsParam(req);
-    const selectedRows = groupsParam ? (allGroups || []).filter((g) => groupsParam.includes(g.id)) : allGroups;
-    // Só entram grupos configurados para rodar na Shopee (e, se o painel mandou um lote, só as palavras do lote).
-    const groups = filterGroupKeywords(mergeGroupsByName((selectedRows || []).filter((g) => groupRunsOn(g, 'shopee'))), getKeywordsParam(req));
-
-    // Produtos já salvos nos últimos 14 dias: a Shopee devolve o MESMO produto em vários anúncios
-    // (um por vendedor, cada um com link diferente) — comparar só o link não pega isso.
-    const recent = await loadRecentIndex(supabaseAdmin, marketplace.id);
-    const dedupeCtx = { index: recent.index };
-
-    let found = 0;
-    let skipped = 0;
-    const errors = [];
-    const seenUrls = new Set();
-    const totals = { checked: 0, updated: 0, ended: 0, listedOnly: 0, withHistory: 0, trackedNow: 0, maxDrop: 0, changed: 0, duplicates: 0, historyError: null };
-
-    // Uma tarefa por palavra-chave (cada palavra é buscada uma única vez, mesmo que esteja em dois grupos).
-    // Antes as palavras eram buscadas UMA POR VEZ, em fila, e o limite de tempo cortava as últimas —
-    // por isso marcar tudo trazia bem menos produtos do que buscar palavra por palavra.
-    const tasks = [];
-    const seenKeywords = new Set();
-    for (const group of groups) {
-      for (const keyword of group.keywords) {
-        const key = normKey(keyword);
-        if (seenKeywords.has(key)) continue;
-        seenKeywords.add(key);
-        tasks.push({ group, keyword });
-      }
-    }
-    shuffle(tasks);
-
-    const skippedKeywords = [];
-    let done = 0;
-    let nextTask = 0;
-    async function worker() {
-      while (nextTask < tasks.length) {
-        const task = tasks[nextTask++];
-        if (Date.now() - startedAt > SCAN_BUDGET_MS) { skipped += 1; skippedKeywords.push(task.keyword); continue; }
-        try {
-          const sortType = SHOPEE_SORT_ROTATION[Math.floor(Math.random() * SHOPEE_SORT_ROTATION.length)];
-          const page = 1 + Math.floor(Math.random() * 3);
-          let offers;
-          try {
-            offers = await searchProductOffers(creds.client_id, creds.client_secret, task.keyword, { limit: SHOPEE_PER_KEYWORD_LIMIT, sortType, page });
-          } catch (firstErr) {
-            // A Shopee limita pedidos simultâneos: se reclamou de limite/frequência, espera um pouco e tenta uma vez mais.
-            if (!/rate|limit|frequen|too many|429|10030|10020/i.test(String(firstErr.message))) throw firstErr;
-            await new Promise((r) => setTimeout(r, 1500));
-            offers = await searchProductOffers(creds.client_id, creds.client_secret, task.keyword, { limit: SHOPEE_PER_KEYWORD_LIMIT, sortType, page });
-          }
-          done += 1;
-          const r = await processShopeeOffers(offers, marketplace.id, task.group, task.keyword, creds, seenUrls, dedupeCtx);
-          found += r.found;
-          totals.updated += r.updated;
-          totals.ended += r.ended || 0;
-          totals.checked += r.checked;
-          totals.listedOnly += r.listedOnly;
-          totals.withHistory += r.withHistory;
-          totals.trackedNow += r.trackedNow;
-          totals.changed += r.changed;
-          totals.duplicates += r.duplicates;
-          totals.maxDrop = Math.max(totals.maxDrop, r.maxDrop);
-          if (!totals.historyError && r.historyError) totals.historyError = r.historyError;
-        } catch (err) {
-          errors.push(`${task.group.name} / "${task.keyword}": ${err.message}`);
-          await supabaseAdmin.from('integration_logs').insert({
-            marketplace_id: marketplace.id,
-            level: 'error',
-            message: `Falha ao buscar ofertas Shopee para "${task.keyword}" (grupo ${task.group.name}): ${err.message}`,
-          });
-        }
-      }
-    }
-    await Promise.all(Array.from({ length: Math.min(SHOPEE_CONCURRENCY, tasks.length) }, worker));
-
-    // Limpeza: histórico com mais de 30 dias não serve para nada (a comparação usa 7).
-    if (!totals.historyError) {
-      const keepSince = new Date(Date.now() - NETSHOES_HISTORY_KEEP_DAYS * 864e5).toISOString();
-      await supabaseAdmin.from('promotion_price_history').delete().eq('marketplace_id', marketplace.id).lt('checked_at', keepSince);
-    }
-
-    // Promoções que a busca não vê há dias viram "finalizadas" (só se esta busca realmente leu produtos).
-    const swept = done > 0 ? await sweepStale(supabaseAdmin, marketplace.id) : 0;
-
-    const parts = [];
-    if (totals.ended + swept > 0) parts.push(`${totals.ended + swept} promoção(ões) marcada(s) como finalizada(s).`);
-    if (found === 0 && totals.updated > 0) {
-      parts.push(`Nenhuma promoção nova; ${totals.updated} já existente(s) no painel foi(ram) atualizada(s) com o preço e o desconto de agora.`);
-    } else if (found === 0 && totals.checked > 0) {
-      parts.push(`A Shopee devolveu ${totals.checked} produto(s), mas nenhum caiu de preço de verdade (queda mínima de ${SHOPEE_MIN_DROP_PCT}% contra o que já vi nos últimos ${NETSHOES_HISTORY_DAYS} dias)${SHOPEE_ACCEPT_LISTED_DISCOUNT ? ` nem tinha desconto de tabela de pelo menos ${SHOPEE_LISTED_MIN_PCT}%` : `. Em ${totals.listedOnly} havia só "desconto" de preço de tabela, que a Shopee informa sem prova de promoção, e por isso foram ignorados`}. ${totals.trackedNow} passaram a ser acompanhados agora e ${totals.withHistory} já tinham histórico (${totals.changed} com preço diferente do histórico). Rode a busca de novo nos próximos dias.`);
-    }
-    if (totals.duplicates) parts.push(`${totals.duplicates} produto(s) repetido(s) (mesmo produto vendido por outro vendedor) foram descartados.`);
-    if (totals.historyError) parts.push(`Histórico de preços indisponível (${totals.historyError}): sem ele não dá para provar queda de preço, então nada foi salvo como promoção.`);
-    if (skipped) parts.push(`${skipped} palavra(s)-chave ficaram para a próxima busca (limite de tempo).`);
-
-    res.status(200).json({
-      ok: true,
-      groupsSearched: (groups || []).length,
-      keywordsSearched: done,
-      skippedKeywords,
-      endedPromotions: totals.ended + swept,
-      productsChecked: totals.checked,
-      promotionsFound: found,
-      errors,
-      note: parts.length ? parts.join(' ') : undefined,
-    });
-  } catch (err) {
-    res.status(500).json({ error: `Erro no servidor: ${err.message}` });
-  }
-}
-
-// Checa se o título do produto realmente tem a ver com a palavra-chave buscada.
-// A busca da Shopee é por relevância ampla — alguns vendedores colocam palavras
-// populares no título só pra aparecer em mais buscas ("keyword stuffing"). Isso
-// descarta o caso óbvio de vazamento (ex: produto de cozinha aparecendo na
-// busca de "corrida"), sem precisar de um filtro perfeito.
-function foldText(value) {
-  return String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
-}
-
-function titleMatchesKeyword(title, keyword) {
-  const stopWords = new Set(['de', 'da', 'do', 'das', 'dos', 'e', 'com', 'para', 'em', 'a', 'o']);
-  // Sem acento nos dois lados: "calça" na palavra-chave também casa com "Calca" no título (antes era descartado).
-  const words = foldText(keyword)
-    .split(/[\s,]+/)
-    .filter((w) => w.length > 2 && !stopWords.has(w));
-  if (words.length === 0) return true; // palavra-chave só com termos curtos — não filtra
-  const titleLower = foldText(title);
-  return words.some((w) => titleLower.includes(w));
-}
-
-// Processa as ofertas de uma palavra-chave em lote. Regra de promoção (igual à da Netshoes):
-//   preço normal = mediana dos preços que o sistema registrou nos últimos 7 dias
-//   é promoção quando o preço atual está abaixo dele em pelo menos SHOPEE_MIN_DROP_PCT.
-// O priceDiscountRate da Shopee (preço de tabela) NÃO conta como prova — ver comentário no topo do arquivo.
-async function processShopeeOffers(offers, marketplaceId, group, keyword, creds, seenUrls, dedupeCtx) {
-  const stats = { found: 0, updated: 0, ended: 0, checked: 0, listedOnly: 0, withHistory: 0, trackedNow: 0, maxDrop: 0, changed: 0, duplicates: 0, historyError: null };
-
-  // 1) Lê as ofertas (descarta título sem relação com a busca e links repetidos)
-  const parsed = [];
-  for (const offer of offers) {
-    if (!titleMatchesKeyword(offer.productName || '', keyword)) continue;
-    const productUrl = offer.productLink || offer.offerLink;
-    const price = parsePrice(offer.priceMin);
-    if (!productUrl || !price || !offer.productName) continue;
-    if (seenUrls.has(productUrl)) continue;
-    seenUrls.add(productUrl);
-    parsed.push({
-      title: offer.productName,
-      productUrl,
-      price,
-      listedRate: Number(offer.priceDiscountRate) || 0,
-      imageUrl: offer.imageUrl || null,
-    });
-  }
-  stats.checked = parsed.length;
-  if (!parsed.length) return stats;
-
-  // 2) Histórico de preços desses links nos últimos 7 dias
-  const historyByUrl = new Map();
-  const windowStart = new Date(Date.now() - NETSHOES_HISTORY_DAYS * 864e5).toISOString();
-  let historyOk = true;
-  for (const part of chunk(parsed.map((c) => c.productUrl), 10)) {
-    const { data, error } = await supabaseAdmin
-      .from('promotion_price_history')
-      .select('product_url, price, checked_at')
-      .eq('marketplace_id', marketplaceId)
-      .in('product_url', part)
-      .gte('checked_at', windowStart);
-    if (error) { historyOk = false; stats.historyError = error.message; break; }
-    for (const row of data || []) {
-      if (!historyByUrl.has(row.product_url)) historyByUrl.set(row.product_url, { prices: [], lastAt: 0 });
-      const h = historyByUrl.get(row.product_url);
-      h.prices.push(Number(row.price));
-      h.lastAt = Math.max(h.lastAt, new Date(row.checked_at).getTime());
-    }
-  }
-
-  // 3) Decide quem caiu de preço de verdade
-  const candidates = [];
-  for (const c of parsed) {
-    const h = historyByUrl.get(c.productUrl);
-    let reference = null;
-    let source = 'shopee_affiliate_api';
-    if (h && h.prices.length) {
-      stats.withHistory += 1;
-      const med = median(h.prices);
-      if (med > c.price) reference = med;
-      if (h.prices.some((p) => Math.abs(p - c.price) >= 0.01)) stats.changed += 1;
-    }
-    let drop = reference ? ((reference - c.price) / reference) * 100 : 0;
-
-    if (drop < SHOPEE_MIN_DROP_PCT) {
-      // Sem queda comprovada. Só aceita o "desconto de tabela" se o dono ligou essa opção.
-      if (c.listedRate >= MIN_DISCOUNT_PCT) stats.listedOnly += 1;
-      if (SHOPEE_ACCEPT_LISTED_DISCOUNT && c.listedRate >= SHOPEE_LISTED_MIN_PCT && c.listedRate <= SHOPEE_LISTED_MAX_PCT) {
-        reference = Number((c.price / (1 - c.listedRate / 100)).toFixed(2));
-        drop = c.listedRate;
-        source = 'shopee_listed_price';
-      } else {
+    // 1b) preco de AGORA (Shopee confirma na API): usa o preco real e descarta se deixou de ser desconto
+    if (check.livePrice && Math.abs(check.livePrice - Number(p.current_price)) >= 0.01) {
+      const prev = p.previous_price ? Number(p.previous_price) : null;
+      if (prev && check.livePrice >= prev) {
+        await endPromotion(p, 'o pre\u00e7o voltou ao normal (sem desconto agora)');
+        await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: 'pulada: sem desconto agora' });
+        skippedInfo.push({ title: p.title, reason: 'o pre\u00e7o atual n\u00e3o est\u00e1 mais em promo\u00e7\u00e3o' });
         continue;
       }
+      p.current_price = check.livePrice;
+      p.discount_rate = prev ? Math.round(((prev - check.livePrice) / prev) * 10000) / 100 : p.discount_rate;
+      supabaseAdmin.from('promotions').update({ current_price: p.current_price, discount_rate: p.discount_rate, last_seen_at: new Date().toISOString() }).eq('id', p.id).then(() => {}, () => {});
     }
-    stats.maxDrop = Math.max(stats.maxDrop, drop);
-    candidates.push({ ...c, previousPrice: reference, discountRate: Number(drop.toFixed(2)), source });
-  }
-
-  // 4) Registra o preço de hoje no histórico (só quem não foi registrado nas últimas 6h)
-  if (historyOk) {
-    const gapMs = NETSHOES_HISTORY_MIN_GAP_HOURS * 36e5;
-    const nowMs = Date.now();
-    const rows = parsed
-      .filter((c) => { const h = historyByUrl.get(c.productUrl); return !h || nowMs - h.lastAt >= gapMs; })
-      .map((c) => ({ marketplace_id: marketplaceId, product_url: c.productUrl, price: c.price }));
-    if (rows.length) {
-      const { error } = await supabaseAdmin.from('promotion_price_history').insert(rows);
-      if (error) stats.historyError = error.message;
-      else stats.trackedNow = rows.length;
+    // 2) preco/cupom de agora
+    const v = await buildView(p);
+    if (v && v.discount && v.discount > MAX_DISCOUNT_PCT) {
+      await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: 'pulada: desconto suspeito' });
+      skippedInfo.push({ title: p.title, reason: `desconto de ${Math.round(v.discount)}% parece pre\u00e7o de tabela inflado` });
+      continue;
     }
+    if (v) { chosen = p; view = v; break; }
+    await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: 'pulada: cupom n\u00e3o confirmado' });
+    skippedInfo.push({ title: p.title, reason: 'o cupom dessa oferta n\u00e3o est\u00e1 mais v\u00e1lido' });
   }
-  // 5) Quais desses links já estão salvos? (candidatos E não candidatos: quem já estava no painel e deixou de ser promoção é finalizado)
-  const existingByUrl = new Map();
-  for (const part of chunk(parsed.map((c) => c.productUrl), 10)) {
-    const { data, error } = await supabaseAdmin
-      .from('promotions')
-      .select('*')
-      .eq('marketplace_id', marketplaceId)
-      .in('original_url', part);
-    if (error) { if (candidates.length) throw new Error(`banco de dados: ${error.message}`); break; }
-    (data || []).forEach((row) => existingByUrl.set(row.original_url, row));
+  if (!chosen) {
+    // So e "fila acabou" se TODA a fila foi conferida. Se parou por limite (8 conferencias ou tempo) ainda ha
+    // mais promocoes: tenta as proximas daqui a pouco em vez de encerrar o disparo.
+    if (tries < list.length) return { retry: true, skipped: skippedInfo };
+    return { empty: true, skipped: skippedInfo };
   }
 
-  // Preço voltou a subir (3% ou mais acima do preço salvo na promoção) = promoção finalizada.
-  const candidateUrls = new Set(candidates.map((c) => c.productUrl));
-  const endIds = [];
-  for (const c of parsed) {
-    if (candidateUrls.has(c.productUrl)) continue;
-    const ex = existingByUrl.get(c.productUrl);
-    if (ex && !ex.ended_at && ex.status !== 'IGNORED' && Number(ex.current_price) > 0 && c.price >= Number(ex.current_price) * 1.03) endIds.push(ex.id);
-  }
-  if (endIds.length) stats.ended = await markEnded(supabaseAdmin, endIds, 'O preço voltou a subir (a Shopee não mostra mais a promoção)');
-  // Quem ainda aparece (mesmo sem queda nova) continua "visto hoje": a varredura de promoções velhas usa isso.
-  const stillIds = parsed.map((c) => existingByUrl.get(c.productUrl)).filter((e) => e && !endIds.includes(e.id) && !candidateUrls.has(e.original_url)).map((e) => e.id);
-  if (stillIds.length) {
-    for (const part of chunk(stillIds, 100)) await supabaseAdmin.from('promotions').update({ last_seen_at: new Date().toISOString() }).in('id', part);
-  }
-  if (!candidates.length) return stats;
-  const revive = await reviveFields(supabaseAdmin);
+  chosen.view = view;
+  const { count: total } = await supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true }).eq('destination_id', dest.id);
+  const html = buildMessage(chosen, total || 0, String(body.footer || '').slice(0, 120));
+  return { chosen, view, html, remaining: Math.max(list.length - tries, 0), skippedInfo };
+}
 
+async function sendNext(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+
+  const prep = await prepareNext(dest, body);
+  if (prep.error) return fail(res, prep.error.status, prep.error.message, prep.error.extra);
+  if (prep.empty) return res.status(200).json({ empty: true, skipped: prep.skipped });
+  if (prep.retry) return res.status(200).json({ retry: true, skipped: prep.skipped });
+
+  const { chosen, view, html, remaining, skippedInfo } = prep;
+  const slugName = chosen.marketplaces ? chosen.marketplaces.name : null;
+
+  if (dest.platform === 'whatsapp_manual') {
+    const plain = toWhatsApp(html);
+    const { error: logErr } = await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: plain });
+    if (isDupError(logErr)) return fail(res, 409, 'Essa promo\u00e7\u00e3o j\u00e1 foi enviada a este destino (evitei repetir).', { code: 'duplicate' });
+    return res.status(200).json({ ok: true, manual: true, message: plain, promotion: { title: chosen.title, coupon: view.coupon }, remaining, skipped: skippedInfo });
+  }
+
+  // RESERVA antes de enviar: se o servidor cair depois do envio, a promocao ja consta como enviada e nao repete.
+  // (O indice unico do SQL 0005 impede dois envios da mesma promocao ao mesmo destino, mesmo em disputa.)
+  const reserve = await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: toPlain(html) }).select('id').maybeSingle();
+  if (isDupError(reserve.error)) return fail(res, 409, 'Essa promo\u00e7\u00e3o j\u00e1 foi enviada a este destino (evitei repetir).', { code: 'duplicate' });
+  const reservedId = reserve.data ? reserve.data.id : null;
+  try {
+    let done = false;
+    if (chosen.image_url && /^https:\/\//i.test(chosen.image_url) && html.length <= 1000) {
+      try {
+        await telegram(dest.bot_token, 'sendPhoto', { chat_id: dest.chat_id, photo: chosen.image_url, caption: html, parse_mode: 'HTML' });
+        done = true;
+      } catch (e) { if (e.status === 429) throw e; /* imagem recusada: manda s\u00f3 o texto */ }
+    }
+    if (!done) await telegram(dest.bot_token, 'sendMessage', { chat_id: dest.chat_id, text: html, parse_mode: 'HTML', disable_web_page_preview: false });
+  } catch (err) {
+    // Nao foi enviado: libera a reserva para a promocao poder sair depois.
+    if (reservedId) await supabaseAdmin.from('dispatch_log').delete().eq('id', reservedId);
+    if (err.status === 429) return fail(res, 429, 'Telegram pediu para ir mais devagar.', { code: 'rate_limited', retryAfter: err.retryAfter || 60 });
+    return fail(res, 502, friendlyTelegramError(err));
+  }
+
+  res.status(200).json({ ok: true, sent: { title: chosen.title, marketplace: slugName, coupon: view.coupon }, remaining, skipped: skippedInfo });
+}
+
+
+// ---------------- disparo continuo (estado no servidor) ----------------
+
+const CLAIM_STALE_MS = 150 * 1000;
+const BOT_PENDING_MAX_MS = 10 * 60 * 1000; // mensagem entregue ao robo e nao confirmada ha mais que isso: descarta
+
+// ---- horario de funcionamento (hora de Brasilia = UTC-3, sem horario de verao desde 2019) ----
+const BRT_OFFSET_MS = -3 * 3600 * 1000;
+function parseHour(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = parseInt(v, 10);
+  return Number.isInteger(n) && n >= 0 && n <= 23 ? n : null;
+}
+function inWindow(f, ms = Date.now()) {
+  const from = Number.isInteger(f.hour_from) ? f.hour_from : null;
+  const to = Number.isInteger(f.hour_to) ? f.hour_to : null;
+  if (from === null || to === null || from === to) return true; // sem limite
+  const h = new Date(ms + BRT_OFFSET_MS).getUTCHours();
+  return from < to ? (h >= from && h < to) : (h >= from || h < to);
+}
+function nextWindowStart(f, ms = Date.now()) {
+  const brt = new Date(ms + BRT_OFFSET_MS);
+  let start = Date.UTC(brt.getUTCFullYear(), brt.getUTCMonth(), brt.getUTCDate(), f.hour_from, 0, 0) - BRT_OFFSET_MS;
+  if (start <= ms) start += 24 * 3600 * 1000;
+  return start;
+}
+// Intervalo com variacao de +-15%: mensagens em horario "redondo" demais chamam atencao do WhatsApp.
+function jitteredMs(minutes) {
+  return Math.max(Math.round(minutes * 60000 * (0.85 + Math.random() * 0.3)), 90 * 1000);
+}
+
+function fakeRes() {
+  return { code: 200, body: null, status(c) { this.code = c; return this; }, json(b) { this.body = b; return this; } };
+}
+
+async function jobsPayload() {
   const now = new Date().toISOString();
-  // Do mais barato para o mais caro: entre anúncios repetidos do mesmo produto, o mais barato entra primeiro.
-  candidates.sort((a, b) => a.price - b.price);
-  for (const c of candidates) {
-    const existing = existingByUrl.get(c.productUrl);
-    if (existing) {
-      await supabaseAdmin
-        .from('promotions')
-        .update({
-          current_price: c.price,
-          previous_price: c.previousPrice,
-          discount_rate: c.discountRate,
-          source: c.source,
-          watch_group_id: existing.watch_group_id || group.id,
-          ...keywordPatch(existing, keyword),
-          ...revive,
-          last_seen_at: now,
-        })
-        .eq('id', existing.id);
-      stats.updated += 1;
+  const { data, error } = await supabaseAdmin.from('dispatch_jobs').select('*');
+  if (error) return { jobs: [], now, jobsError: error.message };
+  // ultima vez que o robo do WhatsApp consultou o servidor (coluna criada pelo SQL 0004; sem ela, fica null)
+  let botSeenAt = null;
+  try {
+    const r = await supabaseAdmin.from('dispatch_destinations').select('bot_seen_at').not('bot_seen_at', 'is', null).order('bot_seen_at', { ascending: false }).limit(1);
+    if (!r.error && r.data && r.data[0]) botSeenAt = r.data[0].bot_seen_at;
+  } catch { /* sem a coluna: segue */ }
+  return { jobs: data || [], now, botSeenAt };
+}
+
+async function startJob(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino nao encontrado.');
+  const isTelegram = dest.platform === 'telegram';
+  // WhatsApp: 'bot' = robo envia sozinho; qualquer outra coisa = assistido (voce toca em enviar).
+  const mode = isTelegram ? 'auto' : (body.mode === 'bot' ? 'bot' : 'assisted');
+  const interval = Math.max(parseInt(body.interval_min, 10) || 0, (isTelegram || mode === 'bot') ? 2 : 1);
+  const maxSends = Math.min(Math.max(parseInt(body.max_sends, 10) || 20, 1), 500);
+  const footer = String(body.footer || '').slice(0, 120);
+  const filters = {
+    group_ids: Array.isArray(body.group_ids) ? body.group_ids : [],
+    marketplace: body.marketplace || null,
+    min_score: Math.max(0, Math.min(100, Number(body.min_score) || 0)),
+    footer,
+    hour_from: parseHour(body.hour_from),
+    hour_to: parseHour(body.hour_to),
+  };
+  if (mode === 'bot') {
+    const waGroup = String(body.wa_group || dest.chat_id || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    if (!waGroup) return fail(res, 400, 'Informe o nome do grupo do WhatsApp (exatamente como aparece no WhatsApp) para o robo saber onde enviar.');
+    filters.wa_group = waGroup;
+    // guarda o nome no destino, para ja vir preenchido da proxima vez
+    if (waGroup !== dest.chat_id) await supabaseAdmin.from('dispatch_destinations').update({ chat_id: waGroup }).eq('id', dest.id);
+  }
+  // Disparo JA rodando para este destino (clique duplo, segunda aba, pagina ainda carregando): NAO zera o contador.
+  // Para recomecar do zero, pare primeiro.
+  {
+    const { data: existing } = await supabaseAdmin.from('dispatch_jobs').select('id, status').eq('destination_id', dest.id).maybeSingle();
+    if (existing && existing.status === 'running') {
+      const payload = await jobsPayload();
+      return res.status(200).json({ ...payload, alreadyRunning: true });
+    }
+  }
+  const nowIso = new Date().toISOString();
+  const row = {
+    destination_id: dest.id, mode, status: 'running',
+    interval_min: interval, max_sends: maxSends, sent_count: 0, next_run_at: nowIso, claimed_at: null,
+    filters,
+    pending: null, last_event: mode === 'bot' ? 'Disparo iniciado. Aguardando o robo buscar a primeira mensagem.' : 'Disparo iniciado.', last_error: null, error_streak: 0, updated_at: nowIso,
+  };
+  const { error } = await supabaseAdmin.from('dispatch_jobs').upsert(row, { onConflict: 'destination_id' });
+  if (error) {
+    if (mode === 'bot' && /check constraint|violates/i.test(String(error.message || ''))) {
+      return fail(res, 500, 'O banco ainda nao aceita o modo robo. Rode o SQL 0004_robo_whatsapp.sql no Supabase (SQL Editor) e tente de novo.');
+    }
+    return fail(res, 500, dbError(error));
+  }
+  res.status(200).json(await jobsPayload());
+}
+
+async function stopJob(res, body) {
+  const { error } = await supabaseAdmin.from('dispatch_jobs')
+    .update({ status: 'stopped', pending: null, claimed_at: null, last_event: 'Parado por voce.', updated_at: new Date().toISOString() })
+    .eq('destination_id', body.destination_id);
+  if (error) return fail(res, 500, dbError(error));
+  res.status(200).json(await jobsPayload());
+}
+
+// WhatsApp assistido: a pessoa abriu o WhatsApp -> conta como enviado e recomeca a contagem.
+async function ackJob(res, body) {
+  const { data: job, error } = await supabaseAdmin.from('dispatch_jobs').select('*').eq('destination_id', body.destination_id).maybeSingle();
+  if (error) return fail(res, 500, dbError(error));
+  if (job && job.pending) {
+    const sent = job.sent_count + 1;
+    const done = sent >= job.max_sends;
+    await supabaseAdmin.from('dispatch_jobs').update({
+      pending: null, sent_count: sent, status: done ? 'stopped' : 'running',
+      next_run_at: new Date(Date.now() + job.interval_min * 60000).toISOString(),
+      last_event: done ? `Meta de ${job.max_sends} envios atingida.` : `Aberto no WhatsApp: ${String(job.pending.title || '').slice(0, 60)}`,
+      last_error: null, updated_at: new Date().toISOString(),
+    }).eq('id', job.id);
+  }
+  res.status(200).json(await jobsPayload());
+}
+
+async function processJob(job) {
+  const nowIso = () => new Date().toISOString();
+  const finish = (patch) => supabaseAdmin.from('dispatch_jobs').update({ claimed_at: null, updated_at: nowIso(), ...patch }).eq('id', job.id);
+  let r;
+  try {
+    const dest = await getDestination(job.destination_id);
+    if (!dest) { await finish({ status: 'stopped', last_error: 'Destino removido.' }); return; }
+    const f = job.filters || {};
+    if (!inWindow(f)) {
+      const start = nextWindowStart(f);
+      await finish({ next_run_at: new Date(start).toISOString(), last_event: `Fora do horario (${f.hour_from}h-${f.hour_to}h): retomo as ${f.hour_from}h.`, last_error: null });
+      return;
+    }
+    const fr = fakeRes();
+    await sendNext(fr, { destination_id: dest.id, group_ids: f.group_ids || [], marketplace: f.marketplace || null, min_score: f.min_score || 0, footer: f.footer || '' });
+    r = { status: fr.code, json: fr.body || {} };
+  } catch (e) {
+    r = { status: 500, json: { error: e.message || 'erro inesperado' } };
+  }
+
+  const j = r.json;
+  const skippedTxt = j.skipped && j.skipped.length ? ` (${j.skipped.length} pulada(s) por problema no produto)` : '';
+
+  if (r.status === 200 && j.retry) {
+    await finish({ next_run_at: new Date(Date.now() + 15000).toISOString(), last_event: `Conferi ${j.skipped ? j.skipped.length : 8} produtos e nenhum servia (preco/link mudou); tento os proximos em instantes.`, last_error: null });
+    return;
+  }
+  if (r.status === 200 && j.empty) {
+    await finish({ status: 'stopped', pending: null, last_event: 'A fila acabou: nao ha mais promocoes validas para esse filtro.' + skippedTxt });
+    return;
+  }
+  if (r.status === 200) {
+    if (job.mode === 'assisted') {
+      await finish({
+        pending: { message: j.message, title: j.promotion.title, coupon: j.promotion.coupon, remaining: j.remaining, prepared_at: nowIso() },
+        last_event: 'Promocao pronta para enviar.' + skippedTxt, last_error: null, error_streak: 0,
+      });
+      return;
+    }
+    const sent = job.sent_count + 1;
+    const done = sent >= job.max_sends;
+    const t = (j.sent && j.sent.title ? j.sent.title : '').slice(0, 70);
+    await finish({
+      sent_count: sent, status: done ? 'stopped' : 'running',
+      next_run_at: new Date(Date.now() + job.interval_min * 60000).toISOString(),
+      last_event: (done ? `Meta de ${job.max_sends} envios atingida. ` : '') + `Enviado: ${t}${j.sent && j.sent.coupon ? ` (cupom ${j.sent.coupon})` : ''}${skippedTxt}`,
+      last_error: null, error_streak: 0,
+    });
+    return;
+  }
+  // erros
+  const code = j.code;
+  const msg = j.error || 'Falha ao enviar.';
+  if (code === 'daily_limit' || code === 'bad_link') { await finish({ status: 'stopped', pending: null, last_error: msg }); return; }
+  if (code === 'duplicate') { await finish({ next_run_at: new Date(Date.now() + 5000).toISOString(), last_event: 'Pulei uma promocao que ja tinha sido enviada.', last_error: null }); return; }
+  if (code === 'rate_limited') { await finish({ next_run_at: new Date(Date.now() + ((j.retryAfter || 60) + 1) * 1000).toISOString(), last_error: msg }); return; }
+  const streak = (job.error_streak || 0) + 1;
+  if (streak >= 30) { await finish({ status: 'stopped', error_streak: streak, last_error: `${msg} (parei apos 30 falhas seguidas)` }); return; }
+  await finish({ next_run_at: new Date(Date.now() + 60000).toISOString(), error_streak: streak, last_error: msg });
+}
+
+// Roda os disparos que ja estao na hora. Pode ser chamado pela pagina aberta ou por um "relogio" externo.
+async function tickJobs() {
+  const nowIso = new Date().toISOString();
+  const { data: due, error } = await supabaseAdmin.from('dispatch_jobs').select('*')
+    .eq('status', 'running').neq('mode', 'bot').is('pending', null).lte('next_run_at', nowIso).limit(3);
+  if (error) throw new Error(dbError(error));
+  const work = [];
+  for (const j of due || []) {
+    const stale = new Date(Date.now() - CLAIM_STALE_MS).toISOString();
+    // "trava" atomica: so quem conseguir marcar o claimed_at executa (evita envio duplicado)
+    const { data: claimed } = await supabaseAdmin.from('dispatch_jobs').update({ claimed_at: nowIso })
+      .eq('id', j.id).eq('status', 'running').lte('next_run_at', nowIso)
+      .or(`claimed_at.is.null,claimed_at.lt.${stale}`).select().maybeSingle();
+    if (claimed) work.push(processJob(claimed));
+  }
+  await Promise.all(work);
+}
+
+
+// ---------------- WhatsApp 100% automatico (robo no notebook) ----------------
+// O robo consulta bot_poll de tempos em tempos. Se ha um envio na hora, o servidor escolhe e confere a
+// promocao, grava no registro (assim ela nunca se repete) e entrega a mensagem pronta; o robo envia no
+// WhatsApp e confirma com bot_ack. Sem o robo ligado nada e enviado — o disparo apenas espera.
+
+function botDeliver(job) {
+  const p = job.pending;
+  return { job_id: job.id, group: p.group, message: p.message, image_url: p.image_url || null, title: p.title };
+}
+
+async function prepareForBot(job) {
+  const nowIso = () => new Date().toISOString();
+  const release = (patch) => supabaseAdmin.from('dispatch_jobs').update({ claimed_at: null, updated_at: nowIso(), ...patch }).eq('id', job.id);
+  try {
+    const dest = await getDestination(job.destination_id);
+    if (!dest) { await release({ status: 'stopped', last_error: 'Destino removido.' }); return null; }
+    const f = job.filters || {};
+    const group = String(f.wa_group || dest.chat_id || '').trim();
+    if (!group) { await release({ status: 'stopped', last_error: 'Falta o nome do grupo do WhatsApp.' }); return null; }
+
+    const prep = await prepareNext(dest, { group_ids: f.group_ids || [], marketplace: f.marketplace || null, min_score: f.min_score || 0, footer: f.footer || '' });
+    if (prep.error) {
+      const code = prep.error.extra && prep.error.extra.code;
+      if (code === 'daily_limit' || code === 'bad_link') { await release({ status: 'stopped', pending: null, last_error: prep.error.message }); return null; }
+      await release({ next_run_at: new Date(Date.now() + 60000).toISOString(), last_error: prep.error.message });
+      return null;
+    }
+    const skippedTxt = prep.skipped && prep.skipped.length ? ` (${prep.skipped.length} pulada(s) por problema no produto)` : '';
+    if (prep.retry) {
+      await release({ next_run_at: new Date(Date.now() + 15000).toISOString(), last_event: 'Conferi varios produtos e nenhum servia; tento os proximos em instantes.', last_error: null });
+      return null;
+    }
+    if (prep.empty) {
+      await release({ status: 'stopped', pending: null, last_event: 'A fila acabou: nao ha mais promocoes validas para esse filtro.' + skippedTxt });
+      return null;
+    }
+
+    const message = toWhatsApp(prep.html);
+    // Registra JA, antes do robo enviar: se o robo cair no meio, a promocao nao se repete depois.
+    const { data: logRow, error: logErr } = await supabaseAdmin.from('dispatch_log')
+      .insert({ destination_id: dest.id, promotion_id: prep.chosen.id, skipped: false, message }).select('id').maybeSingle();
+    if (logErr) {
+      // Sem registro nao ha como garantir "nunca repete": nao entrega ao robo. Duplicata = ja foi enviada; tenta a proxima logo.
+      await release({ next_run_at: new Date(Date.now() + (isDupError(logErr) ? 5000 : 60000)).toISOString(), last_error: isDupError(logErr) ? null : `Nao consegui registrar o envio: ${logErr.message}`.slice(0, 200) });
+      return null;
+    }
+    const imageUrl = prep.chosen.image_url && /^https:\/\//i.test(prep.chosen.image_url) ? prep.chosen.image_url : null;
+    const pending = {
+      log_id: logRow ? logRow.id : null, message, image_url: imageUrl, title: prep.chosen.title,
+      coupon: prep.view.coupon || null, remaining: prep.remaining, group, prepared_at: nowIso(), delivered_at: nowIso(),
+    };
+    await release({ pending, last_event: `Entregue ao robo: ${String(prep.chosen.title).slice(0, 60)}${skippedTxt}`, last_error: null });
+    return botDeliver({ id: job.id, pending });
+  } catch (e) {
+    await release({ next_run_at: new Date(Date.now() + 60000).toISOString(), last_error: e.message || 'erro inesperado' });
+    return null;
+  }
+}
+
+async function botPoll(res) {
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  // "estou vivo": a tela mostra se o robo esta conectado (coluna do SQL 0004; se faltar, so ignora)
+  await supabaseAdmin.from('dispatch_destinations').update({ bot_seen_at: nowIso }).eq('platform', 'whatsapp_manual');
+
+  const { data: jobs, error } = await supabaseAdmin.from('dispatch_jobs').select('*')
+    .eq('status', 'running').eq('mode', 'bot').order('next_run_at', { ascending: true });
+  if (error) return fail(res, 500, dbError(error));
+
+  let sleep = 60; // segundos ate o robo voltar a perguntar (no maximo 60, para reagir rapido a um novo "Iniciar")
+  for (const job of jobs || []) {
+    const f = job.filters || {};
+
+    // 1) mensagem ja entregue e ainda sem confirmacao (robo reiniciou no meio): entrega de novo
+    if (job.pending && job.pending.message) {
+      const age = nowMs - new Date(job.pending.prepared_at).getTime();
+      const sinceDelivery = job.pending.delivered_at ? nowMs - new Date(job.pending.delivered_at).getTime() : 0;
+      // Reentrega so nos primeiros 90s (resposta perdida na rede). Depois disso o robo pode ter enviado e so nao
+      // confirmou: reenviar DUPLICARIA a mensagem no grupo. Prefere pular a repetir.
+      if (age < BOT_PENDING_MAX_MS && sinceDelivery <= 90 * 1000) return res.status(200).json(botDeliver(job));
+      await supabaseAdmin.from('dispatch_jobs').update({
+        pending: null, claimed_at: null, next_run_at: new Date(nowMs + jitteredMs(job.interval_min)).toISOString(),
+        last_event: 'O robo nao confirmou o envio anterior; para nao repetir mensagem no grupo, segui para o proximo.', updated_at: nowIso,
+      }).eq('id', job.id);
       continue;
     }
 
-    // Mesmo produto (outro vendedor/anúncio) já salvo ou já aceito nesta busca? Descarta.
-    // (checa e registra no mesmo trecho, sem esperar nada no meio — assim duas buscas simultâneas não passam juntas)
-    if (dedupeCtx && dedupeCtx.index.findSimilar(c.title)) { stats.duplicates += 1; continue; }
-    if (dedupeCtx) dedupeCtx.index.add(c.title, { title: c.title, current_price: c.price, original_url: c.productUrl });
+    // 2) ainda nao e a hora
+    const due = new Date(job.next_run_at).getTime();
+    if (due > nowMs) { sleep = Math.min(sleep, Math.max(Math.ceil((due - nowMs) / 1000), 5)); continue; }
 
-    let affiliateUrl = null;
-    try {
-      affiliateUrl = await generateShortLink(creds.client_id, creds.client_secret, c.productUrl, group.name);
-    } catch (err) {
-      await supabaseAdmin.from('integration_logs').insert({
-        marketplace_id: marketplaceId,
-        level: 'warn',
-        message: `Oferta encontrada mas falhou ao gerar link de afiliado (${c.title.slice(0, 60)}): ${err.message}`,
-      });
+    // 3) fora do horario escolhido: espera a janela abrir
+    if (!inWindow(f, nowMs)) {
+      await supabaseAdmin.from('dispatch_jobs').update({
+        next_run_at: new Date(nextWindowStart(f, nowMs)).toISOString(),
+        last_event: `Fora do horario (${f.hour_from}h-${f.hour_to}h): retomo as ${f.hour_from}h.`, updated_at: nowIso,
+      }).eq('id', job.id);
+      continue;
     }
 
-    const { error, duplicate } = await insertPromotions({
-      marketplace_id: marketplaceId,
-      watch_group_id: group.id,
-      matched_keyword: keyword || null,
-      title: c.title,
-      image_url: c.imageUrl,
-      original_url: c.productUrl,
-      current_price: c.price,
-      previous_price: c.previousPrice,
-      discount_rate: c.discountRate,
-      source: c.source,
-      status: 'PENDING',
-      last_seen_at: now,
-      affiliate_url: affiliateUrl,
-      affiliate_url_added_at: affiliateUrl ? now : null,
-    });
-    if (error) throw new Error(`banco de dados: ${error.message}`);
-    if (!duplicate) stats.found += 1;
+    // 4) "trava" atomica: so uma consulta prepara o envio (evita mensagem em dobro)
+    const stale = new Date(nowMs - CLAIM_STALE_MS).toISOString();
+    const { data: claimed } = await supabaseAdmin.from('dispatch_jobs').update({ claimed_at: nowIso })
+      .eq('id', job.id).eq('status', 'running').is('pending', null).lte('next_run_at', nowIso)
+      .or(`claimed_at.is.null,claimed_at.lt.${stale}`).select().maybeSingle();
+    if (!claimed) continue;
+
+    const out = await prepareForBot(claimed);
+    if (out) return res.status(200).json(out);
   }
-  return stats;
+  res.status(200).json({ idle: true, sleep });
 }
+
+// O robo avisa o resultado do envio.
+async function botAck(res, body) {
+  const { data: job, error } = await supabaseAdmin.from('dispatch_jobs').select('*').eq('id', body.job_id).maybeSingle();
+  if (error) return fail(res, 500, dbError(error));
+  if (!job || !job.pending) return res.status(200).json({ ok: true });
+  const p = job.pending;
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+
+  if (body.ok) {
+    const sent = job.sent_count + 1;
+    const done = sent >= job.max_sends;
+    await supabaseAdmin.from('dispatch_jobs').update({
+      pending: null, claimed_at: null, sent_count: sent, status: done ? 'stopped' : 'running',
+      next_run_at: new Date(nowMs + jitteredMs(job.interval_min)).toISOString(),
+      last_event: (done ? `Meta de ${job.max_sends} envios atingida. ` : '') + `Enviado: ${String(p.title || '').slice(0, 70)}${p.coupon ? ` (cupom ${p.coupon})` : ''}`,
+      last_error: null, error_streak: 0, updated_at: nowIso,
+    }).eq('id', job.id);
+    return res.status(200).json({ ok: true });
+  }
+
+  // falhou
+  const reason = String(body.error || 'falha desconhecida').slice(0, 200);
+  const fatal = body.fatal === true; // grupo nao encontrado / WhatsApp desconectado: nao adianta tentar de novo
+  if (p.log_id) {
+    // erro do robo (nao do produto): em falha fatal a promocao volta a ficar disponivel; nas demais, fica marcada como pulada
+    if (fatal) await supabaseAdmin.from('dispatch_log').delete().eq('id', p.log_id);
+    else await supabaseAdmin.from('dispatch_log').update({ skipped: true, message: `falhou no robo: ${reason}` }).eq('id', p.log_id);
+  }
+  const streak = (job.error_streak || 0) + 1;
+  const stop = fatal || streak >= 5;
+  await supabaseAdmin.from('dispatch_jobs').update({
+    pending: null, claimed_at: null, status: stop ? 'stopped' : 'running',
+    next_run_at: new Date(nowMs + 2 * 60000).toISOString(), error_streak: streak,
+    last_error: stop && !fatal ? `${reason} (parei apos 5 falhas seguidas)` : reason, updated_at: nowIso,
+  }).eq('id', job.id);
+  res.status(200).json({ ok: true });
+}
+
+module.exports = async function handler(req, res) {
+  if (LOAD_ERROR) return res.status(500).json({ error: LOAD_ERROR, version: VERSION });
+  try {
+    // Chave do robo (DISPATCH_BOT_KEY, definida na Vercel): quem chega so com a chave (sem login no painel)
+    // pode apenas consultar/confirmar envios — nada de listar destinos, ler tokens ou mexer em disparos.
+    const botKey = process.env.DISPATCH_BOT_KEY;
+    const viaKey = !!botKey && req.headers['x-bot-key'] === botKey;
+    if (viaKey && !(req.method === 'POST' && req.body && (req.body.action === 'bot_poll' || req.body.action === 'bot_ack'))) {
+      return fail(res, 403, 'A chave do robo so pode usar bot_poll e bot_ack.');
+    }
+
+    if (req.method === 'GET') {
+      if (req.query && req.query.tick) { await tickJobs(); return res.status(200).json({ ok: true }); }
+      return await listDestinations(res);
+    }
+    if (req.method !== 'POST') return fail(res, 405, 'M\u00e9todo n\u00e3o permitido.');
+
+    const body = req.body || {};
+    switch (body.action) {
+      case 'create_destination': return await createDestination(res, body);
+      case 'delete_destination': {
+        const { error } = await supabaseAdmin.from('dispatch_destinations').delete().eq('id', body.id);
+        if (error) return fail(res, 500, dbError(error));
+        return res.status(200).json({ ok: true });
+      }
+      case 'test': return await sendTest(res, body);
+      case 'queue': return await queue(res, body);
+      case 'verify': return await verifyQueue(res, body);
+      case 'job_start': return await startJob(res, body);
+      case 'job_stop': return await stopJob(res, body);
+      case 'job_ack': return await ackJob(res, body);
+      case 'tick': await tickJobs(); return res.status(200).json(await jobsPayload());
+      case 'bot_poll': return await botPoll(res);
+      case 'bot_ack': return await botAck(res, body);
+      case 'send_next': return await sendNext(res, body);
+      default: return fail(res, 400, 'A\u00e7\u00e3o inv\u00e1lida.');
+    }
+  } catch (err) {
+    console.error('dispatch error', err);
+    fail(res, 500, err.message || 'Erro inesperado no disparador.');
+  }
+};
