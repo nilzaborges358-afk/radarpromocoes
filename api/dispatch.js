@@ -8,6 +8,7 @@ catch (e) { LOAD_ERROR = `Nao consegui carregar o banco (src/core/database/supab
 function coupons() { try { return require('../src/core/coupons'); } catch { return {}; } }
 function shopeeClient() { try { return require('../src/integrations/shopee/client'); } catch { return {}; } }
 function dedupeLib() { try { return require('../src/core/dedupe'); } catch { return null; } }
+function scoreLib() { try { return require('../public/score.js'); } catch { return null; } }
 function lifecycle() { try { return require('../src/core/lifecycle'); } catch { return null; } }
 
 // Disparador de promo--es (Telegram autom-tico / WhatsApp assistido).
@@ -242,7 +243,7 @@ async function loadQueue(destId, body) {
   const hasEnded = !!(lc && await lc.endedSupported(supabaseAdmin)); // promocao finalizada nunca entra na fila
   let q = supabaseAdmin
     .from('promotions')
-    .select('id, title, image_url, original_url, current_price, previous_price, discount_rate, source, status, affiliate_url, watch_group_id, last_seen_at, detected_at, marketplaces(slug, name)')
+    .select('*, marketplaces(slug, name)')
     .not('affiliate_url', 'is', null)
     .neq('status', 'IGNORED')
     .gt('current_price', 0)
@@ -298,8 +299,16 @@ async function loadQueue(destId, body) {
 
   // Promocoes com queda de preco COMPROVADA saem antes das que so tem "desconto de tabela" informado
   // pela Shopee (preco de tabela inflado e comum). Dentro de cada faixa, maior desconto primeiro.
+  // FUNIL: cada promocao ganha um score de venda (0-100, o mesmo do painel). Sai primeiro a de maior chance de
+  // converter; e o disparo pode exigir um score minimo (so destaques / boas / tudo).
+  const S = scoreLib();
+  const minScore = Number(body.min_score) || 0;
+  if (S) {
+    list.forEach((p) => { p._score = S.compute(p).score; });
+    if (minScore > 0) list = list.filter((p) => p._score >= minScore);
+  }
   const rank = (p) => (p.source === 'shopee_listed_price' ? 1 : 0);
-  list = list.map((p, i) => ({ p, i })).sort((a, b) => (rank(a.p) - rank(b.p)) || ((Number(b.p.discount_rate) || 0) - (Number(a.p.discount_rate) || 0)) || (a.i - b.i)).map((x) => x.p);
+  list = list.map((p, i) => ({ p, i })).sort((a, b) => (((b.p._score || 0) - (a.p._score || 0)) || (rank(a.p) - rank(b.p)) || ((Number(b.p.discount_rate) || 0) - (Number(a.p.discount_rate) || 0)) || (a.i - b.i))).map((x) => x.p);
 
   // Mesmo PRODUTO (outro vendedor, outro link) nao pode sair duas vezes:
   //  1) nao repete produto parecido com algo ja ENVIADO a este destino nas ultimas 2 semanas;
@@ -621,6 +630,7 @@ async function startJob(res, body) {
   const filters = {
     group_ids: Array.isArray(body.group_ids) ? body.group_ids : [],
     marketplace: body.marketplace || null,
+    min_score: Math.max(0, Math.min(100, Number(body.min_score) || 0)),
     footer,
     hour_from: parseHour(body.hour_from),
     hour_to: parseHour(body.hour_to),
@@ -697,7 +707,7 @@ async function processJob(job) {
       return;
     }
     const fr = fakeRes();
-    await sendNext(fr, { destination_id: dest.id, group_ids: f.group_ids || [], marketplace: f.marketplace || null, footer: f.footer || '' });
+    await sendNext(fr, { destination_id: dest.id, group_ids: f.group_ids || [], marketplace: f.marketplace || null, min_score: f.min_score || 0, footer: f.footer || '' });
     r = { status: fr.code, json: fr.body || {} };
   } catch (e) {
     r = { status: 500, json: { error: e.message || 'erro inesperado' } };
@@ -783,7 +793,7 @@ async function prepareForBot(job) {
     const group = String(f.wa_group || dest.chat_id || '').trim();
     if (!group) { await release({ status: 'stopped', last_error: 'Falta o nome do grupo do WhatsApp.' }); return null; }
 
-    const prep = await prepareNext(dest, { group_ids: f.group_ids || [], marketplace: f.marketplace || null, footer: f.footer || '' });
+    const prep = await prepareNext(dest, { group_ids: f.group_ids || [], marketplace: f.marketplace || null, min_score: f.min_score || 0, footer: f.footer || '' });
     if (prep.error) {
       const code = prep.error.extra && prep.error.extra.code;
       if (code === 'daily_limit' || code === 'bad_link') { await release({ status: 'stopped', pending: null, last_error: prep.error.message }); return null; }
