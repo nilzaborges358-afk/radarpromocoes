@@ -1,4 +1,4 @@
-const VERSION = 'dispatch-v2026-11-04.1';
+const VERSION = 'dispatch-v2026-11-05.2';
 
 // Carregamento protegido: se alguma peca faltar no deploy, a API responde dizendo QUAL (em vez de cair com erro 500).
 let supabaseAdmin = null;
@@ -466,8 +466,9 @@ async function prepareNext(dest, body) {
   const list = await loadQueue(dest.id, body);
   let chosen = null; let view = null; let tries = 0;
   const skippedInfo = [];
+  const t0 = Date.now();
   for (const p of list) {
-    if (tries >= 8) break;
+    if (tries >= 8 || Date.now() - t0 > 16000) break; // a funcao da Vercel morre em 30s: deixa folga
     tries += 1;
     // 1) o produto/link ainda existe e funciona?
     const check = await validatePromotion(p);
@@ -504,7 +505,12 @@ async function prepareNext(dest, body) {
     await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: 'pulada: cupom n\u00e3o confirmado' });
     skippedInfo.push({ title: p.title, reason: 'o cupom dessa oferta n\u00e3o est\u00e1 mais v\u00e1lido' });
   }
-  if (!chosen) return { empty: true, skipped: skippedInfo };
+  if (!chosen) {
+    // So e "fila acabou" se TODA a fila foi conferida. Se parou por limite (8 conferencias ou tempo) ainda ha
+    // mais promocoes: tenta as proximas daqui a pouco em vez de encerrar o disparo.
+    if (tries < list.length) return { retry: true, skipped: skippedInfo };
+    return { empty: true, skipped: skippedInfo };
+  }
 
   chosen.view = view;
   const { count: total } = await supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true }).eq('destination_id', dest.id);
@@ -519,6 +525,7 @@ async function sendNext(res, body) {
   const prep = await prepareNext(dest, body);
   if (prep.error) return fail(res, prep.error.status, prep.error.message, prep.error.extra);
   if (prep.empty) return res.status(200).json({ empty: true, skipped: prep.skipped });
+  if (prep.retry) return res.status(200).json({ retry: true, skipped: prep.skipped });
 
   const { chosen, view, html, remaining, skippedInfo } = prep;
   const slugName = chosen.marketplaces ? chosen.marketplaces.name : null;
@@ -625,6 +632,15 @@ async function startJob(res, body) {
     // guarda o nome no destino, para ja vir preenchido da proxima vez
     if (waGroup !== dest.chat_id) await supabaseAdmin.from('dispatch_destinations').update({ chat_id: waGroup }).eq('id', dest.id);
   }
+  // Disparo JA rodando para este destino (clique duplo, segunda aba, pagina ainda carregando): NAO zera o contador.
+  // Para recomecar do zero, pare primeiro.
+  {
+    const { data: existing } = await supabaseAdmin.from('dispatch_jobs').select('id, status').eq('destination_id', dest.id).maybeSingle();
+    if (existing && existing.status === 'running') {
+      const payload = await jobsPayload();
+      return res.status(200).json({ ...payload, alreadyRunning: true });
+    }
+  }
   const nowIso = new Date().toISOString();
   const row = {
     destination_id: dest.id, mode, status: 'running',
@@ -690,6 +706,10 @@ async function processJob(job) {
   const j = r.json;
   const skippedTxt = j.skipped && j.skipped.length ? ` (${j.skipped.length} pulada(s) por problema no produto)` : '';
 
+  if (r.status === 200 && j.retry) {
+    await finish({ next_run_at: new Date(Date.now() + 15000).toISOString(), last_event: `Conferi ${j.skipped ? j.skipped.length : 8} produtos e nenhum servia (preco/link mudou); tento os proximos em instantes.`, last_error: null });
+    return;
+  }
   if (r.status === 200 && j.empty) {
     await finish({ status: 'stopped', pending: null, last_event: 'A fila acabou: nao ha mais promocoes validas para esse filtro.' + skippedTxt });
     return;
@@ -771,6 +791,10 @@ async function prepareForBot(job) {
       return null;
     }
     const skippedTxt = prep.skipped && prep.skipped.length ? ` (${prep.skipped.length} pulada(s) por problema no produto)` : '';
+    if (prep.retry) {
+      await release({ next_run_at: new Date(Date.now() + 15000).toISOString(), last_event: 'Conferi varios produtos e nenhum servia; tento os proximos em instantes.', last_error: null });
+      return null;
+    }
     if (prep.empty) {
       await release({ status: 'stopped', pending: null, last_event: 'A fila acabou: nao ha mais promocoes validas para esse filtro.' + skippedTxt });
       return null;
@@ -788,7 +812,7 @@ async function prepareForBot(job) {
     const imageUrl = prep.chosen.image_url && /^https:\/\//i.test(prep.chosen.image_url) ? prep.chosen.image_url : null;
     const pending = {
       log_id: logRow ? logRow.id : null, message, image_url: imageUrl, title: prep.chosen.title,
-      coupon: prep.view.coupon || null, remaining: prep.remaining, group, prepared_at: nowIso(),
+      coupon: prep.view.coupon || null, remaining: prep.remaining, group, prepared_at: nowIso(), delivered_at: nowIso(),
     };
     await release({ pending, last_event: `Entregue ao robo: ${String(prep.chosen.title).slice(0, 60)}${skippedTxt}`, last_error: null });
     return botDeliver({ id: job.id, pending });
@@ -815,10 +839,13 @@ async function botPoll(res) {
     // 1) mensagem ja entregue e ainda sem confirmacao (robo reiniciou no meio): entrega de novo
     if (job.pending && job.pending.message) {
       const age = nowMs - new Date(job.pending.prepared_at).getTime();
-      if (age < BOT_PENDING_MAX_MS) return res.status(200).json(botDeliver(job));
+      const sinceDelivery = job.pending.delivered_at ? nowMs - new Date(job.pending.delivered_at).getTime() : 0;
+      // Reentrega so nos primeiros 90s (resposta perdida na rede). Depois disso o robo pode ter enviado e so nao
+      // confirmou: reenviar DUPLICARIA a mensagem no grupo. Prefere pular a repetir.
+      if (age < BOT_PENDING_MAX_MS && sinceDelivery <= 90 * 1000) return res.status(200).json(botDeliver(job));
       await supabaseAdmin.from('dispatch_jobs').update({
         pending: null, claimed_at: null, next_run_at: new Date(nowMs + jitteredMs(job.interval_min)).toISOString(),
-        last_event: 'O robo nao confirmou o envio anterior; segui para o proximo.', updated_at: nowIso,
+        last_event: 'O robo nao confirmou o envio anterior; para nao repetir mensagem no grupo, segui para o proximo.', updated_at: nowIso,
       }).eq('id', job.id);
       continue;
     }
