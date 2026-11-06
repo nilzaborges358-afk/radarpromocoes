@@ -10,6 +10,7 @@
 const STALE_HOURS = 96; // sem ser vista pelas buscas por 4 dias = promoção finalizada
 
 let supportCache = { at: 0, ok: null };
+let metaCache = { at: 0, ok: null };
 
 async function endedSupported(supabase) {
   if (supportCache.ok !== null && Date.now() - supportCache.at < 60000) return supportCache.ok;
@@ -18,6 +19,16 @@ async function endedSupported(supabase) {
     supportCache = { at: Date.now(), ok: !error };
   } catch { supportCache = { at: Date.now(), ok: false }; }
   return supportCache.ok;
+}
+
+// Colunas de "prova social" (vendas, nota, comissão, loja) do SQL 0006. Sem elas, não grava (nada quebra).
+async function metaSupported(supabase) {
+  if (metaCache.ok !== null && Date.now() - metaCache.at < 60000) return metaCache.ok;
+  try {
+    const { error } = await supabase.from('promotions').select('sales, rating, commission_rate, shop_name').limit(1);
+    metaCache = { at: Date.now(), ok: !error };
+  } catch { metaCache = { at: Date.now(), ok: false }; }
+  return metaCache.ok;
 }
 
 // Campos para "reativar" uma promoção que reapareceu (vazio se o banco ainda não tem a coluna).
@@ -56,4 +67,4 @@ async function sweepStale(supabase, marketplaceId, hours = STALE_HOURS) {
   return total;
 }
 
-module.exports = { STALE_HOURS, endedSupported, reviveFields, markEnded, sweepStale };
+module.exports = { STALE_HOURS, metaSupported, endedSupported, reviveFields, markEnded, sweepStale };
