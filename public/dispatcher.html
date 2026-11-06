@@ -57,6 +57,11 @@
   details summary { cursor:pointer; color: var(--accent); }
   details ol { margin:8px 0 0 18px; padding:0; line-height:1.6; }
 
+  .runpanel { display:flex; flex-direction:column; gap:8px; margin:0 0 12px; }
+  .runrow { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; padding:10px 14px; border:1px solid var(--line, #2a2a2a); border-left:3px solid #7bd88f; background: rgba(123,216,143,.06); font-size:13px; }
+  .runrow b { font-weight:600; }
+  .runrow .sub { color: var(--muted); font-size:12px; }
+  .runrow button { background:none; border:1px solid var(--line, #2a2a2a); color:inherit; font:inherit; font-size:12px; padding:5px 12px; cursor:pointer; border-radius:999px; }
   .ntabs { display:flex; gap:8px; flex-wrap:wrap; margin:0 0 6px; }
   .ntab { display:inline-flex; align-items:center; gap:7px; padding:8px 16px; border:1px solid var(--line, #2a2a2a); background:transparent; color:inherit; font:inherit; font-size:13px; cursor:pointer; border-radius:999px; }
   .ntab:hover { border-color: var(--accent, #7bd88f); }
@@ -193,6 +198,7 @@
       <button class="btn secondary hidden" id="waBtn">📱 Abrir próximo agora</button>
     </div>
 
+    <div class="runpanel" id="runPanel"></div>
     <div class="status-box" id="statusBox">Parado.</div>
     <button class="btn hidden" id="waOpenBtn" style="width:100%;margin-top:10px;padding:18px;font-size:16px;">📱 COPIAR / ABRIR NO WHATSAPP</button>
     <div class="queue-info hidden" id="waHint" style="color:#7bd88f;margin-top:10px;"></div>
@@ -212,6 +218,7 @@
 const $ = (id) => document.getElementById(id);
 const MIN_INTERVAL = 2; // minutos \u2014 abaixo disso vira spam
 
+let loaded = false; // so libera "Iniciar" depois de saber quais disparos ja estao rodando (evita zerar sem querer)
 let destinations = [];
 let groups = [];
 let jobs = [];
@@ -219,6 +226,7 @@ let serverOffset = 0; // diferenca entre o relogio do servidor e o do computador
 let pollTimer = null;
 let uiTimer = null;
 let ticking = false;
+let lastCountsAt = 0;
 let botSeenAt = null; // ultima vez que o robo do WhatsApp consultou o servidor
 let lastTickErr = '';
 let lastSeen = {};
@@ -340,9 +348,67 @@ async function loadAll() {
   forceNicheGroups();
   renderNicheTabs();
   updateModeUI();
+  // Recarregou a pagina com disparos rodando: se o destino escolhido nao tem disparo, mas outro tem, mostra o que esta rodando.
+  if (d.status === 'fulfilled' && !selectedJob(false)) {
+    const running = jobs.find((j) => j.status === 'running' && destinations.some((x) => x.id === j.destination_id));
+    if (running) {
+      $('destSelect').value = running.destination_id;
+      const dd = selectedDest();
+      $('waGroup').value = dd && dd.chat_id && isWa(dd) ? dd.chat_id : '';
+      activeNiche = nicheOfJob(running);
+      localStorage.setItem('dispatcherNiche', activeNiche);
+      applyJobToUI();
+      renderNicheTabs();
+    }
+  }
+  if (d.status === 'fulfilled') loaded = true; // so libera o Iniciar com a lista de disparos carregada de verdade
+  if (!loaded) setTimeout(loadAll, 5000); // servidor demorou/falhou: tenta de novo sozinho
   jobs.forEach((j) => { lastSeen[j.id] = jobSig(j); });
+  updateModeUI();
   renderJob();
   ensurePolling();
+}
+
+// Qual aba de nicho corresponde aos grupos de um disparo (ou "CUSTOM" se for mistura).
+function nicheOfJob(job) {
+  const ids = new Set(((job.filters || {}).group_ids) || []);
+  if (!ids.size) return 'ALL';
+  const all = mergedGroups();
+  for (const g of all) { if (g.ids.length && g.ids.every((id) => ids.has(id)) && [...ids].every((id) => g.ids.includes(id))) return g.name.toLowerCase(); }
+  if (ids.size === 1 && ids.has('none')) return 'none';
+  const everyone = new Set(all.flatMap((g) => g.ids));
+  return [...everyone].every((id) => ids.has(id)) ? 'ALL' : 'CUSTOM';
+}
+
+// Painel com TODOS os disparos em andamento (um por destino/nicho), sempre visivel, mesmo depois de recarregar.
+function renderRunning() {
+  const box = $('runPanel');
+  if (!box) return;
+  const running = jobs.filter((j) => j.status === 'running');
+  if (!running.length) { box.innerHTML = ''; return; }
+  const tabs = nicheTabs();
+  box.innerHTML = running.map((j) => {
+    const d = destinations.find((x) => x.id === j.destination_id);
+    if (!d) return '';
+    const nk = nicheOfJob(j);
+    const nicheName = (tabs.find((t) => t.key === nk) || { name: 'Vários nichos' }).name;
+    let when;
+    if (j.mode === 'bot' && j.pending) when = 'enviando no WhatsApp...';
+    else if (j.mode === 'assisted' && j.pending) when = '🔔 pronta para enviar';
+    else {
+      const left = new Date(j.next_run_at).getTime() - serverNow();
+      when = left > 0 ? `próximo em ${String(Math.floor(left / 60000)).padStart(2, '0')}:${String(Math.floor((left % 60000) / 1000)).padStart(2, '0')}` : (j.mode === 'bot' ? 'aguardando o robô' : 'enviando...');
+    }
+    return `<div class="runrow"><div><b>${escapeHtml(d.name)}</b> · ${escapeHtml(nicheName)}<div class="sub">Enviados ${j.sent_count}/${j.max_sends} nesta rodada · últimas 24h: ${d.sentLast24h || 0}/${d.daily_limit} · ${when}</div></div><button data-run-dest="${j.destination_id}">Ver</button></div>`;
+  }).join('');
+  box.querySelectorAll('[data-run-dest]').forEach((b) => b.addEventListener('click', () => {
+    const job = jobs.find((j) => j.destination_id === b.dataset.runDest);
+    $('destSelect').value = b.dataset.runDest;
+    const dd = selectedDest();
+    $('waGroup').value = dd && dd.chat_id && isWa(dd) ? dd.chat_id : '';
+    if (job) { activeNiche = nicheOfJob(job); localStorage.setItem('dispatcherNiche', activeNiche); }
+    applyJobToUI(); renderNicheTabs(); updateModeUI(); renderJob(); saveSettings();
+  }));
 }
 
 function renderDestinations(loadError) {
@@ -523,6 +589,8 @@ function updateModeUI() {
   document.querySelectorAll('.sel-wa').forEach((el) => el.classList.toggle('hidden', !wa));
   document.querySelectorAll('.sel-bot').forEach((el) => el.classList.toggle('hidden', mode !== 'bot'));
   document.querySelectorAll('.sel-hours').forEach((el) => el.classList.toggle('hidden', assisted));
+  $('startBtn').disabled = !loaded;
+  $('waStartBtn').disabled = !loaded;
   $('startBtn').classList.toggle('hidden', busy || assisted);
   $('stopBtn').classList.toggle('hidden', !busy || assisted);
   $('waStartBtn').classList.toggle('hidden', !assisted || busy);
@@ -709,6 +777,10 @@ async function tickServer() {
   try {
     applyJobs(await api({ action: 'tick' }));
     lastTickErr = '';
+    if (Date.now() - lastCountsAt > 60000) {
+      lastCountsAt = Date.now();
+      try { const dd = await fetchJson('/api/dispatch'); if (dd.destinations) { destinations = dd.destinations; renderRunning(); } } catch { /* ignora */ }
+    }
   } catch (err) {
     if (err.message !== lastTickErr) { lastTickErr = err.message; log(`\u26a0\ufe0f Sem resposta do servidor (${err.message}). Tentando de novo...`, 'err'); }
   } finally {
@@ -724,6 +796,7 @@ function ensurePolling() {
 }
 
 function renderJob() {
+  renderRunning();
   const box = $('statusBox');
   const openBtn = $('waOpenBtn');
   renderBotStatus();
@@ -786,6 +859,8 @@ function renderJob() {
 }
 
 async function startRun() {
+  if (!loaded) { alert('Aguarde a p\u00e1gina terminar de carregar os disparos que j\u00e1 est\u00e3o rodando, depois clique de novo.'); return; }
+  if (selectedJob(false)) { alert('Esse destino j\u00e1 est\u00e1 com um disparo rodando. Para recome\u00e7ar do zero, pare primeiro.'); return; }
   const dest = selectedDest();
   if (!dest) { alert('Crie e selecione um destino.'); return; }
   const wa = isWa(dest);
@@ -817,12 +892,14 @@ async function startRun() {
   try { if (manual && 'Notification' in window && Notification.permission === 'default') await Notification.requestPermission(); } catch { /* ignora */ }
   saveSettings();
   try {
-    applyJobs(await api({
+    const started = await api({
       action: 'job_start', destination_id: dest.id, interval_min: interval, max_sends: maxSends,
       group_ids: f.group_ids, marketplace: f.marketplace, footer: f.footer,
       mode: wa ? mode : undefined, wa_group: mode === 'bot' ? waGroup : undefined,
       hour_from: manual || hourFrom === '' ? null : hourFrom, hour_to: manual || hourTo === '' ? null : hourTo,
-    }));
+    });
+    applyJobs(started);
+    if (started.alreadyRunning) { log('Esse disparo j\u00e1 estava rodando: mantive a contagem de onde estava.', 'ok'); await loadAll(); return; }
     log(`Disparo iniciado: 1 promo\u00e7\u00e3o a cada ${interval} min, at\u00e9 ${maxSends} envios.`, 'ok');
     if (manual) beep();
     await loadAll();
