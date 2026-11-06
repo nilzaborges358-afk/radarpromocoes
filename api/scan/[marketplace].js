@@ -243,7 +243,7 @@ async function scanMercadoLivre(req, res) {
     }
 
     // ----- Descoberta automática por palavra-chave (o ML bloqueia /sites/MLB/search; usa o catálogo) -----
-    const disc = { searched: 0, candidates: 0, checked: 0, found: 0, searchErrors: [], statuses: {}, reasons: {}, skippedKeywords: [] };
+    const disc = { searched: 0, candidates: 0, checked: 0, found: 0, searchErrors: [], failed: 0, statuses: {}, reasons: {}, skippedKeywords: [] };
     if (discoveryGroups.length > 0 && Date.now() - startedAt < SCAN_BUDGET_MS) {
       await discoverMlPromotions({ groups: discoveryGroups, ctx, startedAt, disc });
       stats.found += disc.found;
@@ -300,6 +300,7 @@ async function scanMercadoLivre(req, res) {
       productsChecked: stats.checked + disc.checked,
       promotionsFound: stats.found,
       keywordsSearched: disc.searched,
+      keywordsFailed: disc.failed,
       skippedKeywords: disc.skippedKeywords,
       errors: stats.errors,
       note: notes.join(' ') || undefined,
@@ -371,6 +372,7 @@ async function discoverMlPromotions({ groups, ctx, startedAt, disc }) {
           disc.searched += 1;
           for (const r of list) if (!candidates.has(r.id)) candidates.set(r.id, { ...r, group, keyword: kw });
         } catch (err) {
+          disc.failed += 1; // a palavra FOI tentada; o ML recusou (nao adianta repetir)
           disc.searchErrors.push(`"${kw}": ${err.message}`);
           if (err.status) disc.statuses[err.status] = (disc.statuses[err.status] || 0) + 1;
         }
