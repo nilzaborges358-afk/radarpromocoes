@@ -1,1334 +1,1142 @@
-<!DOCTYPE html>
-<html lang="pt-br">
-<head>
-<meta charset="UTF-8" />
-<title>Radar — Disparador</title>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg: #101114; --panel: #17181c; --line: #2b2d33; --ink: #f3f2ee;
-    --muted: #8b8d94; --accent: #e7b24a; --good: #5fcb8f; --bad: #e2604a;
-    --font-display: 'Space Grotesk', sans-serif; --font-body: 'Inter', sans-serif;
-  }
-  * { box-sizing: border-box; }
-  body { margin:0; background: var(--bg); color: var(--ink); font-family: var(--font-body); -webkit-font-smoothing: antialiased; }
+const VERSION = 'dispatch-v2026-11-12.2';
 
-  nav { display:flex; justify-content:space-between; align-items:center; padding:18px 32px; border-bottom:1px solid var(--line); }
-  nav .nav-links { display:flex; gap:24px; }
-  nav .logout-link { cursor:pointer; }
-  nav a { color: var(--muted); text-decoration:none; font-size:13px; font-weight:500; padding-bottom:4px; border-bottom:2px solid transparent; }
-  nav a.active { color: var(--ink); border-bottom-color: var(--accent); }
+// Carregamento protegido: se alguma peca faltar no deploy, a API responde dizendo QUAL (em vez de cair com erro 500).
+let supabaseAdmin = null;
+let LOAD_ERROR = null;
+try { supabaseAdmin = require('../src/core/database/supabaseClient').supabaseAdmin; }
+catch (e) { LOAD_ERROR = `Nao consegui carregar o banco (src/core/database/supabaseClient.js): ${e.message}`; }
+function coupons() { try { return require('../src/core/coupons'); } catch { return {}; } }
+function shopeeClient() { try { return require('../src/integrations/shopee/client'); } catch { return {}; } }
+function dedupeLib() { try { return require('../src/core/dedupe'); } catch { return null; } }
+function scoreLib() { try { return require('../public/score.js'); } catch { return null; } }
+function lifecycle() { try { return require('../src/core/lifecycle'); } catch { return null; } }
 
-  .masthead { padding: 28px 32px 8px; }
-  .wordmark { font-family: var(--font-display); font-weight:700; font-size:24px; margin:0; letter-spacing:-0.02em; }
-  .wordmark span { color: var(--accent); }
-  .tagline { font-size:13px; color: var(--muted); margin:4px 0 0; }
+// Disparador de promo--es (Telegram autom-tico / WhatsApp assistido).
+// GET  /api/dispatch                      -> lista destinos
+// POST /api/dispatch { action: ... }      -> create_destination | delete_destination | test | queue | verify | send_next | job_start | job_stop | job_ack | tick | bot_poll | bot_ack
+// Modo ROBO (WhatsApp 100% automatico): o servidor prepara a mensagem na hora certa e o robo que roda no
+// notebook (robo-whatsapp) busca em bot_poll, envia no WhatsApp e confirma em bot_ack.
+// Precisa das tabelas dispatch_destinations e dispatch_log (SQL em supabase/migrations/0002_disparador.sql).
 
-  .block { margin: 20px 32px; padding: 20px 22px; background: var(--panel); border: 1px solid var(--line); }
-  .block-title { font-family: var(--font-display); font-weight:600; font-size:15px; margin-bottom:4px; }
-  .block-sub { font-size:12px; color: var(--muted); margin:0 0 16px; line-height:1.5; }
+const QUEUE_DAYS_SEEN = 1;     // so promocoes vistas pela busca nas ultimas 24h (precos de hoje)
+const LATEST_SCAN_WINDOW_MS = 45 * 60 * 1000; // so entra a promocao da ULTIMA busca de cada nicho/marketplace (uma busca leva alguns minutos)
+const MAX_DISCOUNT_PCT = 70;          // acima disso quase sempre e preco de tabela inflado ("90% OFF") — nao dispara
+const MAX_DISCOUNT_LISTED_PCT = 60;   // desconto so de tabela (Shopee) tem teto menor
+const NO_REPEAT_DAYS = 14;     // n\u00e3o repete a mesma promo\u00e7\u00e3o no mesmo destino por 2 semanas
+const MIN_GAP_SECONDS = 20;    // trava anti-duplo-clique
+const COUPON_CACHE_MS = 10 * 60 * 1000;
+let couponCache = { at: 0, list: null };
 
-  .grid { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; }
-  .field { flex:1; min-width:180px; }
-  .field label { display:block; font-size:12px; color: var(--muted); margin-bottom:6px; }
-  .field input, .field select {
-    width:100%; background:var(--inset); border:1px solid var(--line); color: var(--ink);
-    padding:9px 10px; font-family: var(--font-body); font-size:13px;
-  }
-  .full { flex-basis:100%; }
+// ---------------- utilit-rios ----------------
 
-  button { font-family: var(--font-body); }
-  .btn { background: var(--accent); color:var(--on-accent); border:none; font-weight:600; font-size:13px; padding:10px 18px; cursor:pointer; }
-  .btn.secondary { background:transparent; color: var(--ink); border:1px solid var(--line); }
-  .btn.danger { background:transparent; color: var(--bad); border:1px solid var(--bad); }
-  .btn.small { padding:6px 10px; font-size:12px; }
-  .btn:disabled { opacity:0.5; cursor:not-allowed; }
+const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const money = (n) => Number(n).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const r2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+const isoAgo = (ms) => new Date(Date.now() - ms).toISOString();
+const DAY = 24 * 60 * 60 * 1000;
 
-  .dest-list { display:flex; flex-direction:column; gap:1px; background:var(--line); margin-bottom:16px; }
-  .dest-row { background:var(--inset); padding:10px 14px; display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
-  .dest-name { font-size:13px; font-weight:600; }
-  .dest-meta { font-size:11.5px; color: var(--muted); }
-  .dest-actions { display:flex; gap:8px; }
-
-  details { margin: 0 0 14px; font-size:12.5px; color: var(--muted); }
-  details summary { cursor:pointer; color: var(--accent); }
-  details ol { margin:8px 0 0 18px; padding:0; line-height:1.6; }
-
-  .runpanel { display:flex; flex-direction:column; gap:8px; margin:0 0 12px; }
-  .runrow { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; padding:10px 14px; border:1px solid var(--line, #2a2a2a); border-left:3px solid #7bd88f; background: rgba(123,216,143,.06); font-size:13px; }
-  .runrow b { font-weight:600; }
-  .runrow .sub { color: var(--muted); font-size:12px; }
-  .runrow button { background:none; border:1px solid var(--line, #2a2a2a); color:inherit; font:inherit; font-size:12px; padding:5px 12px; cursor:pointer; border-radius:999px; }
-  .ntabs { display:flex; gap:8px; flex-wrap:wrap; margin:0 0 6px; }
-  .ntab { display:inline-flex; align-items:center; gap:7px; padding:8px 16px; border:1px solid var(--line, #2a2a2a); background:transparent; color:inherit; font:inherit; font-size:13px; cursor:pointer; border-radius:999px; }
-  .ntab:hover { border-color: var(--accent, #7bd88f); }
-  .ntab.on { background: color-mix(in srgb, var(--accent, #7bd88f) 18%, transparent); border-color: var(--accent, #7bd88f); font-weight:600; }
-  .ntab .live { width:8px; height:8px; border-radius:50%; background:#7bd88f; box-shadow:0 0 8px #7bd88f; animation: ntpulse 1.6s infinite; }
-  @keyframes ntpulse { 50% { opacity:.35; } }
-  .nnote { font-size:12px; color: var(--muted); margin:0 0 16px; }
-  .groups-box { display:flex; flex-wrap:wrap; gap:6px 16px; padding-top:4px; max-height:220px; overflow-y:auto; }
-  .check { display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; }
-
-  .queue-info { margin-top:12px; font-size:12.5px; color: var(--muted); min-height:18px; }
-  .controls { display:flex; gap:10px; margin-top:14px; flex-wrap:wrap; align-items:center; }
-  .status-box { margin-top:14px; padding:12px 14px; background:var(--inset); border:1px solid var(--line); font-size:13px; min-height:44px; }
-  .status-box .big { font-family: var(--font-display); font-size:18px; font-weight:600; }
-  .status-box.running { border-color: var(--good); }
-  .warn { margin-top:12px; font-size:12px; color: var(--accent); line-height:1.5; }
-
-  .log { max-height:260px; overflow:auto; font-size:12.5px; line-height:1.7; color: var(--muted); }
-  .log .ok { color: var(--good); }
-  .log .err { color: var(--bad); }
-  .msg { font-size:12px; color: var(--muted); margin-top:8px; min-height:16px; }
-  .manual-box { margin:10px 0 4px; padding:14px; border:1px solid var(--line); background:var(--inset, #0e1013); }
-  .manual-box.busy .manual-act { opacity:.35; pointer-events:none; }
-  .manual-cols { display:flex; gap:16px; flex-wrap:wrap; }
-  .manual-col { flex:1; min-width:300px; }
-  .manual-head { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:13px; margin-bottom:8px; flex-wrap:wrap; }
-  .manual-tools { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
-  .manual-tools input { flex:1; min-width:140px; background:var(--panel); border:1px solid var(--line); color:var(--ink); padding:7px 9px; font-size:12.5px; font-family:var(--font-body); }
-  .manual-list { max-height:420px; overflow-y:auto; display:flex; flex-direction:column; gap:1px; background:var(--line); border:1px solid var(--line); min-height:46px; }
-  .mrow { background:var(--panel); padding:8px 10px; display:flex; gap:10px; align-items:center; }
-  .mrow.next { box-shadow: inset 3px 0 0 var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
-  .mrow.done { opacity:.55; }
-  .mpos { min-width:30px; text-align:center; font-family:var(--font-display); font-weight:700; font-size:14px; color:var(--accent); }
-  .minfo { flex:1; min-width:0; }
-  .mtitle { font-size:12.5px; line-height:1.35; overflow:hidden; text-overflow:ellipsis; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
-  .mmeta { font-size:11.5px; color:var(--muted); margin-top:2px; }
-  .mcode { font-family:ui-monospace, Menlo, Consolas, monospace; background:rgba(255,255,255,.06); padding:1px 5px; border-radius:3px; }
-  .mbadge { font-size:11px; padding:2px 7px; border-radius:999px; border:1px solid var(--line); white-space:nowrap; }
-  .mbadge.sent { color:var(--good); border-color:var(--good); }
-  .mbadge.skipped, .mbadge.unavailable { color:var(--bad); border-color:var(--bad); }
-  .mbadge.next { color:var(--accent); border-color:var(--accent); font-weight:600; }
-  .mbtns { display:flex; gap:4px; }
-  .mbtns button { background:transparent; border:1px solid var(--line); color:var(--ink); padding:4px 8px; cursor:pointer; font-size:12px; }
-  .mbtns button:hover { border-color:var(--accent); }
-  .mempty { background:var(--panel); padding:14px; font-size:12.5px; color:var(--muted); }
-  .hidden { display:none !important; }
-  select option { background:#14161a; color:#e8e8e8; }
-  .status-box.alert { border-color: var(--accent); animation: pulse 1s infinite; }
-  @keyframes pulse { 50% { background:#2a2108; } }
-</style>
-<script src="theme.js"></script>
-<link rel="stylesheet" href="theme.css">
-</head>
-<body>
-
-  <nav>
-    <div class="nav-links">
-      <a href="index.html">Painel geral</a>
-      <a href="marketplaces.html">Marketplaces</a>
-      <a href="watchlist.html">Lista de vigilância</a>
-      <a href="generator.html">Gerador de Link</a>
-      <a href="coupons.html">Cupons</a>
-      <a href="dispatcher.html" class="active">Disparador</a>
-    </div>
-    <a class="logout-link" id="logoutLink">Sair</a>
-  </nav>
-
-  <div class="masthead">
-    <h1 class="wordmark">Disparador<span>.</span></h1>
-    <p class="tagline">Envia as promoções que já têm o seu link de afiliado, uma de cada vez, no intervalo que você escolher</p>
-  </div>
-
-  <!-- 1. Destinos -->
-  <div class="block">
-    <div class="block-title">1. Destinos</div>
-    <p class="block-sub">Telegram envia sozinho. No WhatsApp você escolhe: <b>Robô</b> (um programa que fica aberto no seu notebook e envia sozinho no grupo — 100% automático) ou <b>Assistido</b> (o sistema prepara e você toca em enviar).</p>
-
-    <div class="dest-list" id="destList"></div>
-
-    <details>
-      <summary>Como conectar um canal ou grupo do Telegram (5 minutos)</summary>
-      <ol>
-        <li>No Telegram, abra o <b>@BotFather</b>, mande <code>/newbot</code>, escolha um nome e copie o <b>token</b> que ele devolver.</li>
-        <li>Crie um canal ou grupo (ou use um que já exista) e <b>adicione o bot</b> nele. Em canal, o bot precisa ser <b>administrador</b> com permissão de postar.</li>
-        <li>Em <b>Chat</b>, use <code>@nome_do_canal</code> (canal público) ou o id numérico (grupo/canal privado).</li>
-        <li>Preencha abaixo, clique em <b>Adicionar destino</b> e depois em <b>Testar</b>.</li>
-      </ol>
-    </details>
-
-    <div class="grid">
-      <div class="field">
-        <label>Tipo</label>
-        <select id="newPlatform">
-          <option value="telegram">Telegram (automático)</option>
-          <option value="whatsapp_manual">WhatsApp (robô ou assistido)</option>
-        </select>
-      </div>
-      <div class="field"><label>Nome</label><input type="text" id="newName" placeholder="Ex: Achadinhos Beleza" /></div>
-      <div class="field new-wa hidden"><label>Nome do grupo no WhatsApp (exato)</label><input type="text" id="newWaGroup" placeholder="Ex: Achadinhos VIP" /></div>
-      <div class="field tg-only"><label>Chat (@canal ou id)</label><input type="text" id="newChat" placeholder="@meucanal" /></div>
-      <div class="field tg-only"><label>Token do bot</label><input type="password" id="newToken" placeholder="123456:ABC..." /></div>
-      <div class="field" style="max-width:150px;"><label>Limite por 24h</label><input type="number" id="newLimit" value="60" min="1" max="200" /></div>
-      <button class="btn" id="addDestBtn">Adicionar destino</button>
-    </div>
-    <div class="msg" id="destMsg"></div>
-  </div>
-
-  <!-- 2. Envio -->
-  <div class="block">
-    <div class="block-title">2. Envio</div>
-    <p class="block-sub">Só entram na fila promoções que têm link de afiliado, que apareceram na ÚLTIMA busca daquele nicho (o que foi achado numa busca anterior e não apareceu na de agora fica de fora) e que ainda não foram enviadas a esse destino nas últimas 2 semanas. O sistema confere o preço de novo na hora de enviar e não dispara desconto suspeito (tipo "90% OFF"). Vão primeiro as de maior desconto.</p>
-
-    <div class="ntabs" id="nicheTabs"></div>
-    <div class="nnote" id="nicheNote"></div>
-
-    <div class="grid">
-      <div class="field"><label>Destino</label><select id="destSelect"></select></div>
-      <div class="field">
-        <label>Marketplace</label>
-        <select id="mpSelect">
-          <option value="">Todos</option>
-          <option value="shopee">Shopee</option>
-          <option value="netshoes">Netshoes</option>
-          <option value="shein">Shein</option>
-          <option value="mercadolivre">Mercado Livre</option>
-          <option value="magalu">Magalu</option>
-          <option value="amazon">Amazon</option>
-        </select>
-      </div>
-      <div class="field"><label>Qualidade mínima</label><select id="minScore">
-        <option value="52" selected>Boas e destaques (recomendado)</option>
-        <option value="68">Só destaques 🔥</option>
-        <option value="0">Tudo (sem filtro)</option>
-      </select></div>
-      <div class="field" style="max-width:150px;"><label>Intervalo (min)</label><input type="number" id="interval" value="5" min="2" /></div>
-      <div class="field" style="max-width:170px;"><label>Parar após (envios)</label><input type="number" id="maxSends" value="20" min="1" max="200" /></div>
-      <div class="field sel-wa hidden" style="max-width:260px;"><label>Modo do WhatsApp</label>
-        <select id="waMode"><option value="bot">Robô — 100% automático</option><option value="assisted">Assistido — eu toco em enviar</option></select>
-      </div>
-      <div class="field sel-bot hidden"><label>Nome do grupo no WhatsApp (exatamente como aparece lá)</label><input type="text" id="waGroup" placeholder="Ex: Achadinhos VIP" /></div>
-      <div class="field sel-hours" style="max-width:150px;"><label>Enviar a partir das (h)</label><input type="number" id="hourFrom" min="0" max="23" placeholder="8" /></div>
-      <div class="field sel-hours" style="max-width:150px;"><label>até as (h) — Brasília</label><input type="number" id="hourTo" min="0" max="23" placeholder="22" /></div>
-      <div class="field full"><label>Linha final da mensagem (opcional — ex.: "Siga o canal para mais ofertas")</label><input type="text" id="footer" value="" /></div>
-      <div class="field full">
-        <label>Grupos / nichos que podem ser enviados</label>
-        <div class="groups-box" id="groupBox"></div>
-      </div>
-    </div>
-
-    <div class="queue-info" id="queueInfo"></div>
-    <div class="queue-info hidden" id="botStatus"></div>
-
-    <label class="queue-info" style="display:flex;align-items:center;gap:8px;cursor:pointer;"><input type="checkbox" id="manualOn" /> <b>Escolher a ordem dos produtos manualmente</b> &nbsp;(você decide quais saem e em qual sequência)</label>
-    <div class="manual-box hidden" id="manualBox">
-      <p class="block-sub" style="margin-bottom:12px;">Clique em <b>+ Adicionar</b> nos produtos na ordem em que quer lançar: o primeiro que você adicionar é o primeiro a sair. Use as setas para reorganizar. O disparo segue <b>exatamente</b> essa ordem (mesmo intervalo, mesmo conferência de preço/link de sempre) e para sozinho quando o último sair. Se um produto ficar indisponível na hora (preço subiu, link caiu), ele é pulado e aparece marcado aqui com o motivo.</p>
-      <div class="manual-cols">
-        <div class="manual-col">
-          <div class="manual-head"><b>Disponíveis agora</b> <span class="dest-meta" id="manualAvailCount"></span></div>
-          <div class="manual-tools manual-act">
-            <input type="text" id="manualSearch" placeholder="Buscar por nome, código ou loja..." />
-            <button class="btn secondary small" id="manualLoadBtn" type="button">Carregar / atualizar</button>
-            <button class="btn secondary small" id="manualAddAllBtn" type="button">Adicionar todos</button>
-          </div>
-          <div class="manual-list" id="manualAvail"></div>
-        </div>
-        <div class="manual-col">
-          <div class="manual-head"><b>Ordem de disparo</b> <span class="dest-meta" id="manualOrderCount"></span>
-            <button class="btn danger small manual-act" id="manualClearBtn" type="button">Limpar ordem</button></div>
-          <div class="manual-list" id="manualOrder"></div>
-        </div>
-      </div>
-      <div class="msg" id="manualMsg"></div>
-    </div>
-
-    <label class="queue-info" style="display:flex;align-items:center;gap:8px;cursor:pointer;"><input type="checkbox" id="waCopyOnly" checked /> WhatsApp: só copiar a mensagem (eu colo no WhatsApp Web que já deixo aberto, sem abrir aba nova)</label>
-
-    <div class="controls">
-      <button class="btn secondary" id="queueBtn">Atualizar fila</button>
-      <button class="btn secondary" id="verifyBtn">🔍 Verificar fila</button>
-      <button class="btn secondary" id="testBtn">Enviar teste</button>
-      <button class="btn" id="startBtn">▶ Iniciar disparo automático</button>
-      <button class="btn danger hidden" id="stopBtn">■ Parar</button>
-      <button class="btn hidden" id="waStartBtn">🔔 Iniciar alertas do WhatsApp</button>
-      <button class="btn danger hidden" id="waStopBtn">■ Parar alertas</button>
-      <button class="btn secondary hidden" id="waBtn">📱 Abrir próximo agora</button>
-    </div>
-
-    <div class="runpanel" id="runPanel"></div>
-    <div class="status-box" id="statusBox">Parado.</div>
-    <button class="btn hidden" id="waOpenBtn" style="width:100%;margin-top:10px;padding:18px;font-size:16px;">📱 COPIAR / ABRIR NO WHATSAPP</button>
-    <div class="queue-info hidden" id="waHint" style="color:#7bd88f;margin-top:10px;"></div>
-    <div class="warn" id="runWarn">O disparo fica salvo no servidor: você pode recarregar a página, trocar de aba ou publicar uma atualização que ele continua do ponto onde estava. No Telegram, os envios acontecem enquanto alguma página do painel estiver aberta. No WhatsApp com robô, quem envia é o programa no seu notebook: notebook ligado, com internet e o robô aberto — pode fechar esta página.</div>
-  </div>
-
-  <!-- 3. Registro -->
-  <div class="block">
-    <div class="block-title">3. Registro desta sessão</div>
-    <div class="log" id="log"></div>
-  </div>
-
-  <div id="ver" style="font-size:11px;color:#8a8a8a;margin:14px 18px 24px;">Disparador: o script NÃO carregou (atualize com Ctrl+F5; se continuar, me avise).</div>
-
-  <script>
-(function(){ var v=document.getElementById('ver'); if(v) v.textContent='Disparador v2026-11-12.1 - script carregado'; })();
-const $ = (id) => document.getElementById(id);
-const MIN_INTERVAL = 2; // minutos \u2014 abaixo disso vira spam
-
-let loaded = false; // so libera "Iniciar" depois de saber quais disparos ja estao rodando (evita zerar sem querer)
-let destinations = [];
-let groups = [];
-let jobs = [];
-let serverOffset = 0; // diferenca entre o relogio do servidor e o do computador
-let pollTimer = null;
-let uiTimer = null;
-let ticking = false;
-let lastCountsAt = 0;
-let botSeenAt = null; // ultima vez que o robo do WhatsApp consultou o servidor
-let lastTickErr = '';
-let lastSeen = {};
-let alarmKey = null;
-let localPending = null; // mensagem preparada pelo bot\u00e3o "Abrir pr\u00f3ximo agora" (fora do disparo cont\u00ednuo)
-let audioCtx = null;
-let manualOn = false;      // ordem manual ligada?
-let manualAvail = [];      // produtos disponiveis para escolher
-let manualOrder = [];      // ordem de disparo escolhida [{id,title,marketplace,price,previous_price,discount,score,code}]
-let manualStatus = {};     // id -> {state, reason}
-let manualNext = null;
-let manualBusyLast = null;
-let manualStatusTimer = null;
-let waAlarmTimer = null;
-let waTitleTimer = null;
-const WA_MIN_INTERVAL = 1; // minutos (WhatsApp assistido: quem envia e voce)
-
-function escapeHtml(str) {
-  const d = document.createElement('div');
-  d.textContent = str == null ? '' : String(str);
-  return d.innerHTML;
+function fail(res, status, error, extra) {
+  res.status(status).json({ error, ...(extra || {}) });
 }
 
-function explainHttp(status, raw, data) {
-  if (data && data.error) return data.error;
-  if (status === 404) return 'o servidor n\u00e3o encontrou /api/dispatch (o arquivo api/dispatch.js n\u00e3o est\u00e1 no deploy)';
-  if (status === 401 || status === 403) return `acesso negado (HTTP ${status}) \u2014 fa\u00e7a login de novo`;
-  if (status >= 500) return `o servidor falhou (HTTP ${status}) \u2014 veja os Logs da Vercel; trecho: ${String(raw || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140)}`;
-  return `Falha na requisi\u00e7\u00e3o (HTTP ${status})`;
+function tableMissing(error) {
+  const m = String((error && (error.message || error)) || '');
+  return (error && error.code === '42P01') || /does not exist|schema cache|relation .* not found/i.test(m);
 }
 
-async function api(body) {
+function dbError(error) {
+  if (tableMissing(error)) {
+    return 'As tabelas do disparador ainda nao existem no Supabase. Rode os SQLs 0002_disparador.sql e 0003_disparo_continuo.sql (SQL Editor > New query) e tente de novo.';
+  }
+  return `banco de dados: ${error.message || error}`;
+}
+
+async function telegram(token, method, payload) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 45000);
-  let res;
+  const timer = setTimeout(() => ctrl.abort(), 12000);
   try {
-    res = await fetch('/api/dispatch', {
+    const r = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload || {}),
       signal: ctrl.signal,
     });
+    const data = await r.json().catch(() => ({}));
+    if (!data.ok) {
+      const err = new Error(data.description || `Telegram respondeu ${r.status}`);
+      err.status = data.error_code || r.status;
+      err.retryAfter = data.parameters && data.parameters.retry_after;
+      throw err;
+    }
+    return data.result;
   } catch (e) {
-    throw new Error(e.name === 'AbortError' ? 'o servidor demorou mais de 45s para responder' : `sem conex\u00e3o com o servidor (${e.message})`);
+    if (e.name === 'AbortError') throw new Error('O Telegram demorou demais para responder.');
+    throw e;
   } finally {
     clearTimeout(timer);
   }
-  const raw = await res.text();
-  let data = {};
-  try { data = JSON.parse(raw); } catch { /* resposta que n\u00e3o \u00e9 JSON */ }
-  if (!res.ok) {
-    const msg = explainHttp(res.status, raw, data);
-    const err = new Error(msg);
-    err.code = data.code;
-    err.retryAfter = data.retryAfter;
-    throw err;
+}
+
+function friendlyTelegramError(err) {
+  const m = String(err.message || '');
+  if (/unauthorized|not found/i.test(m) && err.status === 401) return 'Token do bot inv\u00e1lido. Copie de novo no @BotFather.';
+  if (/chat not found/i.test(m)) return 'Chat n\u00e3o encontrado. Confira o @canal (ou id) e se o bot foi adicionado ao canal/grupo.';
+  if (/not enough rights|have no rights|administrator|forbidden/i.test(m)) return 'O bot n\u00e3o tem permiss\u00e3o para postar. Em canal, torne o bot administrador com permiss\u00e3o de postar.';
+  return m;
+}
+
+// ---------------- mensagens (v-rias varia--es) ----------------
+
+// Paleta de emojis (escolhida pelo dono): - - - -- - - - - - - - -- -
+const OPENERS = ['\ud83d\udd25', '\ud83d\udc40', '\ud83e\udd29', '\ud83d\udecd\ufe0f', '\ud83c\udfaf'];
+const LINK_EMOJIS = ['\ud83d\udc49', '\ud83d\udcf2', '\ud83d\udd17'];
+
+function pick(arr, n) { return arr[Math.abs(n) % arr.length]; }
+
+// Emoji do assunto, pelo que o produto e (cozinha, casa, eletronicos).
+function categoryEmoji(title) {
+  const t = String(title || '').toLowerCase();
+  if (/panela|frigideira|cozinha|air ?fryer|fritadeira|talher|prato|copo|garrafa|esponja|marmita|assadeira|faca|utens[i\u00ed]lio/.test(t)) return '\ud83c\udf73';
+  if (/celular|smartphone|fone|carregador|cabo |usb|bluetooth|caixa de som|smartwatch|mouse|teclado|notebook|tablet|c[a\u00e2]mera|inteligente|led /.test(t)) return '\ud83d\udcf1';
+  if (/toalha|lixeira|banheiro|cama|len[c\u00e7]ol|travesseiro|organizador|cesto|tapete|cortina|sof[a\u00e1]|limpeza|vassoura|rodo|aspirador|sensor/.test(t)) return '\ud83c\udfe0';
+  return null;
+}
+
+// Monta o texto: sempre o MESMO formato, para o grupo nao enjoar de textinhos diferentes:
+//   nome do produto (como esta no anuncio)
+//   De ~R$ X~ por *R$ Y* (Z% OFF)
+//   cupom, se houver
+//   link de afiliado
+function buildMessage(p, turn, footer) {
+  const title = esc(p.title);
+  const link = esc(p.affiliate_url);
+  const { price, listPrice, coupon, finalPrice } = p.view;
+  const off = p.view.discount ? Math.round(p.view.discount) : null;
+  const hasList = listPrice && listPrice > price;
+  const offTxt = off ? ` (${off}% OFF)` : '';
+
+  const priceLine = hasList
+    ? `\ud83d\udcb8 De <s>R$ ${money(listPrice)}</s> por <b>R$ ${money(price)}</b>${coupon ? '' : offTxt}`
+    : `\ud83d\udcb8 Por <b>R$ ${money(price)}</b>${coupon ? '' : offTxt}`;
+  const couponLine = coupon ? `\ud83c\udf9f\ufe0f Com o cupom <b>${esc(coupon)}</b>: <b>R$ ${money(finalPrice)}</b>${offTxt}` : null;
+
+  const lines = [title, '', priceLine, couponLine, '', `\ud83d\udc49 ${link}`].filter((l) => l !== null && l !== undefined);
+  const cleaned = [];
+  for (const l of lines) { if (l === '' && (cleaned.length === 0 || cleaned[cleaned.length - 1] === '')) continue; cleaned.push(l); }
+  // Linha final opcional - mas nunca deixa sair aviso de "afiliado".
+  const safeFooter = footer && !/afiliad/i.test(footer) ? footer : '';
+  if (safeFooter) cleaned.push('', esc(safeFooter));
+  return cleaned.join('\n');
+}
+
+// Vers-o sem HTML para o WhatsApp (que n-o entende <b>/<s>).
+function toPlain(html) {
+  return html.replace(/<\/?(b|s)>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+// Versao para WhatsApp: negrito vira *texto* e riscado vira ~texto~ (o WhatsApp entende os dois).
+function toWhatsApp(html) {
+  return html.replace(/<\/?b>/g, '*').replace(/<\/?s>/g, '~').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+
+// ---------------- valida--o antes de enviar ----------------
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const DEAD_RE = /o produto n[\u00e3a]o existe|produto n[\u00e3a]o encontrado|p[\u00e1a]gina n[\u00e3a]o encontrada|produto indispon[\u00edi]vel|product (does not exist|not found)/i;
+const BADLINK_RE = /invalid publisher code|partnership status/i;
+
+// Abre o link como um cliente abriria e procura sinais claros de problema.
+// S- reprova quando o sinal - claro; se o site bloquear/der erro de rede, segue (inconclusivo).
+async function checkLink(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const r = await fetch(url, { redirect: 'follow', signal: ctrl.signal, headers: { 'User-Agent': UA, 'Accept-Language': 'pt-BR,pt;q=0.9', Accept: 'text/html,*/*' } });
+    if (r.status === 404 || r.status === 410) return { ok: false, kind: 'dead', reason: `a p\u00e1gina do produto n\u00e3o existe mais (erro ${r.status})` };
+    const text = (await r.text().catch(() => '')).slice(0, 40000);
+    if (BADLINK_RE.test(text)) return { ok: false, kind: 'badlink', reason: 'a rede de afiliados recusou o link (ID/parceria inv\u00e1lidos)' };
+    if (DEAD_RE.test(text)) return { ok: false, kind: 'dead', reason: 'a loja informa que o produto n\u00e3o existe' };
+    return { ok: true };
+  } catch { return { ok: true, inconclusive: true }; }
+  finally { clearTimeout(timer); }
+}
+
+function shopeeIds(url) {
+  const u = String(url || '');
+  let m = u.match(/\/product\/(\d+)\/(\d+)/) || u.match(/-i\.(\d+)\.(\d+)/);
+  return m ? { shopId: m[1], itemId: m[2] } : null;
+}
+
+let shopeeCreds;
+async function getShopeeCreds() {
+  if (shopeeCreds !== undefined) return shopeeCreds;
+  const { data: mp } = await supabaseAdmin.from('marketplaces').select('id').eq('slug', 'shopee').maybeSingle();
+  if (!mp) return (shopeeCreds = null);
+  const { data: c } = await supabaseAdmin.from('marketplace_credentials').select('client_id, client_secret').eq('marketplace_id', mp.id).maybeSingle();
+  return (shopeeCreds = c && c.client_id && c.client_secret ? c : null);
+}
+
+// Confirma na API oficial da Shopee que o an-ncio ainda existe e qual o pre-o de hoje.
+async function checkShopee(p) {
+  const ids = shopeeIds(p.original_url);
+  const creds = await getShopeeCreds();
+  if (!ids || !creds) return { ok: true, inconclusive: true };
+  try {
+    const sc = shopeeClient();
+    if (!sc.getProductOffer) return { ok: true, inconclusive: true };
+    const node = await sc.getProductOffer(creds.client_id, creds.client_secret, ids.itemId);
+    if (!node) return { ok: false, kind: 'dead', reason: 'a Shopee n\u00e3o devolve mais esse an\u00fancio (produto removido)' };
+    const live = Number(String(node.priceMin).replace(',', '.'));
+    return { ok: true, livePrice: Number.isFinite(live) && live > 0 ? live : null };
+  } catch { return { ok: true, inconclusive: true }; }
+}
+
+// Retorna { ok, kind, reason, livePrice }
+async function validatePromotion(p) {
+  const slug = p.marketplaces && p.marketplaces.slug;
+  let live = null;
+  if (slug === 'shopee') {
+    const sh = await checkShopee(p);
+    if (!sh.ok) return sh;
+    live = sh.livePrice || null;
+    if (live && Number(p.current_price) > 0 && live > Number(p.current_price) * 1.05) {
+      return { ok: false, kind: 'stale', reason: `o pre\u00e7o subiu (de R$ ${money(p.current_price)} para R$ ${money(live)})` };
+    }
   }
+  const lk = await checkLink(p.affiliate_url);
+  return lk.ok ? { ...lk, livePrice: live } : lk;
+}
+
+async function ignorePromotion(p, why) {
+  await supabaseAdmin.from('promotions').update({ status: 'IGNORED' }).eq('id', p.id);
+  await supabaseAdmin.from('integration_logs').insert({ marketplace_id: null, level: 'warn', message: `Disparador removeu da fila "${String(p.title).slice(0, 60)}": ${why}` }).then(() => {}, () => {});
+}
+
+// Promoção que acabou (anúncio removido, preço subiu, sem desconto): fica no painel como FINALIZADA,
+// com o motivo, e sai da fila de disparo. (Antes era marcada como "ignorada" ou só pulada.)
+async function endPromotion(p, why) {
+  const lc = lifecycle();
+  if (lc && await lc.endedSupported(supabaseAdmin)) {
+    await lc.markEnded(supabaseAdmin, [p.id], why);
+  } else if (why && /removido|n.o devolve/i.test(why)) {
+    await ignorePromotion(p, why); // sem o SQL 0005, mantém o comportamento antigo
+  }
+  await supabaseAdmin.from('integration_logs').insert({ marketplace_id: null, level: 'info', message: `Disparador finalizou a promocao \"${String(p.title).slice(0, 60)}\": ${why}` }).then(() => {}, () => {});
+}
+
+const isDupError = (e) => !!e && (e.code === '23505' || /duplicate key|unique constraint/i.test(e.message || ''));
+
+// ---------------- fila ----------------
+
+async function getDestination(id) {
+  const { data, error } = await supabaseAdmin.from('dispatch_destinations').select('*').eq('id', id).maybeSingle();
+  if (error) throw new Error(dbError(error));
   return data;
 }
 
-function log(text, kind) {
-  const line = document.createElement('div');
-  if (kind) line.className = kind;
-  line.textContent = `${new Date().toLocaleTimeString('pt-BR')}  ${text}`;
-  const box = $('log');
-  box.prepend(line);
-  while (box.children.length > 60) box.removeChild(box.lastChild);
+// ---------------- periodo da fila (igual ao filtro de data do Painel geral) ----------------
+// today_new  = "Hoje (novas)": so o que foi achado pela PRIMEIRA vez hoje (padrao do Painel geral)
+// today_seen = "Hoje (todas as vistas)": inclui produto antigo que a busca viu de novo hoje
+// 3h         = visto pela busca nas ultimas 3 horas (a busca que voce acabou de fazer)
+// 24h        = visto nas ultimas 24 horas (comportamento antigo; e o padrao de quem nao informa o periodo)
+const PERIODS = ['today_new', 'today_seen', '3h', '24h'];
+function brtDayStartMs(ms = Date.now()) {
+  const b = new Date(ms - 3 * 3600 * 1000); // hora de Brasilia (UTC-3)
+  return Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate()) + 3 * 3600 * 1000;
 }
 
-// ---------- erros vis-veis ----------
-// Se algo quebrar, a mensagem aparece na tela (em vez de campos em branco sem explica--o).
-function showPageError(msg) {
-  const el = $('destMsg');
-  if (el) el.textContent = `Erro na p\u00e1gina: ${msg}. Atualize com Ctrl+F5; se continuar, me mande esta mensagem.`;
-}
-window.addEventListener('error', (e) => showPageError(e.message));
-window.addEventListener('unhandledrejection', (e) => showPageError((e.reason && e.reason.message) || String(e.reason)));
-
-// ---------- carregar dados ----------
-
-async function fetchJson(url) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 15000);
+// Nome do nicho (grupo da busca) de cada promocao, para a tela mostrar de onde o produto veio.
+async function attachGroups(list) {
   try {
-    const res = await fetch(url, { signal: ctrl.signal });
-    const raw = await res.text();
-    let data = {};
-    try { data = JSON.parse(raw); } catch { /* n\u00e3o \u00e9 JSON */ }
-    if (!res.ok || data.error) throw new Error(explainHttp(res.status, raw, data));
-    return data;
-  } catch (err) {
-    if (err.name === 'AbortError') throw new Error('o servidor demorou mais de 15s para responder');
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
+    const need = (list || []).filter((p) => p && p.watch_group_id);
+    if (!need.length) return list;
+    const { data } = await supabaseAdmin.from('watch_groups').select('id, name');
+    const map = new Map((data || []).map((g) => [g.id, g.name]));
+    need.forEach((p) => { p._group = map.get(p.watch_group_id) || null; });
+  } catch { /* sem nome de grupo: segue */ }
+  return list;
 }
 
-// Destinos e grupos carregam de forma independente: se um falhar, o outro continua aparecendo.
-async function loadAll() {
-  // Nunca deixa os campos em branco enquanto carrega.
-  if (!$('destSelect').options.length) $('destSelect').innerHTML = '<option value="">Carregando destinos...</option>';
-  if (!$('groupBox').children.length) $('groupBox').innerHTML = '<span class="dest-meta">Carregando grupos...</span>';
-  const [d, g] = await Promise.allSettled([fetchJson('/api/dispatch'), fetchJson('/api/groups')]);
+// ---------------- ordem manual (voce escolhe quais produtos saem e em que sequencia) ----------------
 
-  if (d.status === 'fulfilled') {
-    destinations = d.value.destinations || [];
-    jobs = d.value.jobs || [];
-    if (d.value.version && $('ver')) $('ver').textContent += ` | API ${d.value.version}`;
-    if (d.value.now) serverOffset = new Date(d.value.now).getTime() - Date.now();
-    if (d.value.botSeenAt !== undefined) botSeenAt = d.value.botSeenAt;
-    $('destMsg').textContent = '';
-  } else {
-    destinations = [];
-    $('destMsg').textContent = `Erro ao carregar destinos: ${d.reason.message} (j\u00e1 rodou o SQL 0002_disparador.sql no Supabase? Est\u00e1 logado?)`;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_MANUAL = 200;
+
+// Lista de ids vinda da tela: so uuid valido, sem repetir, mantendo a ORDEM em que veio.
+function cleanManualIds(list) {
+  if (!Array.isArray(list)) return [];
+  const seen = new Set(); const out = [];
+  for (const x of list) {
+    const id = String(x || '');
+    if (UUID_RE.test(id) && !seen.has(id)) { seen.add(id); out.push(id); }
+    if (out.length >= MAX_MANUAL) break;
   }
+  return out;
+}
 
-  if (g.status === 'fulfilled') groups = g.value.groups || [];
-  else { groups = []; $('queueInfo').textContent = `Erro ao carregar grupos: ${g.reason.message}`; }
+// Codigo curto para voce saber QUAL produto e: id do anuncio na loja (Shopee / Mercado Livre) ou o inicio do id interno.
+function codeOf(p) {
+  const url = String((p && p.original_url) || '');
+  const sh = shopeeIds(url);
+  if (sh) return `Shopee ${sh.itemId}`;
+  const ml = url.match(/MLB-?(\d{6,})/i);
+  if (ml) return `MLB${ml[1]}`;
+  return String((p && p.id) || '').slice(0, 8).toUpperCase();
+}
 
-  renderDestinations(d.status === 'rejected' ? d.reason.message : null);
-  renderGroups();
-  restoreSettings();
-  initNiche();
-  manualLoadLocal();
-  applyJobToUI();
-  forceNicheGroups();
-  renderNicheTabs();
-  updateModeUI();
-  // Recarregou a pagina com disparos rodando: se o destino escolhido nao tem disparo, mas outro tem, mostra o que esta rodando.
-  if (d.status === 'fulfilled' && !selectedJob(false)) {
-    const running = jobs.find((j) => j.status === 'running' && destinations.some((x) => x.id === j.destination_id));
-    if (running) {
-      $('destSelect').value = running.destination_id;
-      const dd = selectedDest();
-      $('waGroup').value = dd && dd.chat_id && isWa(dd) ? dd.chat_id : '';
-      activeNiche = nicheOfJob(running);
-      localStorage.setItem('dispatcherNiche', activeNiche);
-      manualLoadLocal();
-      applyJobToUI();
-      renderNicheTabs();
+function manualMeta(p) {
+  return {
+    id: p.id, title: p.title, marketplace: p.marketplaces ? p.marketplaces.name : null, slug: p.marketplaces ? p.marketplaces.slug : null,
+    price: p.current_price != null ? Number(p.current_price) : null,
+    previous_price: p.previous_price ? Number(p.previous_price) : null,
+    discount: p.discount_rate ? Number(p.discount_rate) : null,
+    score: p._score != null ? p._score : null,
+    code: codeOf(p),
+    group: p._group || null, keyword: p.matched_keyword || null,
+    detected_at: p.detected_at || null, last_seen_at: p.last_seen_at || null,
+    original_url: p.original_url || null, affiliate_url: p.affiliate_url || null,
+  };
+}
+
+// Fila MANUAL: devolve exatamente os produtos escolhidos, na ordem escolhida. Continua barrando o que nao pode sair
+// (sem link de afiliado, finalizada/ignorada, ja enviada a este destino nas ultimas 2 semanas). O que o usuario
+// escolheu NAO passa pelos filtros automaticos (ultima busca, score minimo, grupo, "parecido"): quem manda e ele.
+async function loadManualQueue(destId, ids) {
+  const wanted = cleanManualIds(ids);
+  if (!wanted.length) return [];
+  const lc = lifecycle();
+  const hasEnded = !!(lc && await lc.endedSupported(supabaseAdmin));
+  const rows = [];
+  for (let i = 0; i < wanted.length; i += 100) {
+    let q = supabaseAdmin.from('promotions').select('*, marketplaces(slug, name)')
+      .in('id', wanted.slice(i, i + 100)).not('affiliate_url', 'is', null).neq('status', 'IGNORED').gt('current_price', 0);
+    if (hasEnded) q = q.is('ended_at', null);
+    const { data, error } = await q;
+    if (error) throw new Error(dbError(error));
+    rows.push(...(data || []));
+  }
+  const { data: logs, error: logErr } = await supabaseAdmin.from('dispatch_log').select('promotion_id')
+    .eq('destination_id', destId).gte('sent_at', isoAgo(NO_REPEAT_DAYS * DAY));
+  if (logErr) throw new Error(dbError(logErr));
+  const already = new Set((logs || []).map((l) => l.promotion_id));
+  await attachGroups(rows);
+  const byId = new Map(rows.map((p) => [p.id, p]));
+  return wanted.map((id) => byId.get(id)).filter((p) => p && !already.has(p.id) && /^https?:\/\//i.test(p.affiliate_url || ''));
+}
+
+async function loadQueue(destId, body) {
+  const manualIds = cleanManualIds(body.manual_ids);
+  if (manualIds.length) return loadManualQueue(destId, manualIds);
+  const groupIds = Array.isArray(body.group_ids) ? body.group_ids : [];
+  const since = isoAgo(QUEUE_DAYS_SEEN * DAY);
+  // Periodo igual ao do Painel geral (padrao de quem nao informa: 24h, como antes).
+  const period = PERIODS.includes(body.period) ? body.period : '24h';
+  const onlyLatest = body.only_latest_scan !== false;           // "so o que a ultima busca do nicho confirmou"
+  const dayStartIso = new Date(brtDayStartMs()).toISOString();
+  const seenSince = (period === 'today_new' || period === 'today_seen') ? dayStartIso : (period === '3h' ? isoAgo(3 * 3600 * 1000) : since);
+  const stats = body._stats || {};
+  Object.assign(stats, { period_total: 0, already: 0, not_latest: 0, suspicious: 0, low_score: 0, similar: 0, no_link: 0 });
+
+  const lc = lifecycle();
+  const hasEnded = !!(lc && await lc.endedSupported(supabaseAdmin)); // promocao finalizada nunca entra na fila
+  let q = supabaseAdmin
+    .from('promotions')
+    .select('*, marketplaces(slug, name)')
+    .not('affiliate_url', 'is', null)
+    .neq('status', 'IGNORED')
+    .gt('current_price', 0)
+    .order('last_seen_at', { ascending: false, nullsFirst: false })
+    .limit(1000);
+  const withPeriod = (qq) => (period === 'today_new' ? qq.gte('detected_at', dayStartIso) : qq.or(`last_seen_at.gte.${seenSince},and(last_seen_at.is.null,detected_at.gte.${seenSince})`));
+  q = withPeriod(q);
+  if (hasEnded) q = q.is('ended_at', null);
+  const { data, error } = await q;
+  if (error) throw new Error(dbError(error));
+
+  // Achadas no periodo que ainda NAO tem link de afiliado: aparecem no Painel geral, mas nao entram no disparo.
+  try {
+    let nl = supabaseAdmin.from('promotions').select('id', { count: 'exact', head: true }).is('affiliate_url', null).neq('status', 'IGNORED').gt('current_price', 0);
+    nl = withPeriod(nl);
+    if (hasEnded) nl = nl.is('ended_at', null);
+    const nlr = await nl;
+    stats.no_link = nlr && nlr.count ? nlr.count : 0;
+  } catch { /* so diagnostico */ }
+
+  const { data: logs, error: logErr } = await supabaseAdmin
+    .from('dispatch_log').select('promotion_id, skipped').eq('destination_id', destId).gte('sent_at', isoAgo(NO_REPEAT_DAYS * DAY));
+  if (logErr) throw new Error(dbError(logErr));
+  const already = new Set((logs || []).map((l) => l.promotion_id));
+
+  // Quando foi a ULTIMA busca de cada nicho em cada marketplace (inclui o que ainda nao tem link de afiliado).
+  // So entra na fila o que essa ultima busca viu: o que foi achado de manha e nao apareceu na busca de agora
+  // pode ja nao estar em promocao, entao nao sai.
+  const newestByKey = new Map();
+  {
+    let nq = supabaseAdmin.from('promotions').select('watch_group_id, last_seen_at, detected_at, marketplaces(slug)').neq('status', 'IGNORED').or(`last_seen_at.gte.${since},and(last_seen_at.is.null,detected_at.gte.${since})`).order('last_seen_at', { ascending: false, nullsFirst: false }).limit(1000);
+    if (hasEnded) nq = nq.is('ended_at', null);
+    const { data: seenRows } = await nq;
+    for (const r of seenRows || []) {
+      const k = `${r.watch_group_id || 'none'}|${r.marketplaces ? r.marketplaces.slug : ''}`;
+      const t = new Date(r.last_seen_at || r.detected_at).getTime();
+      if (t && (!newestByKey.has(k) || t > newestByKey.get(k))) newestByKey.set(k, t);
     }
   }
-  if (d.status === 'fulfilled') loaded = true; // so libera o Iniciar com a lista de disparos carregada de verdade
-  if (!loaded) setTimeout(loadAll, 5000); // servidor demorou/falhou: tenta de novo sozinho
-  jobs.forEach((j) => { lastSeen[j.id] = jobSig(j); });
-  updateModeUI();
-  renderJob();
-  ensurePolling();
-  renderManual();
-  refreshManualStatus();
-}
+  const inLatestScan = (p) => {
+    const newest = newestByKey.get(`${p.watch_group_id || 'none'}|${p.marketplaces ? p.marketplaces.slug : ''}`);
+    if (!newest) return true;
+    const t = new Date(p.last_seen_at || p.detected_at).getTime();
+    return t >= newest - LATEST_SCAN_WINDOW_MS;
+  };
+  const suspiciousDiscount = (p) => Number(p.discount_rate) > (p.source === 'shopee_listed_price' ? MAX_DISCOUNT_LISTED_PCT : MAX_DISCOUNT_PCT);
 
-// Qual aba de nicho corresponde aos grupos de um disparo (ou "CUSTOM" se for mistura).
-function nicheOfJob(job) {
-  const ids = new Set(((job.filters || {}).group_ids) || []);
-  if (!ids.size) return 'ALL';
-  const all = mergedGroups();
-  for (const g of all) { if (g.ids.length && g.ids.every((id) => ids.has(id)) && [...ids].every((id) => g.ids.includes(id))) return g.name.toLowerCase(); }
-  if (ids.size === 1 && ids.has('none')) return 'none';
-  const everyone = new Set(all.flatMap((g) => g.ids));
-  return [...everyone].every((id) => ids.has(id)) ? 'ALL' : 'CUSTOM';
-}
+  const wantNone = groupIds.includes('none');
+  const mp = body.marketplace || null;
 
-// Painel com TODOS os disparos em andamento (um por destino/nicho), sempre visivel, mesmo depois de recarregar.
-function renderRunning() {
-  const box = $('runPanel');
-  if (!box) return;
-  const running = jobs.filter((j) => j.status === 'running');
-  if (!running.length) { box.innerHTML = ''; return; }
-  const tabs = nicheTabs();
-  box.innerHTML = running.map((j) => {
-    const d = destinations.find((x) => x.id === j.destination_id);
-    if (!d) return '';
-    const nk = nicheOfJob(j);
-    const nicheName = (tabs.find((t) => t.key === nk) || { name: 'Vários nichos' }).name;
-    let when;
-    if (j.mode === 'bot' && j.pending) when = 'enviando no WhatsApp...';
-    else if (j.mode === 'assisted' && j.pending) when = '🔔 pronta para enviar';
-    else {
-      const left = new Date(j.next_run_at).getTime() - serverNow();
-      when = left > 0 ? `próximo em ${String(Math.floor(left / 60000)).padStart(2, '0')}:${String(Math.floor((left % 60000) / 1000)).padStart(2, '0')}` : (j.mode === 'bot' ? 'aguardando o robô' : 'enviando...');
+  let list = (data || []).filter((p) => {
+    if (!/^https?:\/\//i.test(p.affiliate_url || '')) return false;
+    if (mp && (!p.marketplaces || p.marketplaces.slug !== mp)) return false;
+    if (groupIds.length) {
+      if (p.watch_group_id) { if (!groupIds.includes(p.watch_group_id)) return false; }
+      else if (!wantNone) return false;
     }
-    return `<div class="runrow"><div><b>${escapeHtml(d.name)}</b> · ${escapeHtml(nicheName)}<div class="sub">Enviados ${j.sent_count}/${j.max_sends} nesta rodada · últimas 24h: ${d.sentLast24h || 0}/${d.daily_limit} · ${when}</div></div><button data-run-dest="${j.destination_id}">Ver</button></div>`;
-  }).join('');
-  box.querySelectorAll('[data-run-dest]').forEach((b) => b.addEventListener('click', () => {
-    const job = jobs.find((j) => j.destination_id === b.dataset.runDest);
-    $('destSelect').value = b.dataset.runDest;
-    const dd = selectedDest();
-    $('waGroup').value = dd && dd.chat_id && isWa(dd) ? dd.chat_id : '';
-    if (job) { activeNiche = nicheOfJob(job); localStorage.setItem('dispatcherNiche', activeNiche); }
-    manualLoadLocal(); applyJobToUI(); renderNicheTabs(); updateModeUI(); renderJob(); saveSettings(); renderManual(); refreshManualStatus();
-  }));
-}
-
-function renderDestinations(loadError) {
-  // O seletor da etapa 2 - montado primeiro, independente da lista da etapa 1.
-  const sel = $('destSelect');
-  const prev = sel.value;
-  if (destinations.length) {
-    sel.innerHTML = destinations.map((d) => `<option value="${d.id}">${escapeHtml(d.name)}${d.platform === 'whatsapp_manual' ? ' (WhatsApp)' : ' (Telegram)'}</option>`).join('');
-    if (destinations.some((d) => d.id === prev)) sel.value = prev;
-  } else {
-    sel.innerHTML = `<option value="">${loadError ? 'Erro ao carregar destinos' : 'Nenhum destino \u2014 adicione na etapa 1'}</option>`;
-  }
-
-  const list = $('destList');
-  if (!destinations.length) {
-    list.innerHTML = '<div class="dest-row"><span class="dest-meta">Nenhum destino ainda. Adicione um abaixo.</span></div>';
-  } else {
-    list.innerHTML = destinations.map((d) => `
-      <div class="dest-row">
-        <div>
-          <div class="dest-name">${escapeHtml(d.name)}</div>
-          <div class="dest-meta">${d.platform === 'telegram' ? `Telegram \u00b7 ${escapeHtml(d.chat_id)}` : `WhatsApp${d.chat_id ? ` \u00b7 grupo: ${escapeHtml(d.chat_id)}` : ''}`} \u00b7 enviados em 24h: ${d.sentLast24h}/${d.daily_limit}</div>
-        </div>
-        <div class="dest-actions">
-          <button class="btn secondary small" data-test="${d.id}">Testar</button>
-          <button class="btn danger small" data-del="${d.id}">Remover</button>
-        </div>
-      </div>`).join('');
-    list.querySelectorAll('[data-test]').forEach((b) => b.addEventListener('click', () => testDestination(b.dataset.test)));
-    list.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', () => removeDestination(b.dataset.del)));
-  }
-
-}
-
-// Nomes iguais viram UM grupo s-. O valor da caixinha guarda todos os ids do grupo (separados por v-rgula).
-function mergedGroups() {
-  const map = new Map();
-  groups.forEach((g) => {
-    const key = String(g.name || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    if (!map.has(key)) map.set(key, { name: String(g.name || '').replace(/\s+/g, ' ').trim(), ids: [] });
-    map.get(key).ids.push(g.id);
-    const cleaned = String(g.name || '').replace(/\s+/g, ' ').trim();
-    if (!/[A-Z\u00c0-\u00de]/.test(map.get(key).name) && /[A-Z\u00c0-\u00de]/.test(cleaned)) map.get(key).name = cleaned;
+    stats.period_total += 1;                                       // do periodo, com link, no marketplace/nicho escolhido
+    if (already.has(p.id)) { stats.already += 1; return false; }  // ja enviada a este destino nas ultimas 2 semanas
+    if (onlyLatest && !inLatestScan(p)) { stats.not_latest += 1; return false; } // a ultima busca do nicho nao confirmou
+    if (suspiciousDiscount(p)) { stats.suspicious += 1; return false; }
+    return true;
   });
-  return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
-}
 
-// ---------- abas por nicho ----------
-// Cada nicho (grupo da busca) tem sua aba: ao clicar, só aquele nicho entra na fila e o destino que você usou
-// nele da última vez volta sozinho. Assim um grupo de WhatsApp = um nicho, bem separado.
-let activeNiche = 'ALL';
-function nicheDestMap() { try { return JSON.parse(localStorage.getItem('dispatcherNicheDest') || '{}'); } catch { return {}; } }
-function nicheTabs() {
-  return [
-    { key: 'ALL', name: 'Todos os nichos', value: null },
-    ...mergedGroups().map((g) => ({ key: g.name.toLowerCase(), name: g.name, value: g.ids.join(',') })),
-    { key: 'none', name: 'Sem grupo', value: 'none' },
-  ];
-}
-function renderNicheTabs() {
-  const map = nicheDestMap();
-  $('nicheTabs').innerHTML = nicheTabs().map((t) => {
-    const did = map[t.key];
-    const running = did && jobs.some((j) => j.destination_id === did && j.status === 'running');
-    return `<button type="button" class="ntab ${activeNiche === t.key ? 'on' : ''}" data-niche="${escapeHtml(t.key)}">${running ? '<span class="live" title="disparo rodando"></span>' : ''}${escapeHtml(t.name)}</button>`;
-  }).join('');
-  const d = destinations.find((x) => x.id === map[activeNiche]);
-  $('nicheNote').textContent = activeNiche === 'ALL' || activeNiche === 'CUSTOM'
-    ? 'Escolha um nicho para disparar só dele. Cada nicho lembra o destino (grupo do WhatsApp ou canal) que você usou nele.'
-    : d ? `Destino deste nicho: ${d.name}. Pode trocar no seletor abaixo.` : 'Escolha abaixo o destino deste nicho e inicie o disparo: da próxima vez ele já vem selecionado.';
-}
-function forceNicheGroups() {
-  if (activeNiche === 'ALL' || activeNiche === 'CUSTOM') return;
-  const t = nicheTabs().find((x) => x.key === activeNiche);
-  if (!t || !t.value) { activeNiche = 'ALL'; return; }
-  checkGroups(t.value.split(','));
-}
-function initNiche() {
-  const saved = localStorage.getItem('dispatcherNiche') || 'ALL';
-  activeNiche = nicheTabs().some((t) => t.key === saved) ? saved : 'ALL';
-  if (activeNiche === 'ALL') return;
-  const did = nicheDestMap()[activeNiche];
-  if (did && destinations.some((d) => d.id === did)) $('destSelect').value = did;
-}
-function setNiche(key) {
-  activeNiche = key;
-  localStorage.setItem('dispatcherNiche', key);
-  if (key === 'ALL') {
-    document.querySelectorAll('.grp').forEach((c) => { c.checked = true; });
-  } else {
-    const did = nicheDestMap()[key];
-    if (did && destinations.some((d) => d.id === did)) {
-      $('destSelect').value = did;
-      const d = selectedDest();
-      $('waGroup').value = d && d.chat_id && isWa(d) ? d.chat_id : '';
-      manualLoadLocal(); applyJobToUI(); updateModeUI(); renderJob(); renderManual(); refreshManualStatus();
-    }
-    forceNicheGroups();
+  // Promocoes com queda de preco COMPROVADA saem antes das que so tem "desconto de tabela" informado
+  // pela Shopee (preco de tabela inflado e comum). Dentro de cada faixa, maior desconto primeiro.
+  // FUNIL: cada promocao ganha um score de venda (0-100, o mesmo do painel). Sai primeiro a de maior chance de
+  // converter; e o disparo pode exigir um score minimo (so destaques / boas / tudo).
+  const S = scoreLib();
+  const minScore = Number(body.min_score) || 0;
+  if (S) {
+    list.forEach((p) => { p._score = S.compute(p).score; });
+    if (minScore > 0) { const before = list.length; list = list.filter((p) => p._score >= minScore); stats.low_score = before - list.length; }
   }
-  saveSettings();
-  renderNicheTabs();
-  $('queueInfo').textContent = '';
-  refreshQueue();
-}
+  const rank = (p) => (p.source === 'shopee_listed_price' ? 1 : 0);
+  const byRecent = body.sort === 'recent'; // "Mais recentes": a achada por ultimo sai primeiro (igual ao Painel geral)
+  const detTs = (p) => new Date(p.detected_at).getTime() || 0;
+  list = list.map((p, i) => ({ p, i })).sort((a, b) => ((byRecent ? (detTs(b.p) - detTs(a.p)) : 0) || ((b.p._score || 0) - (a.p._score || 0)) || (rank(a.p) - rank(b.p)) || ((Number(b.p.discount_rate) || 0) - (Number(a.p.discount_rate) || 0)) || (a.i - b.i))).map((x) => x.p);
 
-function renderGroups() {
-  const options = [...mergedGroups().map((g) => ({ id: g.ids.join(','), name: g.name })), { id: 'none', name: 'Sem grupo' }];
-  $('groupBox').innerHTML = options.map((g) => `
-    <label class="check"><input type="checkbox" class="grp" value="${escapeHtml(g.id)}" checked /> ${escapeHtml(g.name)}</label>`).join('');
-}
-
-// ---------- configura--es lembradas no navegador (nada sens-vel) ----------
-
-function saveSettings() {
-  localStorage.setItem('dispatcher', JSON.stringify({
-    dest: $('destSelect').value, mp: $('mpSelect').value, minScore: $('minScore').value, interval: $('interval').value,
-    maxSends: $('maxSends').value, footer: $('footer').value, groups: filters().group_ids, copyOnly: $('waCopyOnly').checked,
-    waMode: $('waMode').value, hourFrom: $('hourFrom').value, hourTo: $('hourTo').value, manualOn,
-  }));
-}
-
-function checkGroups(ids) {
-  const set = new Set(ids || []);
-  document.querySelectorAll('.grp').forEach((c) => { c.checked = c.value.split(',').some((id) => set.has(id)); });
-}
-
-function restoreSettings() {
-  try {
-    const s = JSON.parse(localStorage.getItem('dispatcher') || '{}');
-    if (s.dest && destinations.some((d) => d.id === s.dest)) $('destSelect').value = s.dest;
-    if (s.mp !== undefined) $('mpSelect').value = s.mp;
-    if (s.minScore !== undefined) $('minScore').value = s.minScore;
-    if (s.interval) $('interval').value = s.interval;
-    if (s.maxSends) $('maxSends').value = s.maxSends;
-    if (s.footer !== undefined && !/afiliad/i.test(s.footer)) $('footer').value = s.footer;
-    if (Array.isArray(s.groups) && s.groups.length) checkGroups(s.groups);
-    if (s.copyOnly !== undefined) $('waCopyOnly').checked = !!s.copyOnly;
-    if (s.waMode) $('waMode').value = s.waMode;
-    if (s.hourFrom !== undefined) $('hourFrom').value = s.hourFrom;
-    if (s.hourTo !== undefined) $('hourTo').value = s.hourTo;
-    manualOn = !!s.manualOn; $('manualOn').checked = manualOn; $('manualBox').classList.toggle('hidden', !manualOn);
-  } catch { /* ignora */ }
-}
-
-// Se ja existe um disparo rodando (ou parado) para o destino escolhido, mostra os filtros DELE.
-function applyJobToUI() {
-  const job = selectedJob(false);
-  if (!job) return;
-  const f = job.filters || {};
-  $('interval').value = job.interval_min;
-  $('maxSends').value = job.max_sends;
-  $('mpSelect').value = f.marketplace || '';
-  if (f.min_score !== undefined) $('minScore').value = String(f.min_score);
-  $('footer').value = f.footer || '';
-  if (job.mode === 'bot' || job.mode === 'assisted') $('waMode').value = job.mode;
-  if (f.wa_group) $('waGroup').value = f.wa_group;
-  $('hourFrom').value = f.hour_from === null || f.hour_from === undefined ? '' : f.hour_from;
-  $('hourTo').value = f.hour_to === null || f.hour_to === undefined ? '' : f.hour_to;
-  checkGroups(f.group_ids || []);
-  if (Array.isArray(f.manual_ids) && f.manual_ids.length) {
-    manualOn = true; $('manualOn').checked = true; $('manualBox').classList.remove('hidden');
-    const known = new Map([...manualOrder, ...manualAvail].map((x) => [x.id, x]));
-    manualOrder = f.manual_ids.map((id) => known.get(id) || { id, title: 'carregando...', marketplace: null, price: null, previous_price: null, discount: null, score: null, code: String(id).slice(0, 8).toUpperCase() });
-  } else if (manualOn) {
-    manualOn = false; $('manualOn').checked = false; $('manualBox').classList.add('hidden'); // esse disparo foi iniciado sem ordem manual
-  }
-}
-
-function selectedDest() {
-  return destinations.find((d) => d.id === $('destSelect').value) || null;
-}
-
-function isWa(dest) { return !!dest && dest.platform === 'whatsapp_manual'; }
-
-// 'auto' = Telegram; 'bot' = WhatsApp com robo; 'assisted' = WhatsApp em que voce toca em enviar.
-function selectedMode() {
-  if (!isWa(selectedDest())) return 'auto';
-  return $('waMode').value === 'assisted' ? 'assisted' : 'bot';
-}
-
-function updateModeUI() {
-  const dest = selectedDest();
-  const wa = isWa(dest);
-  const mode = selectedMode();
-  const assisted = mode === 'assisted';
-  const busy = !!selectedJob(false);
-  if (wa && !$('waGroup').value && dest.chat_id) $('waGroup').value = dest.chat_id;
-  document.querySelectorAll('.sel-wa').forEach((el) => el.classList.toggle('hidden', !wa));
-  document.querySelectorAll('.sel-bot').forEach((el) => el.classList.toggle('hidden', mode !== 'bot'));
-  document.querySelectorAll('.sel-hours').forEach((el) => el.classList.toggle('hidden', assisted));
-  $('startBtn').disabled = !loaded;
-  $('waStartBtn').disabled = !loaded;
-  $('startBtn').classList.toggle('hidden', busy || assisted);
-  $('stopBtn').classList.toggle('hidden', !busy || assisted);
-  $('waStartBtn').classList.toggle('hidden', !assisted || busy);
-  $('waStopBtn').classList.toggle('hidden', !assisted || !busy);
-  $('waBtn').classList.toggle('hidden', !assisted || busy);
-  $('waCopyOnly').parentElement.classList.toggle('hidden', !assisted);
-  ['destSelect', 'mpSelect', 'minScore', 'interval', 'maxSends', 'footer', 'testBtn', 'queueBtn', 'verifyBtn', 'waMode', 'waGroup', 'hourFrom', 'hourTo'].forEach((id) => { $(id).disabled = busy && id !== 'destSelect' ? true : false; });
-  document.querySelectorAll('.grp').forEach((c) => { c.disabled = busy; });
-  $('manualOn').disabled = busy;
-  if (busy !== manualBusyLast) { manualBusyLast = busy; renderManual(); }
-  renderBotStatus();
-}
-
-const botOnline = () => !!botSeenAt && serverNow() - new Date(botSeenAt).getTime() < 120000;
-
-// Linha "Robo conectado / nao conectado" (so aparece no WhatsApp em modo robo).
-function renderBotStatus() {
-  const el = $('botStatus');
-  if (selectedMode() !== 'bot') { el.classList.add('hidden'); return; }
-  el.classList.remove('hidden');
-  if (botOnline()) {
-    const secs = Math.max(0, Math.round((serverNow() - new Date(botSeenAt).getTime()) / 1000));
-    el.style.color = '#7bd88f';
-    el.textContent = `🤖 Robô conectado (última consulta há ${secs}s).`;
-  } else {
-    el.style.color = '#e7b24a';
-    el.textContent = botSeenAt
-      ? '⚠️ Robô NÃO conectado (sem consultar há mais de 2 minutos). Abra o robô no notebook — sem ele nada é enviado.'
-      : '⚠️ O robô ainda não se conectou. Instale e abra o robô no notebook (passo a passo no arquivo LEIA-ME do robô). Sem ele nada é enviado.';
-  }
-}
-
-function filters() {
-  const group_ids = [...document.querySelectorAll('.grp:checked')].flatMap((c) => c.value.split(',')).filter(Boolean);
-  return { group_ids, marketplace: $('mpSelect').value || null, min_score: Number($('minScore').value) || 0, footer: $('footer').value.trim(), manual_ids: manualOn ? manualOrder.map((x) => x.id) : [] };
-}
-
-// ---------- destinos ----------
-
-async function addDestination() {
-  const btn = $('addDestBtn');
-  btn.disabled = true;
-  $('destMsg').textContent = '';
-  try {
-    const data = await api({
-      action: 'create_destination',
-      platform: $('newPlatform').value,
-      name: $('newName').value,
-      chat_id: $('newPlatform').value === 'whatsapp_manual' ? $('newWaGroup').value : $('newChat').value,
-      bot_token: $('newToken').value,
-      daily_limit: $('newLimit').value,
-    });
-    ['newName', 'newChat', 'newToken', 'newWaGroup'].forEach((id) => { $(id).value = ''; });
-    $('destMsg').textContent = data.botUsername ? `Destino criado. Bot reconhecido: @${data.botUsername}. Clique em "Testar".` : 'Destino criado.';
-    await loadAll();
-  } catch (err) {
-    $('destMsg').textContent = `Erro: ${err.message}`;
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-async function removeDestination(id) {
-  if (!confirm('Remover esse destino? O hist\u00f3rico de envios dele tamb\u00e9m some.')) return;
-  await api({ action: 'delete_destination', id });
-  await loadAll();
-}
-
-// Abre o WhatsApp numa aba aberta no clique (sen-o o navegador bloqueia o pop-up).
-function openWhatsAppTab() {
-  return window.open('', '_blank');
-}
-// O link wa.me pode abrir o aplicativo do Windows, que costuma estragar emojis (viram "-").
-// Por isso: (1) abre direto o WhatsApp Web no navegador e (2) copia a mensagem para a -rea de
-// transfer-ncia - se algo vier sem emoji, basta colar com Ctrl+V.
-function whatsappUrl(message) {
-  return `https://web.whatsapp.com/send?text=${encodeURIComponent(message)}`;
-}
-async function copyMessage(message) {
-  try { await navigator.clipboard.writeText(message); return true; } catch { /* tenta o m\u00e9todo antigo */ }
-  try {
-    const ta = document.createElement('textarea');
-    ta.value = message; ta.style.cssText = 'position:fixed;opacity:0;';
-    document.body.appendChild(ta); ta.focus(); ta.select();
-    const ok = document.execCommand('copy');
-    document.body.removeChild(ta);
-    return ok;
-  } catch { return false; }
-}
-
-// Aviso verde logo abaixo do bot-o; se a c-pia autom-tica falhar, mostra o texto para copiar na m-o.
-function showHint(text, fallbackMessage) {
-  const el = $('waHint');
-  el.classList.remove('hidden');
-  el.textContent = text;
-  if (fallbackMessage) {
-    const ta = document.createElement('textarea');
-    ta.readOnly = true; ta.value = fallbackMessage;
-    ta.style.cssText = 'width:100%;height:150px;margin-top:8px;background:#0e1013;color:#e8e8e8;border:1px solid #333;border-radius:6px;padding:8px;';
-    el.appendChild(ta); ta.focus(); ta.select();
-  }
-}
-
-function fillWhatsAppTab(tab, message) {
-  copyMessage(message);
-  const url = whatsappUrl(message);
-  if (tab) tab.location = url; else window.open(url, '_blank');
-}
-
-async function testDestination(id) {
-  const dest = destinations.find((d) => d.id === id);
-  try {
-    const r = await api({ action: 'test', destination_id: id });
-    if (r.manual) {
-      const copied = await copyMessage(r.message);
-      showHint(copied ? 'Mensagem de teste copiada! Cole (Ctrl+V) em qualquer conversa do WhatsApp e confira se todos os emojis aparecem.' : 'N\u00e3o consegui copiar sozinho. Copie o texto abaixo e cole no WhatsApp:', copied ? null : r.message);
-    }
-    log(`Teste preparado para "${dest ? dest.name : ''}".`, 'ok');
-    $('destMsg').textContent = r.manual ? 'Teste copiado \u2014 cole no WhatsApp.' : 'Teste enviado \u2014 confira no destino.';
-  } catch (err) {
-    log(`Teste falhou: ${err.message}`, 'err');
-    $('destMsg').textContent = `Erro: ${err.message}`;
-  }
-}
-
-// ---------- fila ----------
-
-async function refreshQueue() {
-  const dest = selectedDest();
-  if (!dest) { $('queueInfo').textContent = 'Crie um destino primeiro.'; return; }
-  $('queueInfo').textContent = 'Consultando a fila...';
-  try {
-    const f = filters();
-    const r = await api({ action: 'queue', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace, min_score: f.min_score, manual_ids: f.manual_ids });
-    if (!r.count) {
-      if (manualOn) { $('queueInfo').textContent = 'Nenhum produto da sua ordem está disponível para enviar (já enviados, sem link de afiliado ou finalizados). Veja o status na lista "Ordem de disparo".'; return; }
-      $('queueInfo').textContent = 'Fila vazia: nenhuma promo\u00e7\u00e3o da \u00faltima busca deste nicho, com link de afiliado, que ainda n\u00e3o tenha ido para esse destino. Rode uma busca desse nicho no Painel geral.';
-    } else {
-      const n = r.next;
-      $('queueInfo').textContent = `Na fila: ${r.count}. Pr\u00f3xima: ${n.title.slice(0, 70)} \u2014 R$ ${Number(n.price).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${n.discount ? ` (${Math.round(n.discount)}% OFF)` : ''}${n.marketplace ? ` \u00b7 ${n.marketplace}` : ''}`;
-      if (r.newestSeenAt) {
-        const hours = Math.floor((Date.now() - new Date(r.newestSeenAt).getTime()) / 3600000);
-        if (hours >= 6) $('queueInfo').textContent += ` \u26a0\ufe0f A busca mais recente dessas promo\u00e7\u00f5es foi h\u00e1 ${hours}h: rode uma busca no Painel geral antes de disparar, para garantir pre\u00e7os de hoje.`;
+  // Mesmo PRODUTO (outro vendedor, outro link) nao pode sair duas vezes:
+  //  1) nao repete produto parecido com algo ja ENVIADO a este destino nas ultimas 2 semanas;
+  //  2) entre parecidos na propria fila, fica so o mais barato.
+  const dd = dedupeLib();
+  if (dd && list.length) {
+    const sentIds = (logs || []).filter((l) => !l.skipped).map((l) => l.promotion_id).filter(Boolean);
+    if (sentIds.length) {
+      const sentIndex = new dd.SimilarIndex();
+      for (let i = 0; i < sentIds.length; i += 100) {
+        const { data: sentRows } = await supabaseAdmin.from('promotions').select('id, title').in('id', sentIds.slice(i, i + 100));
+        (sentRows || []).forEach((r) => sentIndex.add(r.title, r));
       }
+      if (sentIndex.size) { const b0 = list.length; list = list.filter((p) => !sentIndex.findSimilar(p.title)); stats.similar += b0 - list.length; }
     }
-  } catch (err) {
-    $('queueInfo').textContent = `Erro: ${err.message}`;
+    const b1 = list.length;
+    list = dd.keepCheapestOfEach(list, (p) => p.title, (p) => Number(p.current_price));
+    stats.similar += b1 - list.length;
   }
+  await attachGroups(list);
+  return list;
 }
 
-// ---------- disparo cont-nuo (o estado fica salvo no servidor) ----------
-// Recarregar a p-gina, trocar de aba ou publicar uma atualiza--o N-O zera nada:
-// contador, hor-rio do pr-ximo envio e total enviado ficam no banco.
-
-function selectedJob(includeStopped) {
-  const d = selectedDest();
-  if (!d) return null;
-  const list = jobs.filter((j) => j.destination_id === d.id);
-  const running = list.find((j) => j.status === 'running');
-  return running || (includeStopped ? list[0] || null : null);
-}
-
-const serverNow = () => Date.now() + serverOffset;
-const jobSig = (j) => `${j.sent_count}|${j.status}|${j.last_event || ''}|${j.last_error || ''}`;
-
-function applyJobs(data) {
-  if (data.now) serverOffset = new Date(data.now).getTime() - Date.now();
-  if (data.botSeenAt !== undefined) botSeenAt = data.botSeenAt;
-  jobs = data.jobs || [];
-  jobs.forEach((j) => {
-    const sig = jobSig(j);
-    if (lastSeen[j.id] !== undefined && lastSeen[j.id] !== sig) {
-      if (manualOn && selectedDest() && j.destination_id === selectedDest().id) scheduleManualStatus();
-      if (j.last_error) log(`\u26a0\ufe0f ${j.last_error}`, 'err');
-      else if (j.last_event) log(j.last_event, 'ok');
-    }
-    lastSeen[j.id] = sig;
-  });
-  updateModeUI();
-  renderJob();
-  ensurePolling();
-}
-
-// Pergunta ao servidor se tem envio na hora (e o servidor executa). Roda enquanto houver disparo ativo.
-async function tickServer() {
-  if (ticking) return;
-  ticking = true;
+async function netshoesCoupons() {
+  if (couponCache.list && Date.now() - couponCache.at < COUPON_CACHE_MS) return couponCache.list;
   try {
-    applyJobs(await api({ action: 'tick' }));
-    lastTickErr = '';
-    if (Date.now() - lastCountsAt > 60000) {
-      lastCountsAt = Date.now();
-      try { const dd = await fetchJson('/api/dispatch'); if (dd.destinations) { destinations = dd.destinations; renderRunning(); } } catch { /* ignora */ }
+    const cp = coupons();
+    if (!cp.getNetshoesContext || !cp.loadNetshoesCoupons) return null;
+    const ctx = await cp.getNetshoesContext(supabaseAdmin);
+    if (ctx.error) return null;
+    const loaded = await cp.loadNetshoesCoupons(ctx);
+    if (loaded.error) return null;
+    couponCache = { at: Date.now(), list: loaded.coupons || [] };
+    return couponCache.list;
+  } catch { return null; }
+}
+
+// Calcula o que vai aparecer na mensagem. Retorna null se a promo--o n-o vale mais (ex.: cupom venceu).
+async function buildView(p) {
+  const slug = p.marketplaces && p.marketplaces.slug;
+  let price = Number(p.current_price);
+  let listPrice = p.previous_price ? Number(p.previous_price) : null;
+  let coupon = null; let finalPrice = null;
+
+  if (slug === 'netshoes') {
+    const fromCoupon = p.source === 'netshoes_coupon';
+    // Em ofertas por cupom, current_price j- - o pre-o COM cupom e previous_price - o pre-o da loja.
+    const storePrice = fromCoupon ? Number(p.previous_price) : price;
+    const list = await netshoesCoupons();
+    const best = list && storePrice > 0 && coupons().bestNetshoesCoupon ? coupons().bestNetshoesCoupon(list, { title: p.title, price: storePrice, category: null }) : null;
+    if (best) {
+      coupon = best.coupon.code; finalPrice = r2(best.finalPrice); price = r2(storePrice);
+      listPrice = fromCoupon ? null : listPrice;
+    } else if (fromCoupon) {
+      return null; // a oferta dependia de um cupom que n\u00e3o consigo confirmar agora
     }
+  }
+
+  const base = coupon ? finalPrice : price;
+  const ref = listPrice && listPrice > price ? listPrice : (coupon ? price : null);
+  const discount = ref && base < ref ? ((ref - base) / ref) * 100 : (p.discount_rate ? Number(p.discount_rate) : null);
+  return { price: r2(price), listPrice: listPrice ? r2(listPrice) : null, coupon, finalPrice, discount };
+}
+
+// ---------------- a--es ----------------
+
+async function createDestination(res, body) {
+  const platform = body.platform === 'whatsapp_manual' ? 'whatsapp_manual' : 'telegram';
+  const name = String(body.name || '').replace(/\s+/g, ' ').trim();
+  if (!name) return fail(res, 400, 'D\u00ea um nome ao destino (ex.: Achadinhos).');
+  const dailyLimit = Math.min(Math.max(parseInt(body.daily_limit, 10) || 60, 1), 200);
+
+  // No WhatsApp, chat_id guarda o NOME do grupo (usado pelo robo). No Telegram, o @canal/id.
+  const row = { name: name.slice(0, 80), platform, daily_limit: dailyLimit, chat_id: platform === 'whatsapp_manual' ? (String(body.chat_id || '').replace(/\s+/g, ' ').trim().slice(0, 120) || null) : null, bot_token: null };
+  let botUsername = null;
+
+  if (platform === 'telegram') {
+    const chat = String(body.chat_id || '').trim();
+    const token = String(body.bot_token || '').trim();
+    if (!chat) return fail(res, 400, 'Preencha o Chat (@nome_do_canal ou o id num\u00e9rico).');
+    if (!/^\d+:[\w-]{20,}$/.test(token)) return fail(res, 400, 'Token do bot com formato estranho. Ele parece com 123456789:ABCdef... (copie inteiro do @BotFather).');
+    try { botUsername = (await telegram(token, 'getMe')).username; }
+    catch (err) { return fail(res, 400, friendlyTelegramError(err)); }
+    row.chat_id = /^-?\d+$/.test(chat) || chat.startsWith('@') ? chat : `@${chat}`;
+    row.bot_token = token;
+  }
+
+  const { error } = await supabaseAdmin.from('dispatch_destinations').insert(row);
+  if (error) return fail(res, 500, dbError(error));
+  res.status(200).json({ ok: true, botUsername });
+}
+
+async function listDestinations(res) {
+  // bot_seen_at e criado pelo SQL 0004; se ele ainda nao foi rodado, cai para a consulta antiga.
+  let q = await supabaseAdmin.from('dispatch_destinations').select('id, name, platform, chat_id, daily_limit, created_at, bot_seen_at').order('created_at');
+  if (q.error && /bot_seen_at/i.test(String(q.error.message || ''))) {
+    q = await supabaseAdmin.from('dispatch_destinations').select('id, name, platform, chat_id, daily_limit, created_at').order('created_at');
+  }
+  const { data, error } = q;
+  if (error) return fail(res, 500, dbError(error));
+  const since = isoAgo(DAY);
+  const [counts, payload] = await Promise.all([
+    Promise.all((data || []).map((d) => supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true })
+      .eq('destination_id', d.id).eq('skipped', false).gte('sent_at', since).then((r) => r.count || 0, () => 0))),
+    jobsPayload(),
+  ]);
+  const out = (data || []).map((d, i) => ({ ...d, sentLast24h: counts[i] }));
+  res.status(200).json({ destinations: out, jobs: payload.jobs, now: payload.now, botSeenAt: payload.botSeenAt || null, version: VERSION });
+}
+
+async function sendTest(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+  const text = '\u2705 Teste do Radar de Promo\u00e7\u00f5es: se voc\u00ea est\u00e1 lendo isso, o destino est\u00e1 funcionando.\n\n\ud83d\udc40 \ud83d\udd25 \ud83e\udd29 \ud83d\udecd\ufe0f \ud83d\udcb8 \ud83c\udfe0 \ud83d\udcf1 \ud83c\udf73 \ud83c\udfaf \ud83d\udcf2 \ud83d\udc49 \u26a0\ufe0f \ud83d\udd17';
+  if (dest.platform === 'whatsapp_manual') return res.status(200).json({ ok: true, manual: true, message: text });
+  try { await telegram(dest.bot_token, 'sendMessage', { chat_id: dest.chat_id, text }); }
+  catch (err) { return fail(res, 400, friendlyTelegramError(err)); }
+  res.status(200).json({ ok: true });
+}
+
+async function queue(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+  const stats = {};
+  const list = await loadQueue(dest.id, { ...body, _stats: stats });
+  if (!list.length) return res.status(200).json({ count: 0, stats });
+  const n = list[0];
+  res.status(200).json({
+    count: list.length, stats,
+    next: { title: n.title, price: Number(n.current_price), discount: n.discount_rate ? Number(n.discount_rate) : null, marketplace: n.marketplaces ? n.marketplaces.name : null, group: n._group || null, detected_at: n.detected_at || null, link: n.affiliate_url },
+    newestSeenAt: list.reduce((m, p) => { const t = p.last_seen_at || p.detected_at; return t && (!m || t > m) ? t : m; }, null),
+  });
+}
+
+
+// Produtos que voce pode escolher para montar a ordem (a mesma lista que o disparo automatico usaria).
+async function manualCandidates(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+  const list = await loadQueue(dest.id, { group_ids: body.group_ids, marketplace: body.marketplace, min_score: body.min_score, period: body.period, sort: body.sort, only_latest_scan: body.only_latest_scan });
+  res.status(200).json({ total: list.length, items: list.slice(0, 300).map(manualMeta) });
+}
+
+// Situacao de cada produto da ordem: ja enviado, pulado (com o motivo), indisponivel ou aguardando.
+async function manualStatus(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+  const ids = cleanManualIds(body.ids);
+  if (!ids.length) return res.status(200).json({ items: [], next: null });
+  const lc = lifecycle();
+  const hasEnded = !!(lc && await lc.endedSupported(supabaseAdmin));
+  const promos = new Map();
+  for (let i = 0; i < ids.length; i += 100) {
+    const { data, error } = await supabaseAdmin.from('promotions').select('*, marketplaces(slug, name)').in('id', ids.slice(i, i + 100));
+    if (error) return fail(res, 500, dbError(error));
+    (data || []).forEach((p) => promos.set(p.id, p));
+  }
+  const logsByPromo = new Map();
+  for (let i = 0; i < ids.length; i += 100) {
+    const { data: logs, error } = await supabaseAdmin.from('dispatch_log').select('promotion_id, skipped, message, sent_at')
+      .eq('destination_id', dest.id).in('promotion_id', ids.slice(i, i + 100)).gte('sent_at', isoAgo(NO_REPEAT_DAYS * DAY)).order('sent_at', { ascending: false });
+    if (error) return fail(res, 500, dbError(error));
+    (logs || []).forEach((l) => { if (!logsByPromo.has(l.promotion_id)) logsByPromo.set(l.promotion_id, []); logsByPromo.get(l.promotion_id).push(l); });
+  }
+  await attachGroups([...promos.values()]);
+  let next = null;
+  const items = ids.map((id) => {
+    const p = promos.get(id);
+    const logs = logsByPromo.get(id) || [];
+    const sentLog = logs.find((l) => !l.skipped);
+    const skipLog = logs.find((l) => l.skipped);
+    let state = 'pending'; let reason = null; let at = null;
+    if (sentLog) { state = 'sent'; at = sentLog.sent_at; }
+    else if (skipLog) { state = 'skipped'; reason = String(skipLog.message || '').replace(/^pulada:\s*/i, '').slice(0, 140); at = skipLog.sent_at; }
+    else if (!p) { state = 'unavailable'; reason = 'n\u00e3o encontrada (foi apagada)'; }
+    else if (p.status === 'IGNORED') { state = 'unavailable'; reason = 'foi ignorada no painel'; }
+    else if (hasEnded && p.ended_at) { state = 'unavailable'; reason = 'a promo\u00e7\u00e3o j\u00e1 foi finalizada'; }
+    else if (!p.affiliate_url) { state = 'unavailable'; reason = 'sem link de afiliado'; }
+    if (state === 'pending' && !next) next = id;
+    return { ...(p ? manualMeta(p) : { id, title: '(promo\u00e7\u00e3o n\u00e3o encontrada)', marketplace: null, price: null, previous_price: null, discount: null, score: null, code: id.slice(0, 8).toUpperCase() }), state, reason, at };
+  });
+  res.status(200).json({ items, next });
+}
+
+// Confere os pr-ximos da fila SEM enviar nada. Quem n-o existe mais - removido (vai para "Ignoradas").
+async function verifyQueue(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+  const list = await loadQueue(dest.id, body);
+  const sample = list.slice(0, 12);
+  const out = { total: list.length, checked: 0, ok: 0, removed: [], warnings: [] };
+  for (const p of sample) {
+    const check = await validatePromotion(p);
+    out.checked += 1;
+    if (check.ok) { out.ok += 1; continue; }
+    if (check.kind === 'badlink') { out.warnings.push(check.reason); break; }
+    if (check.kind === 'dead') await ignorePromotion(p, check.reason);
+    out.removed.push({ title: p.title, reason: check.reason });
+  }
+  res.status(200).json(out);
+}
+
+// Escolhe e confere a proxima promocao (sem enviar nada). Devolve:
+//  { error: { status, message, extra } } | { empty: true, skipped } | { chosen, view, html, remaining, skippedInfo }
+async function prepareNext(dest, body) {
+  // limite diario e trava anti-duplo-clique
+  const { count: sent24 } = await supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true })
+    .eq('destination_id', dest.id).eq('skipped', false).gte('sent_at', isoAgo(DAY));
+  if ((sent24 || 0) >= dest.daily_limit) return { error: { status: 429, message: `Limite de ${dest.daily_limit} envios em 24h atingido para "${dest.name}".`, extra: { code: 'daily_limit' } } };
+
+  const { data: last } = await supabaseAdmin.from('dispatch_log').select('sent_at').eq('destination_id', dest.id).eq('skipped', false)
+    .order('sent_at', { ascending: false }).limit(1);
+  if (last && last[0] && Date.now() - new Date(last[0].sent_at).getTime() < MIN_GAP_SECONDS * 1000) {
+    return { error: { status: 429, message: 'Envio muito r\u00e1pido, aguardando alguns segundos.', extra: { code: 'too_fast' } } };
+  }
+
+  const list = await loadQueue(dest.id, body);
+  let chosen = null; let view = null; let tries = 0;
+  const skippedInfo = [];
+  const t0 = Date.now();
+  for (const p of list) {
+    if (tries >= 8 || Date.now() - t0 > 16000) break; // a funcao da Vercel morre em 30s: deixa folga
+    tries += 1;
+    // 1) o produto/link ainda existe e funciona?
+    const check = await validatePromotion(p);
+    if (!check.ok) {
+      if (check.kind === 'badlink') {
+        return { error: { status: 409, message: `Parei por seguran\u00e7a: ${check.reason}. Confira o ID de afiliado em Marketplaces antes de continuar.`, extra: { code: 'bad_link' } } };
+      }
+      if (check.kind === 'dead' || check.kind === 'stale') await endPromotion(p, check.reason);
+      await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: `pulada: ${check.reason}` });
+      skippedInfo.push({ title: p.title, reason: check.reason });
+      continue;
+    }
+    // 1b) preco de AGORA (Shopee confirma na API): usa o preco real e descarta se deixou de ser desconto
+    if (check.livePrice && Math.abs(check.livePrice - Number(p.current_price)) >= 0.01) {
+      const prev = p.previous_price ? Number(p.previous_price) : null;
+      if (prev && check.livePrice >= prev) {
+        await endPromotion(p, 'o pre\u00e7o voltou ao normal (sem desconto agora)');
+        await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: 'pulada: sem desconto agora' });
+        skippedInfo.push({ title: p.title, reason: 'o pre\u00e7o atual n\u00e3o est\u00e1 mais em promo\u00e7\u00e3o' });
+        continue;
+      }
+      p.current_price = check.livePrice;
+      p.discount_rate = prev ? Math.round(((prev - check.livePrice) / prev) * 10000) / 100 : p.discount_rate;
+      supabaseAdmin.from('promotions').update({ current_price: p.current_price, discount_rate: p.discount_rate, last_seen_at: new Date().toISOString() }).eq('id', p.id).then(() => {}, () => {});
+    }
+    // 2) preco/cupom de agora
+    const v = await buildView(p);
+    if (v && v.discount && v.discount > MAX_DISCOUNT_PCT) {
+      await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: 'pulada: desconto suspeito' });
+      skippedInfo.push({ title: p.title, reason: `desconto de ${Math.round(v.discount)}% parece pre\u00e7o de tabela inflado` });
+      continue;
+    }
+    if (v) { chosen = p; view = v; break; }
+    await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: p.id, skipped: true, message: 'pulada: cupom n\u00e3o confirmado' });
+    skippedInfo.push({ title: p.title, reason: 'o cupom dessa oferta n\u00e3o est\u00e1 mais v\u00e1lido' });
+  }
+  if (!chosen) {
+    // So e "fila acabou" se TODA a fila foi conferida. Se parou por limite (8 conferencias ou tempo) ainda ha
+    // mais promocoes: tenta as proximas daqui a pouco em vez de encerrar o disparo.
+    if (tries < list.length) return { retry: true, skipped: skippedInfo };
+    return { empty: true, skipped: skippedInfo };
+  }
+
+  chosen.view = view;
+  const { count: total } = await supabaseAdmin.from('dispatch_log').select('id', { count: 'exact', head: true }).eq('destination_id', dest.id);
+  const html = buildMessage(chosen, total || 0, String(body.footer || '').slice(0, 120));
+  return { chosen, view, html, remaining: Math.max(list.length - tries, 0), skippedInfo };
+}
+
+async function sendNext(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+
+  const prep = await prepareNext(dest, body);
+  if (prep.error) return fail(res, prep.error.status, prep.error.message, prep.error.extra);
+  if (prep.empty) return res.status(200).json({ empty: true, skipped: prep.skipped });
+  if (prep.retry) return res.status(200).json({ retry: true, skipped: prep.skipped });
+
+  const { chosen, view, html, remaining, skippedInfo } = prep;
+  const slugName = chosen.marketplaces ? chosen.marketplaces.name : null;
+
+  if (dest.platform === 'whatsapp_manual') {
+    const plain = toWhatsApp(html);
+    const { error: logErr } = await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: plain });
+    if (isDupError(logErr)) return fail(res, 409, 'Essa promo\u00e7\u00e3o j\u00e1 foi enviada a este destino (evitei repetir).', { code: 'duplicate' });
+    return res.status(200).json({ ok: true, manual: true, message: plain, promotion: { title: chosen.title, coupon: view.coupon, link: chosen.affiliate_url }, remaining, skipped: skippedInfo });
+  }
+
+  // RESERVA antes de enviar: se o servidor cair depois do envio, a promocao ja consta como enviada e nao repete.
+  // (O indice unico do SQL 0005 impede dois envios da mesma promocao ao mesmo destino, mesmo em disputa.)
+  const reserve = await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: toPlain(html) }).select('id').maybeSingle();
+  if (isDupError(reserve.error)) return fail(res, 409, 'Essa promo\u00e7\u00e3o j\u00e1 foi enviada a este destino (evitei repetir).', { code: 'duplicate' });
+  const reservedId = reserve.data ? reserve.data.id : null;
+  try {
+    let done = false;
+    if (chosen.image_url && /^https:\/\//i.test(chosen.image_url) && html.length <= 1000) {
+      try {
+        await telegram(dest.bot_token, 'sendPhoto', { chat_id: dest.chat_id, photo: chosen.image_url, caption: html, parse_mode: 'HTML' });
+        done = true;
+      } catch (e) { if (e.status === 429) throw e; /* imagem recusada: manda s\u00f3 o texto */ }
+    }
+    if (!done) await telegram(dest.bot_token, 'sendMessage', { chat_id: dest.chat_id, text: html, parse_mode: 'HTML', disable_web_page_preview: false });
   } catch (err) {
-    if (err.message !== lastTickErr) { lastTickErr = err.message; log(`\u26a0\ufe0f Sem resposta do servidor (${err.message}). Tentando de novo...`, 'err'); }
-  } finally {
-    ticking = false;
-  }
-}
-
-function ensurePolling() {
-  const any = jobs.some((j) => j.status === 'running');
-  if (any && !pollTimer) { pollTimer = setInterval(tickServer, 10000); tickServer(); }
-  if (!any && pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-  if (!uiTimer) uiTimer = setInterval(renderJob, 1000);
-}
-
-function renderJob() {
-  renderRunning();
-  const box = $('statusBox');
-  const openBtn = $('waOpenBtn');
-  renderBotStatus();
-  const job = selectedJob(true);
-  if (!job) { if (!localPending) openBtn.classList.add('hidden'); return; }
-
-  if (job.status !== 'running') {
-    box.classList.remove('running', 'alert');
-    box.innerHTML = `<b>Parado.</b> ${escapeHtml(job.last_event || '')}${job.last_error ? `<br>\u26a0\ufe0f ${escapeHtml(job.last_error)}` : ''}<br>Enviados nesta rodada: ${job.sent_count}/${job.max_sends}`;
-    if (!localPending) openBtn.classList.add('hidden');
-    alarmKey = null; stopAlarm();
-    return;
+    // Nao foi enviado: libera a reserva para a promocao poder sair depois.
+    if (reservedId) await supabaseAdmin.from('dispatch_log').delete().eq('id', reservedId);
+    if (err.status === 429) return fail(res, 429, 'Telegram pediu para ir mais devagar.', { code: 'rate_limited', retryAfter: err.retryAfter || 60 });
+    return fail(res, 502, friendlyTelegramError(err));
   }
 
-  if (job.mode === 'bot') {
-    box.classList.remove('alert'); box.classList.add('running');
-    const progress = `Enviados: ${job.sent_count}/${job.max_sends}`;
-    const offline = botOnline() ? '' : '<br>⚠️ <b>O robô não está conectado</b> — abra o robô no notebook, senão nada é enviado.';
-    if (job.pending) {
-      box.innerHTML = `<span class="big">Enviando no WhatsApp...</span><br>${escapeHtml(String(job.pending.title || '').slice(0, 90))}<br>${progress}${offline}`;
+  res.status(200).json({ ok: true, sent: { title: chosen.title, marketplace: slugName, coupon: view.coupon, link: chosen.affiliate_url }, remaining, skipped: skippedInfo });
+}
+
+
+// ---------------- disparo continuo (estado no servidor) ----------------
+
+const CLAIM_STALE_MS = 150 * 1000;
+const BOT_PENDING_MAX_MS = 10 * 60 * 1000; // mensagem entregue ao robo e nao confirmada ha mais que isso: descarta
+
+// ---- horario de funcionamento (hora de Brasilia = UTC-3, sem horario de verao desde 2019) ----
+const BRT_OFFSET_MS = -3 * 3600 * 1000;
+function parseHour(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = parseInt(v, 10);
+  return Number.isInteger(n) && n >= 0 && n <= 23 ? n : null;
+}
+function inWindow(f, ms = Date.now()) {
+  const from = Number.isInteger(f.hour_from) ? f.hour_from : null;
+  const to = Number.isInteger(f.hour_to) ? f.hour_to : null;
+  if (from === null || to === null || from === to) return true; // sem limite
+  const h = new Date(ms + BRT_OFFSET_MS).getUTCHours();
+  return from < to ? (h >= from && h < to) : (h >= from || h < to);
+}
+function nextWindowStart(f, ms = Date.now()) {
+  const brt = new Date(ms + BRT_OFFSET_MS);
+  let start = Date.UTC(brt.getUTCFullYear(), brt.getUTCMonth(), brt.getUTCDate(), f.hour_from, 0, 0) - BRT_OFFSET_MS;
+  if (start <= ms) start += 24 * 3600 * 1000;
+  return start;
+}
+// Intervalo com variacao de +-15%: mensagens em horario "redondo" demais chamam atencao do WhatsApp.
+function jitteredMs(minutes) {
+  return Math.max(Math.round(minutes * 60000 * (0.85 + Math.random() * 0.3)), 90 * 1000);
+}
+
+function fakeRes() {
+  return { code: 200, body: null, status(c) { this.code = c; return this; }, json(b) { this.body = b; return this; } };
+}
+
+async function jobsPayload() {
+  const now = new Date().toISOString();
+  const { data, error } = await supabaseAdmin.from('dispatch_jobs').select('*');
+  if (error) return { jobs: [], now, jobsError: error.message };
+  // ultima vez que o robo do WhatsApp consultou o servidor (coluna criada pelo SQL 0004; sem ela, fica null)
+  let botSeenAt = null;
+  try {
+    const r = await supabaseAdmin.from('dispatch_destinations').select('bot_seen_at').not('bot_seen_at', 'is', null).order('bot_seen_at', { ascending: false }).limit(1);
+    if (!r.error && r.data && r.data[0]) botSeenAt = r.data[0].bot_seen_at;
+  } catch { /* sem a coluna: segue */ }
+  return { jobs: data || [], now, botSeenAt };
+}
+
+async function startJob(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino nao encontrado.');
+  const isTelegram = dest.platform === 'telegram';
+  // WhatsApp: 'bot' = robo envia sozinho; qualquer outra coisa = assistido (voce toca em enviar).
+  const mode = isTelegram ? 'auto' : (body.mode === 'bot' ? 'bot' : 'assisted');
+  const interval = Math.max(parseInt(body.interval_min, 10) || 0, (isTelegram || mode === 'bot') ? 2 : 1);
+  let maxSends = Math.min(Math.max(parseInt(body.max_sends, 10) || 20, 1), 500);
+  const manualIds = cleanManualIds(body.manual_ids);
+  if (manualIds.length) maxSends = manualIds.length; // ordem manual: para sozinho quando o ultimo da lista sair
+  const footer = String(body.footer || '').slice(0, 120);
+  const filters = {
+    group_ids: Array.isArray(body.group_ids) ? body.group_ids : [],
+    marketplace: body.marketplace || null,
+    min_score: Math.max(0, Math.min(100, Number(body.min_score) || 0)),
+    period: PERIODS.includes(body.period) ? body.period : '24h',
+    sort: body.sort === 'recent' ? 'recent' : 'score',
+    only_latest_scan: body.only_latest_scan !== false,
+    footer,
+    hour_from: parseHour(body.hour_from),
+    hour_to: parseHour(body.hour_to),
+  };
+  if (manualIds.length) filters.manual_ids = manualIds;
+  if (mode === 'bot') {
+    const waGroup = String(body.wa_group || dest.chat_id || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    if (!waGroup) return fail(res, 400, 'Informe o nome do grupo do WhatsApp (exatamente como aparece no WhatsApp) para o robo saber onde enviar.');
+    filters.wa_group = waGroup;
+    // guarda o nome no destino, para ja vir preenchido da proxima vez
+    if (waGroup !== dest.chat_id) await supabaseAdmin.from('dispatch_destinations').update({ chat_id: waGroup }).eq('id', dest.id);
+  }
+  // Disparo JA rodando para este destino (clique duplo, segunda aba, pagina ainda carregando): NAO zera o contador.
+  // Para recomecar do zero, pare primeiro.
+  {
+    const { data: existing } = await supabaseAdmin.from('dispatch_jobs').select('id, status').eq('destination_id', dest.id).maybeSingle();
+    if (existing && existing.status === 'running') {
+      const payload = await jobsPayload();
+      return res.status(200).json({ ...payload, alreadyRunning: true });
+    }
+  }
+  const nowIso = new Date().toISOString();
+  const row = {
+    destination_id: dest.id, mode, status: 'running',
+    interval_min: interval, max_sends: maxSends, sent_count: 0, next_run_at: nowIso, claimed_at: null,
+    filters,
+    pending: null, last_event: mode === 'bot' ? 'Disparo iniciado. Aguardando o robo buscar a primeira mensagem.' : 'Disparo iniciado.', last_error: null, error_streak: 0, updated_at: nowIso,
+  };
+  const { error } = await supabaseAdmin.from('dispatch_jobs').upsert(row, { onConflict: 'destination_id' });
+  if (error) {
+    if (mode === 'bot' && /check constraint|violates/i.test(String(error.message || ''))) {
+      return fail(res, 500, 'O banco ainda nao aceita o modo robo. Rode o SQL 0004_robo_whatsapp.sql no Supabase (SQL Editor) e tente de novo.');
+    }
+    return fail(res, 500, dbError(error));
+  }
+  res.status(200).json(await jobsPayload());
+}
+
+async function stopJob(res, body) {
+  const { error } = await supabaseAdmin.from('dispatch_jobs')
+    .update({ status: 'stopped', pending: null, claimed_at: null, last_event: 'Parado por voce.', updated_at: new Date().toISOString() })
+    .eq('destination_id', body.destination_id);
+  if (error) return fail(res, 500, dbError(error));
+  res.status(200).json(await jobsPayload());
+}
+
+// WhatsApp assistido: a pessoa abriu o WhatsApp -> conta como enviado e recomeca a contagem.
+async function ackJob(res, body) {
+  const { data: job, error } = await supabaseAdmin.from('dispatch_jobs').select('*').eq('destination_id', body.destination_id).maybeSingle();
+  if (error) return fail(res, 500, dbError(error));
+  if (job && job.pending) {
+    const sent = job.sent_count + 1;
+    const done = sent >= job.max_sends;
+    await supabaseAdmin.from('dispatch_jobs').update({
+      pending: null, sent_count: sent, status: done ? 'stopped' : 'running',
+      next_run_at: new Date(Date.now() + job.interval_min * 60000).toISOString(),
+      last_event: done ? `Meta de ${job.max_sends} envios atingida.` : `Aberto no WhatsApp: ${String(job.pending.title || '').slice(0, 60)}`,
+      last_error: null, updated_at: new Date().toISOString(),
+    }).eq('id', job.id);
+  }
+  res.status(200).json(await jobsPayload());
+}
+
+async function processJob(job) {
+  const nowIso = () => new Date().toISOString();
+  const finish = (patch) => supabaseAdmin.from('dispatch_jobs').update({ claimed_at: null, updated_at: nowIso(), ...patch }).eq('id', job.id);
+  let r;
+  try {
+    const dest = await getDestination(job.destination_id);
+    if (!dest) { await finish({ status: 'stopped', last_error: 'Destino removido.' }); return; }
+    const f = job.filters || {};
+    if (!inWindow(f)) {
+      const start = nextWindowStart(f);
+      await finish({ next_run_at: new Date(start).toISOString(), last_event: `Fora do horario (${f.hour_from}h-${f.hour_to}h): retomo as ${f.hour_from}h.`, last_error: null });
       return;
     }
-    const left = new Date(job.next_run_at).getTime() - serverNow();
-    const ev = job.last_event ? `<br>${escapeHtml(job.last_event)}` : '';
-    if (left > 0) {
-      const m = String(Math.floor(left / 60000)).padStart(2, '0');
-      const sec = String(Math.floor((left % 60000) / 1000)).padStart(2, '0');
-      box.innerHTML = `<span class="big">Próximo envio em ${m}:${sec}</span><br>${progress}${ev}${offline}`;
-    } else {
-      box.innerHTML = `<span class="big">Aguardando o robô buscar o próximo envio...</span><br>${progress}${ev}${offline}`;
-    }
-    alarmKey = null; stopAlarm(); openBtn.classList.add('hidden');
+    const fr = fakeRes();
+    await sendNext(fr, { destination_id: dest.id, group_ids: f.group_ids || [], marketplace: f.marketplace || null, min_score: f.min_score || 0, footer: f.footer || '', manual_ids: f.manual_ids || [], period: f.period, sort: f.sort, only_latest_scan: f.only_latest_scan });
+    r = { status: fr.code, json: fr.body || {} };
+  } catch (e) {
+    r = { status: 500, json: { error: e.message || 'erro inesperado' } };
+  }
+
+  const j = r.json;
+  const skippedTxt = j.skipped && j.skipped.length ? ` (${j.skipped.length} pulada(s) por problema no produto)` : '';
+
+  if (r.status === 200 && j.retry) {
+    await finish({ next_run_at: new Date(Date.now() + 15000).toISOString(), last_event: `Conferi ${j.skipped ? j.skipped.length : 8} produtos e nenhum servia (preco/link mudou); tento os proximos em instantes.`, last_error: null });
     return;
   }
-
-  if (job.pending) {
-    box.classList.remove('running'); box.classList.add('alert');
-    box.innerHTML = `<span class="big">\ud83d\udd14 PRONTA PARA ENVIAR</span><br>${escapeHtml(String(job.pending.title || '').slice(0, 90))}${job.pending.coupon ? ` \u00b7 cupom <b>${escapeHtml(job.pending.coupon)}</b>` : ''}<br>Restam ${job.pending.remaining} na fila. Aperte o bot\u00e3o (ou Enter), escolha o grupo e envie.`;
-    openBtn.classList.remove('hidden');
-    if (alarmKey !== job.pending.prepared_at) {
-      alarmKey = job.pending.prepared_at;
-      startAlarm(String(job.pending.title || ''));
-      try { navigator.clipboard.writeText(job.pending.message); } catch { /* ignora */ }
-    }
+  if (r.status === 200 && j.empty) {
+    await finish({ status: 'stopped', pending: null, last_event: 'A fila acabou: nao ha mais promocoes validas para esse filtro.' + skippedTxt });
     return;
   }
-
-  alarmKey = null; stopAlarm();
-  openBtn.classList.add('hidden');
-  box.classList.remove('alert'); box.classList.add('running');
-  const remaining = new Date(job.next_run_at).getTime() - serverNow();
-  const progress = `Enviados: ${job.sent_count}/${job.max_sends}`;
-  if (remaining > 0) {
-    const m = String(Math.floor(remaining / 60000)).padStart(2, '0');
-    const s = String(Math.floor((remaining % 60000) / 1000)).padStart(2, '0');
-    box.innerHTML = `<span class="big">Pr\u00f3ximo envio em ${m}:${s}</span><br>${progress}${job.last_event ? `<br>${escapeHtml(job.last_event)}` : ''}`;
-  } else {
-    box.innerHTML = `<span class="big">${job.mode === 'assisted' ? 'Preparando e conferindo o produto...' : 'Enviando...'}</span><br>${progress}`;
-  }
-}
-
-async function startRun() {
-  if (!loaded) { alert('Aguarde a p\u00e1gina terminar de carregar os disparos que j\u00e1 est\u00e3o rodando, depois clique de novo.'); return; }
-  if (selectedJob(false)) { alert('Esse destino j\u00e1 est\u00e1 com um disparo rodando. Para recome\u00e7ar do zero, pare primeiro.'); return; }
-  const dest = selectedDest();
-  if (!dest) { alert('Crie e selecione um destino.'); return; }
-  const wa = isWa(dest);
-  const mode = selectedMode();
-  const manual = mode === 'assisted';
-  const interval = parseInt($('interval').value, 10);
-  let maxSends = parseInt($('maxSends').value, 10) || 20;
-  const f = filters();
-  if (manualOn && !f.manual_ids.length) { alert('Você ligou a ordem manual, mas ainda não adicionou nenhum produto. Adicione os produtos na ordem que quer lançar (ou desligue a ordem manual).'); return; }
-  if (manualOn) maxSends = f.manual_ids.length;
-  const minInterval = manual ? WA_MIN_INTERVAL : MIN_INTERVAL;
-  if (!interval || interval < minInterval) { alert(`O intervalo m\u00ednimo \u00e9 ${minInterval} minuto(s).`); return; }
-  if (!manualOn && !f.group_ids.length) { alert('Marque pelo menos um grupo.'); return; }
-  const waGroup = $('waGroup').value.trim();
-  if (mode === 'bot' && !waGroup) { alert('Escreva o nome do grupo do WhatsApp, exatamente como aparece no WhatsApp.'); return; }
-  const hourFrom = $('hourFrom').value.trim();
-  const hourTo = $('hourTo').value.trim();
-  if ((hourFrom === '') !== (hourTo === '')) { alert('Preencha os dois horários (início e fim) ou deixe os dois em branco para enviar o dia todo.'); return; }
-  const janela = !manual && hourFrom !== '' ? `\nSó das ${hourFrom}h às ${hourTo}h (horário de Brasília).` : '';
-  const aviso = manual
-    ? 'A cada intervalo o sistema prepara a promo\u00e7\u00e3o e toca o alerta; voc\u00ea s\u00f3 abre e envia.'
-    : mode === 'bot'
-      ? `O robô envia sozinho no grupo "${waGroup}". Ele precisa estar aberto no notebook (ligado e com internet).${botOnline() ? '' : '\n\n⚠️ O robô NÃO está conectado agora — abra-o, senão nada será enviado.'}`
-      : 'O disparo fica salvo no servidor: pode recarregar a p\u00e1gina ou trocar de aba.';
-  const ordemTxt = manualOn ? `\n\nORDEM ESCOLHIDA (${manualOrder.length} produtos):\n` + manualOrder.slice(0, 6).map((x, i) => `${i + 1}) ${String(x.title).slice(0, 55)}`).join('\n') + (manualOrder.length > 6 ? `\n... e mais ${manualOrder.length - 6}` : '') : '';
-  if (!confirm(`Enviar 1 promo\u00e7\u00e3o a cada ${interval} min para "${dest.name}", at\u00e9 ${maxSends} envios.${janela}${ordemTxt}\n\n${aviso}\n\nCome\u00e7ar?`)) return;
-
-  if (activeNiche !== 'ALL' && activeNiche !== 'CUSTOM') {
-    const m = nicheDestMap(); m[activeNiche] = dest.id; localStorage.setItem('dispatcherNicheDest', JSON.stringify(m));
-  }
-  unlockAudio();
-  try { if (manual && 'Notification' in window && Notification.permission === 'default') await Notification.requestPermission(); } catch { /* ignora */ }
-  saveSettings();
-  try {
-    const started = await api({
-      action: 'job_start', destination_id: dest.id, interval_min: interval, max_sends: maxSends,
-      group_ids: f.group_ids, marketplace: f.marketplace, min_score: f.min_score, footer: f.footer, manual_ids: f.manual_ids,
-      mode: wa ? mode : undefined, wa_group: mode === 'bot' ? waGroup : undefined,
-      hour_from: manual || hourFrom === '' ? null : hourFrom, hour_to: manual || hourTo === '' ? null : hourTo,
-    });
-    applyJobs(started);
-    if (started.alreadyRunning) { log('Esse disparo j\u00e1 estava rodando: mantive a contagem de onde estava.', 'ok'); await loadAll(); return; }
-    log(`Disparo iniciado: 1 promo\u00e7\u00e3o a cada ${interval} min, at\u00e9 ${maxSends} envios.`, 'ok');
-    if (manual) beep();
-    await loadAll();
-  } catch (err) {
-    log(`\u26a0\ufe0f ${err.message}`, 'err');
-    alert(err.message);
-  }
-}
-
-async function stopRun() {
-  const job = selectedJob(false);
-  if (!job) return;
-  try {
-    applyJobs(await api({ action: 'job_stop', destination_id: job.destination_id }));
-    log('Disparo parado por voc\u00ea.');
-  } catch (err) { log(`\u26a0\ufe0f ${err.message}`, 'err'); }
-}
-
-// ---------- WhatsApp assistido ----------
-
-async function openNextWhatsApp() {
-  const dest = selectedDest();
-  if (!dest) return;
-  const f = filters();
-  const btn = $('waBtn');
-  btn.disabled = true;
-  $('statusBox').textContent = 'Preparando e conferindo o produto...';
-  try {
-    const r = await api({ action: 'send_next', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace, min_score: f.min_score, footer: f.footer, manual_ids: f.manual_ids });
-    if (manualOn) refreshManualStatus();
-    logSkipped(r.skipped);
-    if (r.empty) { $('statusBox').textContent = 'Fila vazia para esse filtro.'; return; }
-    localPending = { message: r.message, title: r.promotion.title, coupon: r.promotion.coupon, remaining: r.remaining };
-    const box = $('statusBox');
-    box.classList.add('alert');
-    box.innerHTML = `<span class="big">PRONTA PARA ENVIAR</span><br>${escapeHtml(r.promotion.title.slice(0, 90))}${r.promotion.coupon ? ` \u00b7 cupom <b>${escapeHtml(r.promotion.coupon)}</b>` : ''}<br>Restam ${r.remaining} na fila. Aperte o bot\u00e3o abaixo (ou Enter).`;
-    $('waOpenBtn').classList.remove('hidden');
-    log(`\ud83d\udcf1 Preparado para WhatsApp: ${r.promotion.title.slice(0, 70)}`, 'ok');
-    loadAll();
-  } catch (err) {
-    $('statusBox').textContent = `Erro: ${err.message}`;
-    log(`\u26a0\ufe0f ${err.message}`, 'err');
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-
-function logSkipped(list) {
-  (list || []).forEach((x) => log(`\u23ed\ufe0f Pulada: ${String(x.title).slice(0, 60)} \u2014 ${x.reason}`, 'err'));
-}
-
-// ---------- verificar fila (sem enviar) ----------
-
-async function verifyQueueUI() {
-  const dest = selectedDest();
-  if (!dest) { $('queueInfo').textContent = 'Crie um destino primeiro.'; return; }
-  $('queueInfo').textContent = 'Conferindo os pr\u00f3ximos produtos (abrindo cada link)... pode levar at\u00e9 1 minuto.';
-  $('verifyBtn').disabled = true;
-  try {
-    const f = filters();
-    const r = await api({ action: 'verify', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace, min_score: f.min_score, manual_ids: f.manual_ids });
-    let msg = `Conferidos ${r.checked} de ${r.total} na fila: ${r.ok} ok`;
-    if (r.removed.length) msg += `, ${r.removed.length} removidos (produto n\u00e3o existe mais)`;
-    if (r.warnings.length) msg += `. \u26a0\ufe0f ${r.warnings[0]}`;
-    $('queueInfo').textContent = msg + '.';
-    r.removed.forEach((x) => log(`\ud83d\uddd1\ufe0f Removida: ${String(x.title).slice(0, 60)} \u2014 ${x.reason}`, 'err'));
-  } catch (err) {
-    $('queueInfo').textContent = `Erro: ${err.message}`;
-  } finally {
-    $('verifyBtn').disabled = false;
-  }
-}
-
-// ---------- WhatsApp com alerta (semi-autom-tico) ----------
-// O WhatsApp n-o permite postar em grupo por API. Aqui o sistema prepara a mensagem no tempo certo,
-// toca um alarme + notifica--o, e voc- s- abre, escolhe o grupo e envia (1 toque).
-
-function beep() {
-  // Som suave: dois toques graves e curtos, tipo "gota" (sem aquele bipe agudo de alerta).
-  try {
-    if (!audioCtx) return;
-    const t0 = audioCtx.currentTime;
-    [[392, 0], [523.25, 0.32]].forEach(([freq, delay]) => { // sol -> do
-      const o = audioCtx.createOscillator();
-      const g = audioCtx.createGain();
-      o.type = 'sine'; o.frequency.value = freq;
-      g.gain.setValueAtTime(0.0001, t0 + delay);
-      g.gain.exponentialRampToValueAtTime(0.12, t0 + delay + 0.04);
-      g.gain.exponentialRampToValueAtTime(0.0001, t0 + delay + 1.1);
-      o.connect(g); g.connect(audioCtx.destination);
-      o.start(t0 + delay); o.stop(t0 + delay + 1.2);
-    });
-  } catch { /* sem \u00e1udio: segue */ }
-}
-
-function startAlarm(title) {
-  stopAlarm();
-  beep();
-  waAlarmTimer = setInterval(beep, 20000); // repete a cada 20s at\u00e9 voc\u00ea abrir
-  const original = document.title;
-  let on = false;
-  waTitleTimer = setInterval(() => { on = !on; document.title = on ? '\ud83d\udd14 ENVIAR AGORA!' : original; }, 800);
-  waTitleTimer.original = original;
-  try {
-    if ('Notification' in window && Notification.permission === 'granted') {
-      const n = new Notification('\ud83d\udcf1 Promo\u00e7\u00e3o pronta para enviar', { body: title.slice(0, 100), requireInteraction: true });
-      n.onclick = () => { window.focus(); n.close(); };
+  if (r.status === 200) {
+    if (job.mode === 'assisted') {
+      await finish({
+        pending: { message: j.message, title: j.promotion.title, coupon: j.promotion.coupon, link: j.promotion.link || null, remaining: j.remaining, prepared_at: nowIso() },
+        last_event: 'Promocao pronta para enviar.' + skippedTxt, last_error: null, error_streak: 0,
+      });
+      return;
     }
-  } catch { /* ignora */ }
-}
-
-function stopAlarm() {
-  if (waAlarmTimer) clearInterval(waAlarmTimer);
-  if (waTitleTimer) { clearInterval(waTitleTimer); document.title = waTitleTimer.original || document.title; }
-  waAlarmTimer = null; waTitleTimer = null;
-}
-
-function unlockAudio() {
-  try {
-    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-    if (audioCtx.state === 'suspended') audioCtx.resume();
-  } catch { /* sem \u00e1udio */ }
-}
-// O navegador s- libera som depois de um clique. Qualquer clique na p-gina j- destrava.
-['pointerdown', 'keydown'].forEach((ev) => document.addEventListener(ev, unlockAudio, { passive: true }));
-
-async function waOpenPending() {
-  const job = selectedJob(false);
-  const fromJob = !!(job && job.pending);
-  const pending = fromJob ? job.pending : localPending;
-  if (!pending) return;
-  const msg = pending.message;
-  const copyOnly = $('waCopyOnly').checked;
-  if (!copyOnly) window.open(whatsappUrl(msg), '_blank'); // dentro do clique, sen\u00e3o o navegador bloqueia
-  const copied = await copyMessage(msg);
-  stopAlarm(); alarmKey = null;
-  localPending = null;
-  $('waOpenBtn').classList.add('hidden');
-  $('statusBox').classList.remove('alert');
-  showHint(
-    copied
-      ? (copyOnly ? 'Mensagem copiada! V\u00e1 ao WhatsApp, abra o grupo, cole com Ctrl+V e envie.' : 'WhatsApp aberto e mensagem copiada. Escolha o grupo; se faltar emoji ou texto, cole com Ctrl+V.')
-      : 'N\u00e3o consegui copiar sozinho. Copie o texto abaixo e cole no grupo:',
-    copied ? null : msg,
-  );
-  log(`\ud83d\udcf1 Pronta no WhatsApp: ${String(pending.title || '').slice(0, 70)}`, 'ok');
-  if (fromJob) {
-    try { applyJobs(await api({ action: 'job_ack', destination_id: job.destination_id })); }
-    catch (err) { log(`\u26a0\ufe0f ${err.message}`, 'err'); }
-  }
-}
-
-document.addEventListener('keydown', (e) => {
-  const job = selectedJob(false);
-  if (((job && job.pending) || localPending) && e.key === 'Enter' && document.activeElement && !['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(document.activeElement.tagName)) {
-    e.preventDefault(); waOpenPending();
-  }
-});
-
-// ---------- ordem manual dos produtos ----------
-// Voce escolhe os produtos e a sequencia; o servidor dispara exatamente nessa ordem. A ordem fica salva no navegador
-// (por destino) enquanto nao inicia, e dentro do disparo (no servidor) depois que inicia.
-
-function manualKey() { const d = selectedDest(); return d ? `dispatcherManualOrder:${d.id}` : null; }
-function manualLoadLocal() {
-  manualStatus = {}; manualNext = null;
-  const k = manualKey();
-  try { manualOrder = k ? JSON.parse(localStorage.getItem(k) || '[]') : []; } catch { manualOrder = []; }
-  if (!Array.isArray(manualOrder)) manualOrder = [];
-}
-function manualSave() { const k = manualKey(); if (k) { try { localStorage.setItem(k, JSON.stringify(manualOrder)); } catch { /* ignora */ } } }
-
-const brl = (n) => 'R$ ' + Number(n).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-function itemMeta(x) {
-  const parts = [];
-  if (x.marketplace) parts.push(escapeHtml(x.marketplace));
-  if (x.price != null) parts.push(`<b>${brl(x.price)}</b>${x.previous_price ? ` <s>${brl(x.previous_price)}</s>` : ''}`);
-  if (x.discount) parts.push(`${Math.round(x.discount)}% OFF`);
-  if (x.score != null) parts.push(x.score >= 68 ? `🔥 ${x.score}` : `nota ${x.score}`);
-  parts.push(`cód. <span class="mcode">${escapeHtml(x.code || '')}</span>`);
-  return parts.join(' · ');
-}
-
-function renderManual() {
-  const box = $('manualBox');
-  if (!box) return;
-  const busy = !!selectedJob(false);
-  box.classList.toggle('busy', busy);
-  const av = $('manualAvail'); const od = $('manualOrder');
-  const avTop = av.scrollTop; const odTop = od.scrollTop;
-  const inOrder = new Set(manualOrder.map((x) => x.id));
-
-  const q = $('manualSearch').value.trim().toLowerCase();
-  const shown = manualAvail.filter((x) => !q || `${x.title} ${x.code} ${x.marketplace || ''}`.toLowerCase().includes(q));
-  $('manualAvailCount').textContent = manualAvail.length ? `${shown.length} de ${manualAvail.length}` : '';
-  av.innerHTML = !manualAvail.length
-    ? '<div class="mempty">Clique em <b>Carregar / atualizar</b> para ver os produtos que estão prontos para disparo (com link de afiliado).</div>'
-    : (shown.length ? shown.map((x) => `
-      <div class="mrow ${inOrder.has(x.id) ? 'done' : ''}">
-        <div class="minfo"><div class="mtitle" title="${escapeHtml(x.title)}">${escapeHtml(x.title)}</div><div class="mmeta">${itemMeta(x)}</div></div>
-        ${inOrder.has(x.id) ? '<span class="mbadge">na ordem</span>' : `<div class="mbtns manual-act"><button type="button" data-madd="${escapeHtml(x.id)}">+ Adicionar</button></div>`}
-      </div>`).join('') : '<div class="mempty">Nenhum produto com esse texto.</div>');
-
-  const total = manualOrder.length;
-  const pendingCount = manualOrder.filter((x) => !manualStatus[x.id] || manualStatus[x.id].state === 'pending').length;
-  $('manualOrderCount').textContent = total ? `${total} produto(s) · ${pendingCount} por enviar` : '';
-  od.innerHTML = !total
-    ? '<div class="mempty">Nenhum produto na ordem ainda. Adicione na lista ao lado: o primeiro que você adicionar será o primeiro a sair.</div>'
-    : manualOrder.map((x, i) => {
-      const st = manualStatus[x.id] || { state: 'pending' };
-      const isNext = manualNext === x.id;
-      let badge = '';
-      if (st.state === 'sent') badge = '<span class="mbadge sent">✅ enviado</span>';
-      else if (st.state === 'skipped') badge = `<span class="mbadge skipped" title="${escapeHtml(st.reason || '')}">⏭️ pulado</span>`;
-      else if (st.state === 'unavailable') badge = `<span class="mbadge unavailable" title="${escapeHtml(st.reason || '')}">⚠️ indisponível</span>`;
-      else if (isNext && busy) badge = '<span class="mbadge next">▶ PRÓXIMO</span>';
-      else badge = '<span class="mbadge">⏳ aguardando</span>';
-      const why = st.reason ? `<div class="mmeta" style="color:var(--bad)">${escapeHtml(st.reason)}</div>` : '';
-      return `<div class="mrow ${isNext ? 'next' : ''} ${st.state === 'sent' ? 'done' : ''}">
-        <div class="mpos">${i + 1}º</div>
-        <div class="minfo"><div class="mtitle" title="${escapeHtml(x.title)}">${escapeHtml(x.title)}</div><div class="mmeta">${itemMeta(x)}</div>${why}</div>
-        ${badge}
-        <div class="mbtns manual-act">
-          <button type="button" title="Mover para o início" data-mact="top" data-i="${i}">⤒</button>
-          <button type="button" title="Subir" data-mact="up" data-i="${i}">↑</button>
-          <button type="button" title="Descer" data-mact="down" data-i="${i}">↓</button>
-          <button type="button" title="Tirar da ordem" data-mact="del" data-i="${i}">✕</button>
-        </div>
-      </div>`;
-    }).join('');
-  av.scrollTop = avTop; od.scrollTop = odTop;
-}
-
-function manualChanged() { manualSave(); renderManual(); scheduleManualStatus(); $('queueInfo').textContent = ''; }
-
-function manualAdd(id) {
-  if (manualOrder.some((x) => x.id === id)) return;
-  const item = manualAvail.find((x) => x.id === id);
-  if (!item) return;
-  manualOrder.push(item);
-  manualChanged();
-}
-
-function manualMove(i, act) {
-  if (i < 0 || i >= manualOrder.length) return;
-  if (act === 'del') manualOrder.splice(i, 1);
-  else if (act === 'top') manualOrder.unshift(manualOrder.splice(i, 1)[0]);
-  else if (act === 'up' && i > 0) [manualOrder[i - 1], manualOrder[i]] = [manualOrder[i], manualOrder[i - 1]];
-  else if (act === 'down' && i < manualOrder.length - 1) [manualOrder[i + 1], manualOrder[i]] = [manualOrder[i], manualOrder[i + 1]];
-  manualChanged();
-}
-
-async function loadManualCandidates() {
-  const dest = selectedDest();
-  if (!dest) { $('manualMsg').textContent = 'Crie e selecione um destino primeiro.'; return; }
-  $('manualMsg').textContent = 'Carregando os produtos disponíveis...';
-  $('manualLoadBtn').disabled = true;
-  try {
-    const f = filters();
-    const r = await api({ action: 'manual_candidates', destination_id: dest.id, group_ids: f.group_ids, marketplace: f.marketplace, min_score: f.min_score });
-    manualAvail = r.items || [];
-    // atualiza preco/dados de quem ja esta na ordem
-    const fresh = new Map(manualAvail.map((x) => [x.id, x]));
-    manualOrder = manualOrder.map((x) => fresh.get(x.id) || x);
-    manualSave();
-    $('manualMsg').textContent = r.total > manualAvail.length ? `Mostrando ${manualAvail.length} de ${r.total} (os de maior nota primeiro). Use a busca para achar outros.` : (manualAvail.length ? '' : 'Nenhum produto disponível com esses filtros. Rode uma busca no Painel geral, ou mude "Qualidade mínima" para "Tudo".');
-    renderManual();
-    refreshManualStatus();
-  } catch (err) {
-    $('manualMsg').textContent = `Erro: ${err.message}`;
-  } finally {
-    $('manualLoadBtn').disabled = false;
-  }
-}
-
-function scheduleManualStatus() {
-  if (manualStatusTimer) clearTimeout(manualStatusTimer);
-  manualStatusTimer = setTimeout(refreshManualStatus, 400);
-}
-
-async function refreshManualStatus() {
-  const dest = selectedDest();
-  if (!manualOn || !dest || !manualOrder.length) { manualStatus = {}; manualNext = null; renderManual(); return; }
-  try {
-    const r = await api({ action: 'manual_status', destination_id: dest.id, ids: manualOrder.map((x) => x.id) });
-    const byId = new Map((r.items || []).map((x) => [x.id, x]));
-    manualOrder = manualOrder.map((x) => { const n = byId.get(x.id); return n ? { id: n.id, title: n.title, marketplace: n.marketplace, price: n.price, previous_price: n.previous_price, discount: n.discount, score: n.score, code: n.code } : x; });
-    manualStatus = {}; (r.items || []).forEach((x) => { manualStatus[x.id] = { state: x.state, reason: x.reason }; });
-    manualNext = r.next || null;
-    manualSave();
-    renderManual();
-  } catch { /* sem resposta: mantem o que ja esta na tela */ }
-}
-
-$('manualOn').addEventListener('change', () => {
-  manualOn = $('manualOn').checked;
-  $('manualBox').classList.toggle('hidden', !manualOn);
-  saveSettings();
-  if (manualOn) { renderManual(); if (!manualAvail.length) loadManualCandidates(); else refreshManualStatus(); }
-  $('queueInfo').textContent = '';
-});
-$('manualLoadBtn').addEventListener('click', loadManualCandidates);
-$('manualAddAllBtn').addEventListener('click', () => {
-  const q = $('manualSearch').value.trim().toLowerCase();
-  const have = new Set(manualOrder.map((x) => x.id));
-  manualAvail.filter((x) => !have.has(x.id) && (!q || `${x.title} ${x.code} ${x.marketplace || ''}`.toLowerCase().includes(q))).forEach((x) => manualOrder.push(x));
-  manualChanged();
-});
-$('manualClearBtn').addEventListener('click', () => { if (!manualOrder.length || confirm('Limpar toda a ordem de disparo?')) { manualOrder = []; manualChanged(); } });
-$('manualSearch').addEventListener('input', renderManual);
-$('manualAvail').addEventListener('click', (e) => { const b = e.target.closest('[data-madd]'); if (b) manualAdd(b.dataset.madd); });
-$('manualOrder').addEventListener('click', (e) => { const b = e.target.closest('[data-mact]'); if (b) manualMove(parseInt(b.dataset.i, 10), b.dataset.mact); });
-
-// ---------- eventos ----------
-
-$('newPlatform').addEventListener('change', () => {
-  document.querySelectorAll('.tg-only').forEach((el) => el.classList.toggle('hidden', $('newPlatform').value !== 'telegram'));
-  document.querySelectorAll('.new-wa').forEach((el) => el.classList.toggle('hidden', $('newPlatform').value !== 'whatsapp_manual'));
-});
-$('addDestBtn').addEventListener('click', addDestination);
-$('nicheTabs').addEventListener('click', (e) => { const b = e.target.closest('[data-niche]'); if (b) setNiche(b.dataset.niche); });
-$('groupBox').addEventListener('change', () => { activeNiche = 'CUSTOM'; renderNicheTabs(); saveSettings(); });
-$('destSelect').addEventListener('change', () => { const d = selectedDest(); $('waGroup').value = d && d.chat_id && isWa(d) ? d.chat_id : ''; manualLoadLocal(); applyJobToUI(); renderManual(); refreshManualStatus(); forceNicheGroups(); renderNicheTabs(); updateModeUI(); renderJob(); saveSettings(); $('queueInfo').textContent = ''; });
-$('waMode').addEventListener('change', () => { updateModeUI(); renderJob(); saveSettings(); });
-
-// Atualiza a luzinha "robo conectado" mesmo sem disparo rodando.
-setInterval(async () => {
-  if (selectedMode() !== 'bot') return;
-  try { const d = await fetchJson('/api/dispatch'); if (d.botSeenAt !== undefined) botSeenAt = d.botSeenAt; if (d.now) serverOffset = new Date(d.now).getTime() - Date.now(); renderBotStatus(); } catch { /* ignora */ }
-}, 20000);
-$('queueBtn').addEventListener('click', refreshQueue);
-$('testBtn').addEventListener('click', () => { const d = selectedDest(); if (d) testDestination(d.id); });
-$('startBtn').addEventListener('click', startRun);
-$('stopBtn').addEventListener('click', stopRun);
-$('waBtn').addEventListener('click', openNextWhatsApp);
-$('waStartBtn').addEventListener('click', startRun);
-$('waStopBtn').addEventListener('click', stopRun);
-$('waOpenBtn').addEventListener('click', waOpenPending);
-$('verifyBtn').addEventListener('click', verifyQueueUI);
-$('waCopyOnly').addEventListener('change', saveSettings);
-
-loadAll();
-
-</script>
-  <script>
-    document.getElementById('logoutLink').addEventListener('click', async () => {
-      await fetch('/api/auth/session', { method: 'DELETE' });
-      window.location.href = '/login.html';
+    const sent = job.sent_count + 1;
+    const done = sent >= job.max_sends;
+    const t = (j.sent && j.sent.title ? j.sent.title : '').slice(0, 70);
+    await finish({
+      sent_count: sent, status: done ? 'stopped' : 'running',
+      next_run_at: new Date(Date.now() + job.interval_min * 60000).toISOString(),
+      last_event: (done ? `Meta de ${job.max_sends} envios atingida. ` : '') + `Enviado: ${t}${j.sent && j.sent.coupon ? ` (cupom ${j.sent.coupon})` : ''}${j.sent && j.sent.link ? ` \u2192 ${String(j.sent.link).slice(0, 80)}` : ''}${skippedTxt}`,
+      last_error: null, error_streak: 0,
     });
-  </script>
-</body>
-</html>
+    return;
+  }
+  // erros
+  const code = j.code;
+  const msg = j.error || 'Falha ao enviar.';
+  if (code === 'daily_limit' || code === 'bad_link') { await finish({ status: 'stopped', pending: null, last_error: msg }); return; }
+  if (code === 'duplicate') { await finish({ next_run_at: new Date(Date.now() + 5000).toISOString(), last_event: 'Pulei uma promocao que ja tinha sido enviada.', last_error: null }); return; }
+  if (code === 'rate_limited') { await finish({ next_run_at: new Date(Date.now() + ((j.retryAfter || 60) + 1) * 1000).toISOString(), last_error: msg }); return; }
+  const streak = (job.error_streak || 0) + 1;
+  if (streak >= 30) { await finish({ status: 'stopped', error_streak: streak, last_error: `${msg} (parei apos 30 falhas seguidas)` }); return; }
+  await finish({ next_run_at: new Date(Date.now() + 60000).toISOString(), error_streak: streak, last_error: msg });
+}
+
+// Roda os disparos que ja estao na hora. Pode ser chamado pela pagina aberta ou por um "relogio" externo.
+async function tickJobs() {
+  const nowIso = new Date().toISOString();
+  const { data: due, error } = await supabaseAdmin.from('dispatch_jobs').select('*')
+    .eq('status', 'running').neq('mode', 'bot').is('pending', null).lte('next_run_at', nowIso).limit(3);
+  if (error) throw new Error(dbError(error));
+  const work = [];
+  for (const j of due || []) {
+    const stale = new Date(Date.now() - CLAIM_STALE_MS).toISOString();
+    // "trava" atomica: so quem conseguir marcar o claimed_at executa (evita envio duplicado)
+    const { data: claimed } = await supabaseAdmin.from('dispatch_jobs').update({ claimed_at: nowIso })
+      .eq('id', j.id).eq('status', 'running').lte('next_run_at', nowIso)
+      .or(`claimed_at.is.null,claimed_at.lt.${stale}`).select().maybeSingle();
+    if (claimed) work.push(processJob(claimed));
+  }
+  await Promise.all(work);
+}
+
+
+// ---------------- WhatsApp 100% automatico (robo no notebook) ----------------
+// O robo consulta bot_poll de tempos em tempos. Se ha um envio na hora, o servidor escolhe e confere a
+// promocao, grava no registro (assim ela nunca se repete) e entrega a mensagem pronta; o robo envia no
+// WhatsApp e confirma com bot_ack. Sem o robo ligado nada e enviado — o disparo apenas espera.
+
+function botDeliver(job) {
+  const p = job.pending;
+  return { job_id: job.id, group: p.group, message: p.message, image_url: p.image_url || null, title: p.title };
+}
+
+async function prepareForBot(job) {
+  const nowIso = () => new Date().toISOString();
+  const release = (patch) => supabaseAdmin.from('dispatch_jobs').update({ claimed_at: null, updated_at: nowIso(), ...patch }).eq('id', job.id);
+  try {
+    const dest = await getDestination(job.destination_id);
+    if (!dest) { await release({ status: 'stopped', last_error: 'Destino removido.' }); return null; }
+    const f = job.filters || {};
+    const group = String(f.wa_group || dest.chat_id || '').trim();
+    if (!group) { await release({ status: 'stopped', last_error: 'Falta o nome do grupo do WhatsApp.' }); return null; }
+
+    const prep = await prepareNext(dest, { group_ids: f.group_ids || [], marketplace: f.marketplace || null, min_score: f.min_score || 0, footer: f.footer || '', manual_ids: f.manual_ids || [], period: f.period, sort: f.sort, only_latest_scan: f.only_latest_scan });
+    if (prep.error) {
+      const code = prep.error.extra && prep.error.extra.code;
+      if (code === 'daily_limit' || code === 'bad_link') { await release({ status: 'stopped', pending: null, last_error: prep.error.message }); return null; }
+      await release({ next_run_at: new Date(Date.now() + 60000).toISOString(), last_error: prep.error.message });
+      return null;
+    }
+    const skippedTxt = prep.skipped && prep.skipped.length ? ` (${prep.skipped.length} pulada(s) por problema no produto)` : '';
+    if (prep.retry) {
+      await release({ next_run_at: new Date(Date.now() + 15000).toISOString(), last_event: 'Conferi varios produtos e nenhum servia; tento os proximos em instantes.', last_error: null });
+      return null;
+    }
+    if (prep.empty) {
+      await release({ status: 'stopped', pending: null, last_event: 'A fila acabou: nao ha mais promocoes validas para esse filtro.' + skippedTxt });
+      return null;
+    }
+
+    const message = toWhatsApp(prep.html);
+    // Registra JA, antes do robo enviar: se o robo cair no meio, a promocao nao se repete depois.
+    const { data: logRow, error: logErr } = await supabaseAdmin.from('dispatch_log')
+      .insert({ destination_id: dest.id, promotion_id: prep.chosen.id, skipped: false, message }).select('id').maybeSingle();
+    if (logErr) {
+      // Sem registro nao ha como garantir "nunca repete": nao entrega ao robo. Duplicata = ja foi enviada; tenta a proxima logo.
+      await release({ next_run_at: new Date(Date.now() + (isDupError(logErr) ? 5000 : 60000)).toISOString(), last_error: isDupError(logErr) ? null : `Nao consegui registrar o envio: ${logErr.message}`.slice(0, 200) });
+      return null;
+    }
+    const imageUrl = prep.chosen.image_url && /^https:\/\//i.test(prep.chosen.image_url) ? prep.chosen.image_url : null;
+    const pending = {
+      log_id: logRow ? logRow.id : null, message, image_url: imageUrl, title: prep.chosen.title,
+      coupon: prep.view.coupon || null, link: prep.chosen.affiliate_url || null, remaining: prep.remaining, group, prepared_at: nowIso(), delivered_at: nowIso(),
+    };
+    await release({ pending, last_event: `Entregue ao robo: ${String(prep.chosen.title).slice(0, 60)}${skippedTxt}`, last_error: null });
+    return botDeliver({ id: job.id, pending });
+  } catch (e) {
+    await release({ next_run_at: new Date(Date.now() + 60000).toISOString(), last_error: e.message || 'erro inesperado' });
+    return null;
+  }
+}
+
+async function botPoll(res) {
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  // "estou vivo": a tela mostra se o robo esta conectado (coluna do SQL 0004; se faltar, so ignora)
+  await supabaseAdmin.from('dispatch_destinations').update({ bot_seen_at: nowIso }).eq('platform', 'whatsapp_manual');
+
+  const { data: jobs, error } = await supabaseAdmin.from('dispatch_jobs').select('*')
+    .eq('status', 'running').eq('mode', 'bot').order('next_run_at', { ascending: true });
+  if (error) return fail(res, 500, dbError(error));
+
+  let sleep = 60; // segundos ate o robo voltar a perguntar (no maximo 60, para reagir rapido a um novo "Iniciar")
+  for (const job of jobs || []) {
+    const f = job.filters || {};
+
+    // 1) mensagem ja entregue e ainda sem confirmacao (robo reiniciou no meio): entrega de novo
+    if (job.pending && job.pending.message) {
+      const age = nowMs - new Date(job.pending.prepared_at).getTime();
+      const sinceDelivery = job.pending.delivered_at ? nowMs - new Date(job.pending.delivered_at).getTime() : 0;
+      // Reentrega so nos primeiros 90s (resposta perdida na rede). Depois disso o robo pode ter enviado e so nao
+      // confirmou: reenviar DUPLICARIA a mensagem no grupo. Prefere pular a repetir.
+      if (age < BOT_PENDING_MAX_MS && sinceDelivery <= 90 * 1000) return res.status(200).json(botDeliver(job));
+      await supabaseAdmin.from('dispatch_jobs').update({
+        pending: null, claimed_at: null, next_run_at: new Date(nowMs + jitteredMs(job.interval_min)).toISOString(),
+        last_event: 'O robo nao confirmou o envio anterior; para nao repetir mensagem no grupo, segui para o proximo.', updated_at: nowIso,
+      }).eq('id', job.id);
+      continue;
+    }
+
+    // 2) ainda nao e a hora
+    const due = new Date(job.next_run_at).getTime();
+    if (due > nowMs) { sleep = Math.min(sleep, Math.max(Math.ceil((due - nowMs) / 1000), 5)); continue; }
+
+    // 3) fora do horario escolhido: espera a janela abrir
+    if (!inWindow(f, nowMs)) {
+      await supabaseAdmin.from('dispatch_jobs').update({
+        next_run_at: new Date(nextWindowStart(f, nowMs)).toISOString(),
+        last_event: `Fora do horario (${f.hour_from}h-${f.hour_to}h): retomo as ${f.hour_from}h.`, updated_at: nowIso,
+      }).eq('id', job.id);
+      continue;
+    }
+
+    // 4) "trava" atomica: so uma consulta prepara o envio (evita mensagem em dobro)
+    const stale = new Date(nowMs - CLAIM_STALE_MS).toISOString();
+    const { data: claimed } = await supabaseAdmin.from('dispatch_jobs').update({ claimed_at: nowIso })
+      .eq('id', job.id).eq('status', 'running').is('pending', null).lte('next_run_at', nowIso)
+      .or(`claimed_at.is.null,claimed_at.lt.${stale}`).select().maybeSingle();
+    if (!claimed) continue;
+
+    const out = await prepareForBot(claimed);
+    if (out) return res.status(200).json(out);
+  }
+  res.status(200).json({ idle: true, sleep });
+}
+
+// O robo avisa o resultado do envio.
+async function botAck(res, body) {
+  const { data: job, error } = await supabaseAdmin.from('dispatch_jobs').select('*').eq('id', body.job_id).maybeSingle();
+  if (error) return fail(res, 500, dbError(error));
+  if (!job || !job.pending) return res.status(200).json({ ok: true });
+  const p = job.pending;
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+
+  if (body.ok) {
+    const sent = job.sent_count + 1;
+    const done = sent >= job.max_sends;
+    await supabaseAdmin.from('dispatch_jobs').update({
+      pending: null, claimed_at: null, sent_count: sent, status: done ? 'stopped' : 'running',
+      next_run_at: new Date(nowMs + jitteredMs(job.interval_min)).toISOString(),
+      last_event: (done ? `Meta de ${job.max_sends} envios atingida. ` : '') + `Enviado: ${String(p.title || '').slice(0, 70)}${p.coupon ? ` (cupom ${p.coupon})` : ''}${p.link ? ` \u2192 ${String(p.link).slice(0, 80)}` : ''}`,
+      last_error: null, error_streak: 0, updated_at: nowIso,
+    }).eq('id', job.id);
+    return res.status(200).json({ ok: true });
+  }
+
+  // falhou
+  const reason = String(body.error || 'falha desconhecida').slice(0, 200);
+  const fatal = body.fatal === true; // grupo nao encontrado / WhatsApp desconectado: nao adianta tentar de novo
+  if (p.log_id) {
+    // erro do robo (nao do produto): em falha fatal a promocao volta a ficar disponivel; nas demais, fica marcada como pulada
+    if (fatal) await supabaseAdmin.from('dispatch_log').delete().eq('id', p.log_id);
+    else await supabaseAdmin.from('dispatch_log').update({ skipped: true, message: `falhou no robo: ${reason}` }).eq('id', p.log_id);
+  }
+  const streak = (job.error_streak || 0) + 1;
+  const stop = fatal || streak >= 5;
+  await supabaseAdmin.from('dispatch_jobs').update({
+    pending: null, claimed_at: null, status: stop ? 'stopped' : 'running',
+    next_run_at: new Date(nowMs + 2 * 60000).toISOString(), error_streak: streak,
+    last_error: stop && !fatal ? `${reason} (parei apos 5 falhas seguidas)` : reason, updated_at: nowIso,
+  }).eq('id', job.id);
+  res.status(200).json({ ok: true });
+}
+
+module.exports = async function handler(req, res) {
+  if (LOAD_ERROR) return res.status(500).json({ error: LOAD_ERROR, version: VERSION });
+  try {
+    // Chave do robo (DISPATCH_BOT_KEY, definida na Vercel): quem chega so com a chave (sem login no painel)
+    // pode apenas consultar/confirmar envios — nada de listar destinos, ler tokens ou mexer em disparos.
+    const botKey = process.env.DISPATCH_BOT_KEY;
+    const viaKey = !!botKey && req.headers['x-bot-key'] === botKey;
+    if (viaKey && !(req.method === 'POST' && req.body && (req.body.action === 'bot_poll' || req.body.action === 'bot_ack'))) {
+      return fail(res, 403, 'A chave do robo so pode usar bot_poll e bot_ack.');
+    }
+
+    if (req.method === 'GET') {
+      if (req.query && req.query.tick) { await tickJobs(); return res.status(200).json({ ok: true }); }
+      return await listDestinations(res);
+    }
+    if (req.method !== 'POST') return fail(res, 405, 'M\u00e9todo n\u00e3o permitido.');
+
+    const body = req.body || {};
+    switch (body.action) {
+      case 'create_destination': return await createDestination(res, body);
+      case 'delete_destination': {
+        const { error } = await supabaseAdmin.from('dispatch_destinations').delete().eq('id', body.id);
+        if (error) return fail(res, 500, dbError(error));
+        return res.status(200).json({ ok: true });
+      }
+      case 'test': return await sendTest(res, body);
+      case 'queue': return await queue(res, body);
+      case 'verify': return await verifyQueue(res, body);
+      case 'manual_candidates': return await manualCandidates(res, body);
+      case 'manual_status': return await manualStatus(res, body);
+      case 'job_start': return await startJob(res, body);
+      case 'job_stop': return await stopJob(res, body);
+      case 'job_ack': return await ackJob(res, body);
+      case 'tick': await tickJobs(); return res.status(200).json(await jobsPayload());
+      case 'bot_poll': return await botPoll(res);
+      case 'bot_ack': return await botAck(res, body);
+      case 'send_next': return await sendNext(res, body);
+      default: return fail(res, 400, 'A\u00e7\u00e3o inv\u00e1lida.');
+    }
+  } catch (err) {
+    console.error('dispatch error', err);
+    fail(res, 500, err.message || 'Erro inesperado no disparador.');
+  }
+};
