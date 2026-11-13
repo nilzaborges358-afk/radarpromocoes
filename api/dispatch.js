@@ -1,4 +1,4 @@
-const VERSION = 'dispatch-v2026-11-12.1';
+const VERSION = 'dispatch-v2026-11-12.2';
 
 // Carregamento protegido: se alguma peca faltar no deploy, a API responde dizendo QUAL (em vez de cair com erro 500).
 let supabaseAdmin = null;
@@ -235,6 +235,29 @@ async function getDestination(id) {
   return data;
 }
 
+// ---------------- periodo da fila (igual ao filtro de data do Painel geral) ----------------
+// today_new  = "Hoje (novas)": so o que foi achado pela PRIMEIRA vez hoje (padrao do Painel geral)
+// today_seen = "Hoje (todas as vistas)": inclui produto antigo que a busca viu de novo hoje
+// 3h         = visto pela busca nas ultimas 3 horas (a busca que voce acabou de fazer)
+// 24h        = visto nas ultimas 24 horas (comportamento antigo; e o padrao de quem nao informa o periodo)
+const PERIODS = ['today_new', 'today_seen', '3h', '24h'];
+function brtDayStartMs(ms = Date.now()) {
+  const b = new Date(ms - 3 * 3600 * 1000); // hora de Brasilia (UTC-3)
+  return Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate()) + 3 * 3600 * 1000;
+}
+
+// Nome do nicho (grupo da busca) de cada promocao, para a tela mostrar de onde o produto veio.
+async function attachGroups(list) {
+  try {
+    const need = (list || []).filter((p) => p && p.watch_group_id);
+    if (!need.length) return list;
+    const { data } = await supabaseAdmin.from('watch_groups').select('id, name');
+    const map = new Map((data || []).map((g) => [g.id, g.name]));
+    need.forEach((p) => { p._group = map.get(p.watch_group_id) || null; });
+  } catch { /* sem nome de grupo: segue */ }
+  return list;
+}
+
 // ---------------- ordem manual (voce escolhe quais produtos saem e em que sequencia) ----------------
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -270,6 +293,9 @@ function manualMeta(p) {
     discount: p.discount_rate ? Number(p.discount_rate) : null,
     score: p._score != null ? p._score : null,
     code: codeOf(p),
+    group: p._group || null, keyword: p.matched_keyword || null,
+    detected_at: p.detected_at || null, last_seen_at: p.last_seen_at || null,
+    original_url: p.original_url || null, affiliate_url: p.affiliate_url || null,
   };
 }
 
@@ -294,6 +320,7 @@ async function loadManualQueue(destId, ids) {
     .eq('destination_id', destId).gte('sent_at', isoAgo(NO_REPEAT_DAYS * DAY));
   if (logErr) throw new Error(dbError(logErr));
   const already = new Set((logs || []).map((l) => l.promotion_id));
+  await attachGroups(rows);
   const byId = new Map(rows.map((p) => [p.id, p]));
   return wanted.map((id) => byId.get(id)).filter((p) => p && !already.has(p.id) && /^https?:\/\//i.test(p.affiliate_url || ''));
 }
@@ -303,6 +330,13 @@ async function loadQueue(destId, body) {
   if (manualIds.length) return loadManualQueue(destId, manualIds);
   const groupIds = Array.isArray(body.group_ids) ? body.group_ids : [];
   const since = isoAgo(QUEUE_DAYS_SEEN * DAY);
+  // Periodo igual ao do Painel geral (padrao de quem nao informa: 24h, como antes).
+  const period = PERIODS.includes(body.period) ? body.period : '24h';
+  const onlyLatest = body.only_latest_scan !== false;           // "so o que a ultima busca do nicho confirmou"
+  const dayStartIso = new Date(brtDayStartMs()).toISOString();
+  const seenSince = (period === 'today_new' || period === 'today_seen') ? dayStartIso : (period === '3h' ? isoAgo(3 * 3600 * 1000) : since);
+  const stats = body._stats || {};
+  Object.assign(stats, { period_total: 0, already: 0, not_latest: 0, suspicious: 0, low_score: 0, similar: 0, no_link: 0 });
 
   const lc = lifecycle();
   const hasEnded = !!(lc && await lc.endedSupported(supabaseAdmin)); // promocao finalizada nunca entra na fila
@@ -312,12 +346,22 @@ async function loadQueue(destId, body) {
     .not('affiliate_url', 'is', null)
     .neq('status', 'IGNORED')
     .gt('current_price', 0)
-    .or(`last_seen_at.gte.${since},and(last_seen_at.is.null,detected_at.gte.${since})`)
     .order('last_seen_at', { ascending: false, nullsFirst: false })
     .limit(1000);
+  const withPeriod = (qq) => (period === 'today_new' ? qq.gte('detected_at', dayStartIso) : qq.or(`last_seen_at.gte.${seenSince},and(last_seen_at.is.null,detected_at.gte.${seenSince})`));
+  q = withPeriod(q);
   if (hasEnded) q = q.is('ended_at', null);
   const { data, error } = await q;
   if (error) throw new Error(dbError(error));
+
+  // Achadas no periodo que ainda NAO tem link de afiliado: aparecem no Painel geral, mas nao entram no disparo.
+  try {
+    let nl = supabaseAdmin.from('promotions').select('id', { count: 'exact', head: true }).is('affiliate_url', null).neq('status', 'IGNORED').gt('current_price', 0);
+    nl = withPeriod(nl);
+    if (hasEnded) nl = nl.is('ended_at', null);
+    const nlr = await nl;
+    stats.no_link = nlr && nlr.count ? nlr.count : 0;
+  } catch { /* so diagnostico */ }
 
   const { data: logs, error: logErr } = await supabaseAdmin
     .from('dispatch_log').select('promotion_id, skipped').eq('destination_id', destId).gte('sent_at', isoAgo(NO_REPEAT_DAYS * DAY));
@@ -350,15 +394,16 @@ async function loadQueue(destId, body) {
   const mp = body.marketplace || null;
 
   let list = (data || []).filter((p) => {
-    if (already.has(p.id)) return false;
-    if (!inLatestScan(p)) return false;
-    if (suspiciousDiscount(p)) return false;
     if (!/^https?:\/\//i.test(p.affiliate_url || '')) return false;
     if (mp && (!p.marketplaces || p.marketplaces.slug !== mp)) return false;
     if (groupIds.length) {
       if (p.watch_group_id) { if (!groupIds.includes(p.watch_group_id)) return false; }
       else if (!wantNone) return false;
     }
+    stats.period_total += 1;                                       // do periodo, com link, no marketplace/nicho escolhido
+    if (already.has(p.id)) { stats.already += 1; return false; }  // ja enviada a este destino nas ultimas 2 semanas
+    if (onlyLatest && !inLatestScan(p)) { stats.not_latest += 1; return false; } // a ultima busca do nicho nao confirmou
+    if (suspiciousDiscount(p)) { stats.suspicious += 1; return false; }
     return true;
   });
 
@@ -370,10 +415,12 @@ async function loadQueue(destId, body) {
   const minScore = Number(body.min_score) || 0;
   if (S) {
     list.forEach((p) => { p._score = S.compute(p).score; });
-    if (minScore > 0) list = list.filter((p) => p._score >= minScore);
+    if (minScore > 0) { const before = list.length; list = list.filter((p) => p._score >= minScore); stats.low_score = before - list.length; }
   }
   const rank = (p) => (p.source === 'shopee_listed_price' ? 1 : 0);
-  list = list.map((p, i) => ({ p, i })).sort((a, b) => (((b.p._score || 0) - (a.p._score || 0)) || (rank(a.p) - rank(b.p)) || ((Number(b.p.discount_rate) || 0) - (Number(a.p.discount_rate) || 0)) || (a.i - b.i))).map((x) => x.p);
+  const byRecent = body.sort === 'recent'; // "Mais recentes": a achada por ultimo sai primeiro (igual ao Painel geral)
+  const detTs = (p) => new Date(p.detected_at).getTime() || 0;
+  list = list.map((p, i) => ({ p, i })).sort((a, b) => ((byRecent ? (detTs(b.p) - detTs(a.p)) : 0) || ((b.p._score || 0) - (a.p._score || 0)) || (rank(a.p) - rank(b.p)) || ((Number(b.p.discount_rate) || 0) - (Number(a.p.discount_rate) || 0)) || (a.i - b.i))).map((x) => x.p);
 
   // Mesmo PRODUTO (outro vendedor, outro link) nao pode sair duas vezes:
   //  1) nao repete produto parecido com algo ja ENVIADO a este destino nas ultimas 2 semanas;
@@ -387,10 +434,13 @@ async function loadQueue(destId, body) {
         const { data: sentRows } = await supabaseAdmin.from('promotions').select('id, title').in('id', sentIds.slice(i, i + 100));
         (sentRows || []).forEach((r) => sentIndex.add(r.title, r));
       }
-      if (sentIndex.size) list = list.filter((p) => !sentIndex.findSimilar(p.title));
+      if (sentIndex.size) { const b0 = list.length; list = list.filter((p) => !sentIndex.findSimilar(p.title)); stats.similar += b0 - list.length; }
     }
+    const b1 = list.length;
     list = dd.keepCheapestOfEach(list, (p) => p.title, (p) => Number(p.current_price));
+    stats.similar += b1 - list.length;
   }
+  await attachGroups(list);
   return list;
 }
 
@@ -494,12 +544,13 @@ async function sendTest(res, body) {
 async function queue(res, body) {
   const dest = await getDestination(body.destination_id);
   if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
-  const list = await loadQueue(dest.id, body);
-  if (!list.length) return res.status(200).json({ count: 0 });
+  const stats = {};
+  const list = await loadQueue(dest.id, { ...body, _stats: stats });
+  if (!list.length) return res.status(200).json({ count: 0, stats });
   const n = list[0];
   res.status(200).json({
-    count: list.length,
-    next: { title: n.title, price: Number(n.current_price), discount: n.discount_rate ? Number(n.discount_rate) : null, marketplace: n.marketplaces ? n.marketplaces.name : null },
+    count: list.length, stats,
+    next: { title: n.title, price: Number(n.current_price), discount: n.discount_rate ? Number(n.discount_rate) : null, marketplace: n.marketplaces ? n.marketplaces.name : null, group: n._group || null, detected_at: n.detected_at || null, link: n.affiliate_url },
     newestSeenAt: list.reduce((m, p) => { const t = p.last_seen_at || p.detected_at; return t && (!m || t > m) ? t : m; }, null),
   });
 }
@@ -509,7 +560,7 @@ async function queue(res, body) {
 async function manualCandidates(res, body) {
   const dest = await getDestination(body.destination_id);
   if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
-  const list = await loadQueue(dest.id, { group_ids: body.group_ids, marketplace: body.marketplace, min_score: body.min_score });
+  const list = await loadQueue(dest.id, { group_ids: body.group_ids, marketplace: body.marketplace, min_score: body.min_score, period: body.period, sort: body.sort, only_latest_scan: body.only_latest_scan });
   res.status(200).json({ total: list.length, items: list.slice(0, 300).map(manualMeta) });
 }
 
@@ -534,6 +585,7 @@ async function manualStatus(res, body) {
     if (error) return fail(res, 500, dbError(error));
     (logs || []).forEach((l) => { if (!logsByPromo.has(l.promotion_id)) logsByPromo.set(l.promotion_id, []); logsByPromo.get(l.promotion_id).push(l); });
   }
+  await attachGroups([...promos.values()]);
   let next = null;
   const items = ids.map((id) => {
     const p = promos.get(id);
@@ -656,7 +708,7 @@ async function sendNext(res, body) {
     const plain = toWhatsApp(html);
     const { error: logErr } = await supabaseAdmin.from('dispatch_log').insert({ destination_id: dest.id, promotion_id: chosen.id, skipped: false, message: plain });
     if (isDupError(logErr)) return fail(res, 409, 'Essa promo\u00e7\u00e3o j\u00e1 foi enviada a este destino (evitei repetir).', { code: 'duplicate' });
-    return res.status(200).json({ ok: true, manual: true, message: plain, promotion: { title: chosen.title, coupon: view.coupon }, remaining, skipped: skippedInfo });
+    return res.status(200).json({ ok: true, manual: true, message: plain, promotion: { title: chosen.title, coupon: view.coupon, link: chosen.affiliate_url }, remaining, skipped: skippedInfo });
   }
 
   // RESERVA antes de enviar: se o servidor cair depois do envio, a promocao ja consta como enviada e nao repete.
@@ -680,7 +732,7 @@ async function sendNext(res, body) {
     return fail(res, 502, friendlyTelegramError(err));
   }
 
-  res.status(200).json({ ok: true, sent: { title: chosen.title, marketplace: slugName, coupon: view.coupon }, remaining, skipped: skippedInfo });
+  res.status(200).json({ ok: true, sent: { title: chosen.title, marketplace: slugName, coupon: view.coupon, link: chosen.affiliate_url }, remaining, skipped: skippedInfo });
 }
 
 
@@ -746,6 +798,9 @@ async function startJob(res, body) {
     group_ids: Array.isArray(body.group_ids) ? body.group_ids : [],
     marketplace: body.marketplace || null,
     min_score: Math.max(0, Math.min(100, Number(body.min_score) || 0)),
+    period: PERIODS.includes(body.period) ? body.period : '24h',
+    sort: body.sort === 'recent' ? 'recent' : 'score',
+    only_latest_scan: body.only_latest_scan !== false,
     footer,
     hour_from: parseHour(body.hour_from),
     hour_to: parseHour(body.hour_to),
@@ -823,7 +878,7 @@ async function processJob(job) {
       return;
     }
     const fr = fakeRes();
-    await sendNext(fr, { destination_id: dest.id, group_ids: f.group_ids || [], marketplace: f.marketplace || null, min_score: f.min_score || 0, footer: f.footer || '', manual_ids: f.manual_ids || [] });
+    await sendNext(fr, { destination_id: dest.id, group_ids: f.group_ids || [], marketplace: f.marketplace || null, min_score: f.min_score || 0, footer: f.footer || '', manual_ids: f.manual_ids || [], period: f.period, sort: f.sort, only_latest_scan: f.only_latest_scan });
     r = { status: fr.code, json: fr.body || {} };
   } catch (e) {
     r = { status: 500, json: { error: e.message || 'erro inesperado' } };
@@ -843,7 +898,7 @@ async function processJob(job) {
   if (r.status === 200) {
     if (job.mode === 'assisted') {
       await finish({
-        pending: { message: j.message, title: j.promotion.title, coupon: j.promotion.coupon, remaining: j.remaining, prepared_at: nowIso() },
+        pending: { message: j.message, title: j.promotion.title, coupon: j.promotion.coupon, link: j.promotion.link || null, remaining: j.remaining, prepared_at: nowIso() },
         last_event: 'Promocao pronta para enviar.' + skippedTxt, last_error: null, error_streak: 0,
       });
       return;
@@ -854,7 +909,7 @@ async function processJob(job) {
     await finish({
       sent_count: sent, status: done ? 'stopped' : 'running',
       next_run_at: new Date(Date.now() + job.interval_min * 60000).toISOString(),
-      last_event: (done ? `Meta de ${job.max_sends} envios atingida. ` : '') + `Enviado: ${t}${j.sent && j.sent.coupon ? ` (cupom ${j.sent.coupon})` : ''}${skippedTxt}`,
+      last_event: (done ? `Meta de ${job.max_sends} envios atingida. ` : '') + `Enviado: ${t}${j.sent && j.sent.coupon ? ` (cupom ${j.sent.coupon})` : ''}${j.sent && j.sent.link ? ` \u2192 ${String(j.sent.link).slice(0, 80)}` : ''}${skippedTxt}`,
       last_error: null, error_streak: 0,
     });
     return;
@@ -909,7 +964,7 @@ async function prepareForBot(job) {
     const group = String(f.wa_group || dest.chat_id || '').trim();
     if (!group) { await release({ status: 'stopped', last_error: 'Falta o nome do grupo do WhatsApp.' }); return null; }
 
-    const prep = await prepareNext(dest, { group_ids: f.group_ids || [], marketplace: f.marketplace || null, min_score: f.min_score || 0, footer: f.footer || '', manual_ids: f.manual_ids || [] });
+    const prep = await prepareNext(dest, { group_ids: f.group_ids || [], marketplace: f.marketplace || null, min_score: f.min_score || 0, footer: f.footer || '', manual_ids: f.manual_ids || [], period: f.period, sort: f.sort, only_latest_scan: f.only_latest_scan });
     if (prep.error) {
       const code = prep.error.extra && prep.error.extra.code;
       if (code === 'daily_limit' || code === 'bad_link') { await release({ status: 'stopped', pending: null, last_error: prep.error.message }); return null; }
@@ -938,7 +993,7 @@ async function prepareForBot(job) {
     const imageUrl = prep.chosen.image_url && /^https:\/\//i.test(prep.chosen.image_url) ? prep.chosen.image_url : null;
     const pending = {
       log_id: logRow ? logRow.id : null, message, image_url: imageUrl, title: prep.chosen.title,
-      coupon: prep.view.coupon || null, remaining: prep.remaining, group, prepared_at: nowIso(), delivered_at: nowIso(),
+      coupon: prep.view.coupon || null, link: prep.chosen.affiliate_url || null, remaining: prep.remaining, group, prepared_at: nowIso(), delivered_at: nowIso(),
     };
     await release({ pending, last_event: `Entregue ao robo: ${String(prep.chosen.title).slice(0, 60)}${skippedTxt}`, last_error: null });
     return botDeliver({ id: job.id, pending });
@@ -1017,7 +1072,7 @@ async function botAck(res, body) {
     await supabaseAdmin.from('dispatch_jobs').update({
       pending: null, claimed_at: null, sent_count: sent, status: done ? 'stopped' : 'running',
       next_run_at: new Date(nowMs + jitteredMs(job.interval_min)).toISOString(),
-      last_event: (done ? `Meta de ${job.max_sends} envios atingida. ` : '') + `Enviado: ${String(p.title || '').slice(0, 70)}${p.coupon ? ` (cupom ${p.coupon})` : ''}`,
+      last_event: (done ? `Meta de ${job.max_sends} envios atingida. ` : '') + `Enviado: ${String(p.title || '').slice(0, 70)}${p.coupon ? ` (cupom ${p.coupon})` : ''}${p.link ? ` \u2192 ${String(p.link).slice(0, 80)}` : ''}`,
       last_error: null, error_streak: 0, updated_at: nowIso,
     }).eq('id', job.id);
     return res.status(200).json({ ok: true });
