@@ -1,4 +1,4 @@
-const VERSION = 'dispatch-v2026-11-05.2';
+const VERSION = 'dispatch-v2026-11-12.1';
 
 // Carregamento protegido: se alguma peca faltar no deploy, a API responde dizendo QUAL (em vez de cair com erro 500).
 let supabaseAdmin = null;
@@ -235,7 +235,72 @@ async function getDestination(id) {
   return data;
 }
 
+// ---------------- ordem manual (voce escolhe quais produtos saem e em que sequencia) ----------------
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_MANUAL = 200;
+
+// Lista de ids vinda da tela: so uuid valido, sem repetir, mantendo a ORDEM em que veio.
+function cleanManualIds(list) {
+  if (!Array.isArray(list)) return [];
+  const seen = new Set(); const out = [];
+  for (const x of list) {
+    const id = String(x || '');
+    if (UUID_RE.test(id) && !seen.has(id)) { seen.add(id); out.push(id); }
+    if (out.length >= MAX_MANUAL) break;
+  }
+  return out;
+}
+
+// Codigo curto para voce saber QUAL produto e: id do anuncio na loja (Shopee / Mercado Livre) ou o inicio do id interno.
+function codeOf(p) {
+  const url = String((p && p.original_url) || '');
+  const sh = shopeeIds(url);
+  if (sh) return `Shopee ${sh.itemId}`;
+  const ml = url.match(/MLB-?(\d{6,})/i);
+  if (ml) return `MLB${ml[1]}`;
+  return String((p && p.id) || '').slice(0, 8).toUpperCase();
+}
+
+function manualMeta(p) {
+  return {
+    id: p.id, title: p.title, marketplace: p.marketplaces ? p.marketplaces.name : null, slug: p.marketplaces ? p.marketplaces.slug : null,
+    price: p.current_price != null ? Number(p.current_price) : null,
+    previous_price: p.previous_price ? Number(p.previous_price) : null,
+    discount: p.discount_rate ? Number(p.discount_rate) : null,
+    score: p._score != null ? p._score : null,
+    code: codeOf(p),
+  };
+}
+
+// Fila MANUAL: devolve exatamente os produtos escolhidos, na ordem escolhida. Continua barrando o que nao pode sair
+// (sem link de afiliado, finalizada/ignorada, ja enviada a este destino nas ultimas 2 semanas). O que o usuario
+// escolheu NAO passa pelos filtros automaticos (ultima busca, score minimo, grupo, "parecido"): quem manda e ele.
+async function loadManualQueue(destId, ids) {
+  const wanted = cleanManualIds(ids);
+  if (!wanted.length) return [];
+  const lc = lifecycle();
+  const hasEnded = !!(lc && await lc.endedSupported(supabaseAdmin));
+  const rows = [];
+  for (let i = 0; i < wanted.length; i += 100) {
+    let q = supabaseAdmin.from('promotions').select('*, marketplaces(slug, name)')
+      .in('id', wanted.slice(i, i + 100)).not('affiliate_url', 'is', null).neq('status', 'IGNORED').gt('current_price', 0);
+    if (hasEnded) q = q.is('ended_at', null);
+    const { data, error } = await q;
+    if (error) throw new Error(dbError(error));
+    rows.push(...(data || []));
+  }
+  const { data: logs, error: logErr } = await supabaseAdmin.from('dispatch_log').select('promotion_id')
+    .eq('destination_id', destId).gte('sent_at', isoAgo(NO_REPEAT_DAYS * DAY));
+  if (logErr) throw new Error(dbError(logErr));
+  const already = new Set((logs || []).map((l) => l.promotion_id));
+  const byId = new Map(rows.map((p) => [p.id, p]));
+  return wanted.map((id) => byId.get(id)).filter((p) => p && !already.has(p.id) && /^https?:\/\//i.test(p.affiliate_url || ''));
+}
+
 async function loadQueue(destId, body) {
+  const manualIds = cleanManualIds(body.manual_ids);
+  if (manualIds.length) return loadManualQueue(destId, manualIds);
   const groupIds = Array.isArray(body.group_ids) ? body.group_ids : [];
   const since = isoAgo(QUEUE_DAYS_SEEN * DAY);
 
@@ -440,6 +505,54 @@ async function queue(res, body) {
 }
 
 
+// Produtos que voce pode escolher para montar a ordem (a mesma lista que o disparo automatico usaria).
+async function manualCandidates(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+  const list = await loadQueue(dest.id, { group_ids: body.group_ids, marketplace: body.marketplace, min_score: body.min_score });
+  res.status(200).json({ total: list.length, items: list.slice(0, 300).map(manualMeta) });
+}
+
+// Situacao de cada produto da ordem: ja enviado, pulado (com o motivo), indisponivel ou aguardando.
+async function manualStatus(res, body) {
+  const dest = await getDestination(body.destination_id);
+  if (!dest) return fail(res, 404, 'Destino n\u00e3o encontrado.');
+  const ids = cleanManualIds(body.ids);
+  if (!ids.length) return res.status(200).json({ items: [], next: null });
+  const lc = lifecycle();
+  const hasEnded = !!(lc && await lc.endedSupported(supabaseAdmin));
+  const promos = new Map();
+  for (let i = 0; i < ids.length; i += 100) {
+    const { data, error } = await supabaseAdmin.from('promotions').select('*, marketplaces(slug, name)').in('id', ids.slice(i, i + 100));
+    if (error) return fail(res, 500, dbError(error));
+    (data || []).forEach((p) => promos.set(p.id, p));
+  }
+  const logsByPromo = new Map();
+  for (let i = 0; i < ids.length; i += 100) {
+    const { data: logs, error } = await supabaseAdmin.from('dispatch_log').select('promotion_id, skipped, message, sent_at')
+      .eq('destination_id', dest.id).in('promotion_id', ids.slice(i, i + 100)).gte('sent_at', isoAgo(NO_REPEAT_DAYS * DAY)).order('sent_at', { ascending: false });
+    if (error) return fail(res, 500, dbError(error));
+    (logs || []).forEach((l) => { if (!logsByPromo.has(l.promotion_id)) logsByPromo.set(l.promotion_id, []); logsByPromo.get(l.promotion_id).push(l); });
+  }
+  let next = null;
+  const items = ids.map((id) => {
+    const p = promos.get(id);
+    const logs = logsByPromo.get(id) || [];
+    const sentLog = logs.find((l) => !l.skipped);
+    const skipLog = logs.find((l) => l.skipped);
+    let state = 'pending'; let reason = null; let at = null;
+    if (sentLog) { state = 'sent'; at = sentLog.sent_at; }
+    else if (skipLog) { state = 'skipped'; reason = String(skipLog.message || '').replace(/^pulada:\s*/i, '').slice(0, 140); at = skipLog.sent_at; }
+    else if (!p) { state = 'unavailable'; reason = 'n\u00e3o encontrada (foi apagada)'; }
+    else if (p.status === 'IGNORED') { state = 'unavailable'; reason = 'foi ignorada no painel'; }
+    else if (hasEnded && p.ended_at) { state = 'unavailable'; reason = 'a promo\u00e7\u00e3o j\u00e1 foi finalizada'; }
+    else if (!p.affiliate_url) { state = 'unavailable'; reason = 'sem link de afiliado'; }
+    if (state === 'pending' && !next) next = id;
+    return { ...(p ? manualMeta(p) : { id, title: '(promo\u00e7\u00e3o n\u00e3o encontrada)', marketplace: null, price: null, previous_price: null, discount: null, score: null, code: id.slice(0, 8).toUpperCase() }), state, reason, at };
+  });
+  res.status(200).json({ items, next });
+}
+
 // Confere os pr-ximos da fila SEM enviar nada. Quem n-o existe mais - removido (vai para "Ignoradas").
 async function verifyQueue(res, body) {
   const dest = await getDestination(body.destination_id);
@@ -625,7 +738,9 @@ async function startJob(res, body) {
   // WhatsApp: 'bot' = robo envia sozinho; qualquer outra coisa = assistido (voce toca em enviar).
   const mode = isTelegram ? 'auto' : (body.mode === 'bot' ? 'bot' : 'assisted');
   const interval = Math.max(parseInt(body.interval_min, 10) || 0, (isTelegram || mode === 'bot') ? 2 : 1);
-  const maxSends = Math.min(Math.max(parseInt(body.max_sends, 10) || 20, 1), 500);
+  let maxSends = Math.min(Math.max(parseInt(body.max_sends, 10) || 20, 1), 500);
+  const manualIds = cleanManualIds(body.manual_ids);
+  if (manualIds.length) maxSends = manualIds.length; // ordem manual: para sozinho quando o ultimo da lista sair
   const footer = String(body.footer || '').slice(0, 120);
   const filters = {
     group_ids: Array.isArray(body.group_ids) ? body.group_ids : [],
@@ -635,6 +750,7 @@ async function startJob(res, body) {
     hour_from: parseHour(body.hour_from),
     hour_to: parseHour(body.hour_to),
   };
+  if (manualIds.length) filters.manual_ids = manualIds;
   if (mode === 'bot') {
     const waGroup = String(body.wa_group || dest.chat_id || '').replace(/\s+/g, ' ').trim().slice(0, 120);
     if (!waGroup) return fail(res, 400, 'Informe o nome do grupo do WhatsApp (exatamente como aparece no WhatsApp) para o robo saber onde enviar.');
@@ -707,7 +823,7 @@ async function processJob(job) {
       return;
     }
     const fr = fakeRes();
-    await sendNext(fr, { destination_id: dest.id, group_ids: f.group_ids || [], marketplace: f.marketplace || null, min_score: f.min_score || 0, footer: f.footer || '' });
+    await sendNext(fr, { destination_id: dest.id, group_ids: f.group_ids || [], marketplace: f.marketplace || null, min_score: f.min_score || 0, footer: f.footer || '', manual_ids: f.manual_ids || [] });
     r = { status: fr.code, json: fr.body || {} };
   } catch (e) {
     r = { status: 500, json: { error: e.message || 'erro inesperado' } };
@@ -793,7 +909,7 @@ async function prepareForBot(job) {
     const group = String(f.wa_group || dest.chat_id || '').trim();
     if (!group) { await release({ status: 'stopped', last_error: 'Falta o nome do grupo do WhatsApp.' }); return null; }
 
-    const prep = await prepareNext(dest, { group_ids: f.group_ids || [], marketplace: f.marketplace || null, min_score: f.min_score || 0, footer: f.footer || '' });
+    const prep = await prepareNext(dest, { group_ids: f.group_ids || [], marketplace: f.marketplace || null, min_score: f.min_score || 0, footer: f.footer || '', manual_ids: f.manual_ids || [] });
     if (prep.error) {
       const code = prep.error.extra && prep.error.extra.code;
       if (code === 'daily_limit' || code === 'bad_link') { await release({ status: 'stopped', pending: null, last_error: prep.error.message }); return null; }
@@ -953,6 +1069,8 @@ module.exports = async function handler(req, res) {
       case 'test': return await sendTest(res, body);
       case 'queue': return await queue(res, body);
       case 'verify': return await verifyQueue(res, body);
+      case 'manual_candidates': return await manualCandidates(res, body);
+      case 'manual_status': return await manualStatus(res, body);
       case 'job_start': return await startJob(res, body);
       case 'job_stop': return await stopJob(res, body);
       case 'job_ack': return await ackJob(res, body);
